@@ -300,14 +300,19 @@ export class LightingRig {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.source.removeFromParent();
-    this.source.dispose();
+    let firstError: unknown;
+    const release = (operation: () => void) => {
+      try { operation(); } catch (error) { firstError ??= error; }
+    };
+    release(() => this.source.removeFromParent());
+    release(() => this.source.dispose());
     for (const edit of this.apertureEdits) {
-      edit.mesh.material = edit.original;
-      for (const material of edit.emissive) material.dispose();
+      release(() => { edit.mesh.material = edit.original; });
+      for (const material of edit.emissive) release(() => material.dispose());
     }
-    this.renderPass.dispose();
-    this.bloomPass.dispose();
-    this.composer.dispose();
+    release(() => this.renderPass.dispose());
+    release(() => this.bloomPass.dispose());
+    release(() => this.composer.dispose());
+    if (firstError !== undefined) throw firstError;
   }
 }
