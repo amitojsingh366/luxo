@@ -116,6 +116,8 @@ export class LuxoBrowserRuntime {
   private started = false;
   private destroyed = false;
   private promptCleared = false;
+  private pendingTtsDone = false;
+  private awaitingTtsDone = false;
 
   constructor(
     private readonly root: HTMLElement,
@@ -125,7 +127,7 @@ export class LuxoBrowserRuntime {
     this.camera = dependencies.createCamera({ onError: (error) => this.report("camera", error) });
     this.mixer = dependencies.createMixer({
       setVadSuppressed: (active) => this.guard("tts", () => this.microphone?.setTtsPlaying(active)),
-      onTtsDone: () => this.guard("tts", () => { this.protocol?.sendTtsDone(); }),
+      onTtsDone: () => this.completeTts(),
     });
     this.fallback = dependencies.createFallback();
     this.overlay = dependencies.createOverlay(root);
@@ -165,6 +167,7 @@ export class LuxoBrowserRuntime {
       camera = this.camera.start();
       scorer = this.dependencies.createScorer();
     } catch (value) {
+      this.invalidateAttempt(generation);
       if (cameraStarted) {
         try { this.camera.stop(); } catch (error) { this.report("startup_cleanup", errorOf(error)); }
       }
@@ -181,6 +184,8 @@ export class LuxoBrowserRuntime {
     if (this.destroyed) return;
     this.destroyed = true;
     this.generation += 1;
+    this.pendingTtsDone = false;
+    this.awaitingTtsDone = false;
     const starting = this.startPromise;
     let firstError: unknown;
     const release = async (operation: () => MaybePromise) => {
@@ -222,6 +227,7 @@ export class LuxoBrowserRuntime {
         : cameraResult.status === "rejected" ? cameraResult.reason
           : scorerResult.status === "rejected" ? scorerResult.reason
             : new Error("Luxo startup was cancelled");
+      this.invalidateAttempt(generation);
       if (scorerResult.status === "fulfilled") {
         try { await scorerResult.value.dispose?.(); }
         catch (error) { this.report("startup_cleanup", errorOf(error)); }
@@ -266,6 +272,7 @@ export class LuxoBrowserRuntime {
       this.started = true;
       this.clearPrompt();
     } catch (error) {
+      this.invalidateAttempt(generation);
       try { await this.cleanupOperational(); }
       catch (cleanupError) { this.report("startup_cleanup", errorOf(cleanupError)); }
       if (!scorerTransferred) {
@@ -289,7 +296,7 @@ export class LuxoBrowserRuntime {
       onBodyState: (state) => this.route(generation, "body_state", () => this.handleBodyState(state)),
       onCue: (cue) => this.route(generation, "audio", () => this.mixer.playCue(cue)),
       onCaptureFrame: () => this.route(generation, "camera", () => this.captureFrame()),
-      onSpeakBegin: (message) => this.route(generation, "tts", () => this.mixer.speakBegin(message)),
+      onSpeakBegin: (message) => this.route(generation, "tts", () => this.beginTts(message)),
       onTtsPcm: (pcm) => this.route(generation, "tts", () => this.mixer.enqueueTtsPcm(pcm)),
       onSpeakEnd: () => this.route(generation, "tts", () => this.mixer.speakEnd({ type: "speak_end" })),
       onError: (error) => this.route(generation, "protocol", () => this.report("protocol", error)),
@@ -314,6 +321,7 @@ export class LuxoBrowserRuntime {
     this.fallbackEndSeconds = null;
     this.fallback.connect();
     this.overlay.setConnectionStatus("connected");
+    this.flushTtsDone();
   }
 
   private handleDisconnected(): void {
@@ -355,7 +363,7 @@ export class LuxoBrowserRuntime {
     void this.camera.captureJpeg()
       .then((blob) => blob.arrayBuffer())
       .then((jpeg) => { if (!this.destroyed && generation === this.generation) this.protocol?.sendCapturedJpeg(jpeg); })
-      .catch((error: unknown) => this.report("camera", errorOf(error)))
+      .catch((error: unknown) => this.route(generation, "camera", () => this.report("camera", errorOf(error))))
       .finally(() => { this.captureBusy = false; });
   }
 
@@ -389,6 +397,38 @@ export class LuxoBrowserRuntime {
     this.startButton.textContent = "Retry Luxo";
     this.startStatus.textContent = error.message;
     this.report("startup", error);
+  }
+
+  private completeTts(): void {
+    if (this.destroyed || !this.awaitingTtsDone) return;
+    this.awaitingTtsDone = false;
+    try {
+      this.pendingTtsDone = !(this.protocol?.sendTtsDone() ?? false);
+    } catch (error) {
+      this.pendingTtsDone = true;
+      this.report("tts", errorOf(error));
+    }
+  }
+
+  private flushTtsDone(): void {
+    if (!this.pendingTtsDone) return;
+    try {
+      if (this.protocol?.sendTtsDone()) this.pendingTtsDone = false;
+    } catch (error) {
+      this.report("tts", errorOf(error));
+    }
+  }
+
+  private invalidateAttempt(generation: number): void {
+    if (generation !== this.generation) return;
+    this.generation += 1;
+    this.pendingTtsDone = false;
+    this.awaitingTtsDone = false;
+  }
+
+  private beginTts(message: { readonly type: "speak_begin"; readonly envelope_hz: number }): void {
+    this.mixer.speakBegin(message);
+    this.awaitingTtsDone = true;
   }
 
   private clearPrompt(): void {
