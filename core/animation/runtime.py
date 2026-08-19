@@ -100,7 +100,8 @@ class AnimationRuntime:
         self._look_fact: LookAtFact | None = None
         self._pending_motion: GestureName | PostureName | None = None
         self._pending_cancel = False
-        self._look_posture_started: PostureName | None = None
+        self._posture_name: PostureName | None = PostureName.REST
+        self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
         self._speaking = False
         self._light_preset = LightPreset.WARM_IDLE
@@ -170,7 +171,8 @@ class AnimationRuntime:
         self._look_fact = None
         self._pending_motion = None
         self._pending_cancel = False
-        self._look_posture_started = None
+        self._posture_name = PostureName.REST
+        self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
         self._speaking = False
         self._light_preset = LightPreset.WARM_IDLE
@@ -205,6 +207,9 @@ class AnimationRuntime:
             gaze = LayerSample(joints=solution.offsets)
             requested_posture = solution.requested_posture
             look_target = look_fact.target.target
+        if requested_posture is None:
+            self._release_look_posture(timestamp)
+        else:
             self._handoff_look_posture(requested_posture, timestamp)
 
         gesture_sample = self._gestures.sample(timestamp)
@@ -252,11 +257,18 @@ class AnimationRuntime:
 
     def _apply_pending_motion(self, now: float) -> None:
         if self._pending_cancel:
+            active = self._gestures.active
             self._gestures.cancel(now)
-            self._look_posture_started = None
+            if isinstance(active, PostureName):
+                self._posture_name = None
+                self._posture_owned_by_look = False
         elif self._pending_motion is not None:
             self._gestures.start(self._pending_motion, now)
-            self._look_posture_started = None
+            if isinstance(self._pending_motion, PostureName):
+                self._posture_name = self._pending_motion
+                self._posture_owned_by_look = False
+            elif self._posture_owned_by_look:
+                self._posture_name = None
         self._pending_motion = None
         self._pending_cancel = False
 
@@ -274,15 +286,25 @@ class AnimationRuntime:
     def _handoff_look_posture(
         self, requested: PostureName | None, now: float
     ) -> None:
-        if requested is None or requested is self._look_posture_started:
-            return
-        if self._gestures.active is requested:
-            self._look_posture_started = requested
+        if requested is None or requested is self._posture_name:
             return
         if self._gestures.active is not None:
             return
         self._gestures.start(requested, now)
-        self._look_posture_started = requested
+        self._posture_name = requested
+        self._posture_owned_by_look = True
+
+    def _release_look_posture(self, now: float) -> None:
+        if not self._posture_owned_by_look:
+            return
+        active = self._gestures.active
+        if isinstance(active, GestureName):
+            return
+        if active is not None and active is not self._posture_name:
+            return
+        self._gestures.start(PostureName.REST, now)
+        self._posture_name = PostureName.REST
+        self._posture_owned_by_look = False
 
     def _light_command(self) -> LightCommand:
         intensity, color_k = _LIGHT_PRESETS[self._light_preset]
