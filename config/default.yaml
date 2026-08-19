@@ -1,0 +1,205 @@
+{
+  "character": {
+    "name": "Luxo"
+  },
+  "runtime": {
+    "python": "3.12",
+    "fsm_hz": 10,
+    "animation_hz": 120,
+    "body_state_hz": 60,
+    "gaze_stale_s": 1.0,
+    "animation_jitter_p99_ms": 3.0
+  },
+  "network": {
+    "websocket_url": "ws://127.0.0.1:8765"
+  },
+  "gaze": {
+    "yaw_threshold_deg": 25.0,
+    "pitch_threshold_deg": 20.0,
+    "min_detection_confidence": 0.5,
+    "engage_dwell_s": 0.50,
+    "notice_hold_s": 0.30,
+    "disengage_dwell_s": 2.50,
+    "disengage_droop_s": 1.50,
+    "ema_alpha": 0.4,
+    "publish_hz": 10
+  },
+  "speech": {
+    "vad_trailing_silence_ms": 300,
+    "minimum_utterance_ms": 400,
+    "input_sample_hz": 16000,
+    "output_sample_hz": 22050,
+    "tts_chunk_max_bytes": 8192,
+    "envelope_hz": 50,
+    "piper_length_scale": 0.88
+  },
+  "vision": {
+    "capture_longest_edge_px": 512,
+    "jpeg_quality": 80,
+    "capture_max_bytes": 61440
+  },
+  "joints": {
+    "base_yaw": {
+      "urdf_name": "base_yaw_joint",
+      "hard_min": -2.600,
+      "hard_max": 2.600,
+      "soft_min": -2.450,
+      "soft_max": 2.450,
+      "velocity_max": 1.50
+    },
+    "shoulder_pitch": {
+      "urdf_name": "shoulder_pitch_joint",
+      "hard_min": -0.750,
+      "hard_max": 1.050,
+      "soft_min": -0.650,
+      "soft_max": 0.950,
+      "velocity_max": 0.95
+    },
+    "elbow_pitch": {
+      "urdf_name": "elbow_pitch_joint",
+      "hard_min": -1.850,
+      "hard_max": 0.400,
+      "soft_min": -1.700,
+      "soft_max": 0.300,
+      "velocity_max": 1.15
+    },
+    "neck_yaw": {
+      "urdf_name": "neck_yaw_joint",
+      "hard_min": -1.350,
+      "hard_max": 1.350,
+      "soft_min": -1.250,
+      "soft_max": 1.250,
+      "velocity_max": 1.60
+    },
+    "head_pitch": {
+      "urdf_name": "head_pitch_joint",
+      "hard_min": -0.900,
+      "hard_max": 0.700,
+      "soft_min": -0.800,
+      "soft_max": 0.600,
+      "velocity_max": 1.45
+    }
+  },
+  "animation": {
+    "idle": {
+      "shoulder_amplitude_rad": 0.012,
+      "breathing_hz": 0.22,
+      "noise_amplitude_rad": 0.004
+    },
+    "timing": {
+      "anticipation_min_ms": 100,
+      "anticipation_max_ms": 150,
+      "arrival_stagger_min_ms": 40,
+      "arrival_stagger_max_ms": 80,
+      "strong_pose_hold_min_ms": 800,
+      "blink_intensity_scale": 0.55,
+      "blink_duration_ms": 90,
+      "blink_head_bob_rad": -0.02,
+      "arrival_order": [
+        "base_yaw",
+        "shoulder_pitch",
+        "elbow_pitch",
+        "neck_yaw",
+        "head_pitch"
+      ]
+    },
+    "look_at": {
+      "neck_error_clamp_rad": 0.5,
+      "neck_recenter_time_constant_s": 0.9,
+      "front_world_axis": "-x",
+      "positive_head_pitch_direction": "down"
+    },
+    "springs": {
+      "base_yaw": {"omega": 9.0, "zeta": 0.85},
+      "shoulder_pitch": {"omega": 6.5, "zeta": 0.90},
+      "elbow_pitch": {"omega": 7.5, "zeta": 0.88},
+      "neck_yaw": {"omega": 14.0, "zeta": 0.62},
+      "head_pitch": {"omega": 13.0, "zeta": 0.60}
+    },
+    "output_order": [
+      "sum_layers",
+      "spring_damper",
+      "velocity_clamp",
+      "soft_limit_clamp"
+    ]
+  },
+  "brain": {
+    "selected_profile": "free",
+    "say_max_characters": 120,
+    "recent_exchange_pairs": 3,
+    "response_stream_max_bytes": 8192,
+    "json_repair_retries": 1,
+    "profiles": {
+      "private": {
+        "model": null,
+        "provider": {
+          "zdr": true,
+          "data_collection": "deny",
+          "allow_fallbacks": false
+        }
+      },
+      "free": {
+        "model": null,
+        "provider": {}
+      }
+    }
+  },
+  "vocabulary": {
+    "states": [
+      "BOOT",
+      "DORMANT",
+      "NOTICING",
+      "ENGAGED",
+      "LISTENING",
+      "THINKING",
+      "SPEAKING",
+      "INSPECTING",
+      "ACTING",
+      "DISENGAGING"
+    ],
+    "ops": [
+      "gesture",
+      "look_at",
+      "light",
+      "sfx",
+      "scan",
+      "observe",
+      "posture",
+      "wait"
+    ],
+    "gestures": [
+      "perk_up",
+      "nod",
+      "double_take",
+      "recoil",
+      "lean_in",
+      "bounce",
+      "shake_no",
+      "settle",
+      "droop",
+      "regard"
+    ],
+    "look_at_targets": ["person", "obj:<id>", "scene"],
+    "light_presets": [
+      "warm_idle",
+      "warm_bright",
+      "cool_dim",
+      "curious_focus",
+      "thinking_pulse",
+      "excited_flash",
+      "sad_fade"
+    ],
+    "light_patterns": ["steady", "pulse", "flicker", "blink"],
+    "sfx": [
+      "chirp_up",
+      "chirp_found",
+      "boing",
+      "whirr_short",
+      "hmm",
+      "blip_sad",
+      "fanfare_small",
+      "click"
+    ],
+    "postures": ["rest", "alert", "slump", "stoop", "crane"]
+  }
+}

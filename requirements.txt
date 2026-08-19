@@ -1,0 +1,7 @@
+# Runtime dependencies named by the locked architecture.  Model weights and
+# whisper.cpp are installed separately and are never vendored in this repo.
+onnxruntime==1.20.1 \
+    --hash=sha256:22b0655e2bf4f2161d52706e31f517a0e54939dc393e92577df51808a7edc8c9 \
+    --hash=sha256:bb71a814f66517a65628c9e4a2bb530a6edd2cd5d87ffa0af0f6f773a027d99e
+websockets==15.0.1 \
+    --hash=sha256:f7a866fbc1e97b5c617ee4116daaa09b722101d4a3c170c787450ba409f9736f
