@@ -1,6 +1,6 @@
-# Lumen renderer
+# Luxo renderer
 
-Lumen's renderer is the browser-owned body: a full-bleed Vite, TypeScript,
+Luxo's renderer is the browser-owned body: a full-bleed Vite, TypeScript,
 three.js, and Tailwind application. It renders the supplied five-DOF lamp and
 accepts body state from the core, but it makes no behavioral decisions.
 

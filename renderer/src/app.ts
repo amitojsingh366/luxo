@@ -78,7 +78,7 @@ function buildStage(root: HTMLElement): {
   const state = makeElement("span", "lumen-brand__state");
   const status = makeElement("div", "lumen-status");
 
-  name.textContent = "Lumen";
+  name.textContent = "Luxo";
   state.textContent = "Browser body · 5 DOF";
   status.textContent = "Loading articulated body";
   status.dataset.tone = "loading";
