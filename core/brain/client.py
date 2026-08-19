@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -87,6 +88,8 @@ class CompletionTransport(Protocol):
 
 
 class BrainClient(Protocol):
+    def warm(self) -> None: ...
+
     def converse(
         self,
         transcript: str,
@@ -191,6 +194,17 @@ class OpenRouterBrainClient:
         self._prompts = prompts or FixedPromptBuilder()
         self._metrics_callback = metrics_callback
         self._clock = clock
+        self._warm_lock = threading.Lock()
+        self._warmed = False
+
+    def warm(self) -> None:
+        """Warm once through the existing narrate call from a startup worker."""
+
+        with self._warm_lock:
+            if self._warmed:
+                return
+            self.narrate(())
+            self._warmed = True
 
     def converse(
         self,
