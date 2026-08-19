@@ -5,10 +5,6 @@ export const CAPTURE_LONGEST_EDGE = 512;
 export const JPEG_QUALITY = 0.8;
 export const JPEG_MAX_BYTES = 60 * 1024;
 
-// Keep the specified 512px output. Only quality is reduced, in bounded steps,
-// when a noisy q80 frame would exceed the transport budget.
-export const JPEG_QUALITY_ATTEMPTS = Object.freeze([0.8, 0.72, 0.64, 0.56]);
-
 export const CAMERA_CONSTRAINTS = Object.freeze({
   audio: false,
   video: Object.freeze({
@@ -200,13 +196,11 @@ export class CameraSensor {
       const context = canvas.getContext('2d');
       if (!context) throw new Error('2D canvas is unavailable for camera capture');
       context.drawImage(this.videoElement, 0, 0, size.width, size.height);
-      let lastByteLength = 0;
-      for (const quality of JPEG_QUALITY_ATTEMPTS) {
-        const blob = await encodeJpeg(canvas, quality);
-        lastByteLength = blob.size;
-        if (isWithinJpegBudget(blob.size)) return blob;
+      const blob = await encodeJpeg(canvas, JPEG_QUALITY);
+      if (!isWithinJpegBudget(blob.size)) {
+        throw new CameraCaptureBudgetError(blob.size);
       }
-      throw new CameraCaptureBudgetError(lastByteLength);
+      return blob;
     } finally {
       canvas.width = 0;
       canvas.height = 0;
