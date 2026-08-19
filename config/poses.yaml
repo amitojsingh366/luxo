@@ -1,0 +1,10 @@
+{
+  "home": "rest",
+  "poses": {
+    "rest": {"base_yaw": 0.00, "shoulder_pitch": 0.35, "elbow_pitch": -0.75, "neck_yaw": 0.00, "head_pitch": 0.25},
+    "alert": {"base_yaw": 0.00, "shoulder_pitch": -0.20, "elbow_pitch": -0.30, "neck_yaw": 0.00, "head_pitch": -0.30},
+    "slump": {"base_yaw": 0.00, "shoulder_pitch": 0.60, "elbow_pitch": -1.40, "neck_yaw": 0.00, "head_pitch": 0.50},
+    "stoop": {"base_yaw": 0.00, "shoulder_pitch": 0.55, "elbow_pitch": -1.10, "neck_yaw": 0.00, "head_pitch": 0.55},
+    "crane": {"base_yaw": 0.00, "shoulder_pitch": -0.40, "elbow_pitch": -0.20, "neck_yaw": 0.00, "head_pitch": -0.15}
+  }
+}
