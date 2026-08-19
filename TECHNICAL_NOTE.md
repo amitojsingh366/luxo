@@ -1,57 +1,52 @@
 # Luxo — Technical Note
 
-A five-DOF desk lamp driven as one aware character through the laptop camera,
-microphone, and speaker.
-
 ## 0. Status
 
-289 Python and 113 renderer checks pass, but they check subsystems in isolation,
-**not** the assembled character. `core/main.py` loads config and serves the
-protocol stream; it does not yet construct the character loop. **The system is
-not demo-ready as of this commit.** No recording and no measurement exist.
+As of commit `0eeb863`, 420 Python and 113 renderer unit checks pass offline.
+They check subsystems in isolation, **not** the assembled character.
+`core/main.py` loads config and serves the protocol stream; it does not yet
+construct the character loop. **The system is not demo-ready as of this
+commit.** No recording and no measurement exist.
 
 ## 1. Architecture and data flow
 
 **The browser is the body. Python is the mind.** Sensors sit with the light and
 speakers because `getUserMedia` is identical on macOS and Ubuntu: it deletes the
 AVFoundation/V4L2/PortAudio layer, gives free echo cancellation, and puts face
-landmarking on the GPU rather than one of four scarce cores.
+landmarking on the GPU rather than one of four scarce CPU cores.
 
 ```
 ┌─────────────── LAPTOP (localhost only) ─────────────────┐
 │ BODY — browser (Vite · TS · three.js · Tone.js)         │
-│  camera ─► MediaPipe Face Landmarker ─► gaze @10Hz      │
-│         └─ JPEG 512px — ONLY on capture_frame           │
+│  camera ─► MediaPipe ─► gaze @10Hz; JPEG ONLY on observe │
 │  mic ───► Silero VAD (ONNX Web) ─► 1 PCM per utterance  │
 │  URDF · PointLight · bloom · 8 SFX · music · TTS out    │
 │  client.ts validates EVERY core message before dispatch │
 └────────┬────────────────────────────────────────────────┘
-   up    │ gaze · vad · tts_done      │ 0x01 PCM · 0x02 JPEG
-   down  │ body_state @60Hz · cue · capture_frame │ 0x03 PCM
+   up   gaze·vad·tts_done·0x01 PCM·0x02 JPEG
+   down body_state@60Hz·cue·capture_frame·0x03 PCM
 ┌────────▼────────────────────────────────────────────────┐
 │ MIND — core (Python 3.12, one process)                  │
 │  BLACKBOARD gaze · utterance · scene_memory · plan       │
 │  10Hz   BehaviorFSM ─► ConversationCoordinator ─► Plans │
 │  workers whisper.cpp · Piper · OpenRouter ──────────────┼─► cloud
-│  120Hz  idle⊕gaze⊕gesture⊕light⊕bob ─► spring-damper    │
-│         ─► velocity clamp ─► soft-limit clamp           │
+│  120Hz  idle⊕gaze⊕gesture⊕light⊕bob ─► springs ─► clamps│
 └─────────────────────────────────────────────────────────┘
 ```
 
-The browser never chooses a gesture, light preset, or joint value. Gaze *dwell*
-is evaluated in the core, so behavioural logic sits on one side of the socket.
-Workers own all inference, network, and synthesis; a completion callback only
-enqueues a generation-tagged result, and publication happens on the serialized
-tick, so the animation tick never blocks on I/O.
+The browser never chooses a gesture, light preset, or joint value, and gaze
+*dwell* is evaluated in the core, so behavioural logic sits on one side of the
+socket. A worker completion callback only enqueues a generation-tagged result;
+publication happens on the serialized tick, so animation never blocks on I/O.
 
 ## 2. Protocol
 
 One socket at `ws://127.0.0.1:8765`. JSON on text frames; binary frames carry a
-**1-byte type prefix** (`0x01` utterance PCM, `0x02` JPEG, `0x03` TTS PCM).
-`ProtocolServer` is the sole owner of `0x03`, so framing has one author. The
-schema is defined once in `schema/messages.schema.json`, TypeScript types are
-generated from it, and a check asserts the generated file matches, so **core and
-renderer cannot drift**.
+**1-byte type prefix** (`0x01` utterance PCM, `0x02` JPEG, `0x03` TTS PCM), and
+`ProtocolServer` solely owns `0x03`, so framing has one author. The schema is
+defined once in `schema/messages.schema.json`, TypeScript types are generated
+from it, and a check asserts the generated file matches, so **core and renderer
+cannot drift**.
 
 ## 3. The model-to-action boundary
 
@@ -78,35 +73,33 @@ The first `observe` stores canonical list `L₀`. On the goal the lamp scans and
 observes again; the second prompt includes `L₀` and asks only what is still
 present and what is new, which stabilises naming ("mug" vs "cup"). **Python
 computes `missing = L₀ − present`** as a deterministic set difference. Only then
-is the model given `missing`, and asked only to narrate it. `observe` returns
-objects and never dialogue; `narrate` produces dialogue. A label reported present
-but absent from the baseline is kept as local evidence and **can never add an
-item to `missing`**. The model cannot hallucinate a missing object because it
-never performs the comparison. Memory is a flat list — no embeddings, N < 20.
+is the model given `missing`, and asked only to narrate it — `observe` returns
+objects, never dialogue. A label reported present but absent from the baseline is
+local evidence only and **can never add an item to `missing`**. The model cannot
+hallucinate a missing object because it never performs the comparison. Memory is
+a flat list: no embeddings, N < 20.
 
 ## 5. Privacy
 
 Gaze never leaves the browser; only derived yaw/pitch/azimuth cross the socket.
-**No frame is ever sent except on an explicit `observe`.** Faces never reach a
+**No frame is ever sent except on an explicit `observe`**, so faces never reach a
 cloud vision service. This is architectural, not policy: no code path uploads a
 frame outside `observe`, and the renderer validates every core message before
 dispatch, so a malformed `capture_frame` cannot trigger a capture. Outbound
 payloads carry only transcript text, memory as one compact line of canonical
 labels, the last three `say` exchanges, and on `observe` one JPEG. **Never
-sent:** joint angles, FSM state, telemetry, gaze, clamp counters, audio, face
-data.
+sent:** joint angles, FSM state, telemetry, gaze, clamps, audio, faces.
 
 ## 6. Physical reasoning and simulation
 
 Per-joint spring-damper, `ẍ = ω²(target − x) − 2ζω·ẋ`. The constants **mirror the
 URDF's own velocity limits**: the shoulder is capped at 0.95 rad/s and gets
 ω=6.5/ζ=0.90 (lags visibly); the neck permits 1.60 rad/s and gets ω=14.0/ζ=0.62
-(overshoots). Overlap and follow-through fall out of respecting the model's
-physical constraints rather than being decorated on top.
-
-Output stage order is mandatory: sum → integrate → **velocity clamp** →
-**soft-limit clamp** → emit. Commands clamp to *soft* limits; hard limits do not
-appear in that module. Every clamp event is counted and exposed in telemetry.
+(overshoots). Overlap and follow-through fall out of the URDF's constraints
+rather than being decorated on top. Output stage order is mandatory: sum →
+integrate → **velocity clamp** → **soft-limit clamp** → emit. Commands clamp to
+*soft* limits; hard limits do not appear in that module, and every clamp event is
+counted and exposed as telemetry.
 
 > On real hardware this behaviour layer would emit setpoints to a deterministic
 > C++ or Rust servo loop at 500 Hz with hard deadlines. In simulation the
@@ -117,27 +110,27 @@ appear in that module. Every clamp event is counted and exposed in telemetry.
 > physical actuator.
 
 Look-at is analytic, not IK: `base_yaw + neck_yaw = α`, the neck leads by up to
-0.5 rad and recentres on a 0.9 s time constant, so overshoot lands on the neck.
+0.5 rad and recentres on a 0.9 s constant, so overshoot lands on the neck.
 
 ## 7. Deployment
 
-Target: clean Ubuntu 24.04, 4 cores, 8 GB, no GPU. Native `setup.sh` + venv + npm,
-**no Docker at runtime**. Venv is mandatory (PEP 668 blocks system pip on Noble),
-requirements pinned with hashes, whisper.cpp built CPU-only from source, models
-fetched to `~/.cache/lumen` with SHA256 verification and never committed.
-Preflight splits in two: `doctor.py` core-side and a `/selftest` page, which
-exercises the real runtime path. `localhost` satisfies the secure-context rule, so
-no TLS and no LAN binding.
+Target: clean Ubuntu 24.04, 4 cores, 8 GB, no GPU. Native `setup.sh` + venv +
+npm, **no Docker at runtime**. Venv is mandatory (PEP 668 blocks system pip on
+Noble), requirements pinned with hashes, whisper.cpp built CPU-only from source,
+models fetched to `~/.cache/lumen` with SHA256 verification, never committed.
+Preflight splits in two: `doctor.py` (913 lines, 131 offline unit checks, injected
+probes, presence-only key handling) and a `/selftest` page exercising the real
+runtime path. `localhost` is a secure context: no TLS, no LAN bind.
 
-**Gap:** `run.sh` and `selftest.html` exist. **`setup.sh`, `doctor.py`, and the
-root `README.md` are not yet in the tree, and no Linux smoke check has been run.**
+**Gap:** `doctor.py`, `run.sh`, and `selftest.html` exist. **`setup.sh` and the
+root `README.md` are absent, and no Linux smoke check has been run.**
 
 ## 8. Rejected alternatives
 
 | Rejected | Reason |
 |---|---|
 | Local LLM/VLM | 4 cores, no GPU: 20–60 s/frame prefill, ~8–12 tok/s. |
-| Python-side sensors | AVFoundation vs V4L2 abstraction; browser reduced to a display. |
+| Python-side sensors | AVFoundation vs V4L2; reduces the browser to a display. |
 | All-browser, no Python | WASM whisper/Piper slower; weakens Linux evidence. |
 | Electron / Tauri | A build system for a tidiness problem. |
 | Physics dynamics | Fights authored animation; authored overshoot is directable. |
@@ -149,31 +142,24 @@ root `README.md` are not yet in the tree, and no Linux smoke check has been run.
 
 **No benchmark has been run.** `measurements/` contains no CSV.
 
-| Metric (§11.1, §11.3, §11.4) | Value |
-|---|---|
-| End-of-speech → first audio, p50 / p95 | `TBD — owner-measured` |
-| Per-stage latency breakdown | `TBD — owner-measured` |
-| Engage precision / recall | `TBD — owner-measured` |
-| Disengage precision / recall | `TBD — owner-measured` |
-| Median time-to-engage | `TBD — owner-measured` |
-| Trials per condition (4) | `TBD — owner-measured` |
-| Peak RSS, core / browser | `TBD — owner-measured` |
-| CPU% per thread | `TBD — owner-measured` |
-| Animation tick jitter p99 | `TBD — owner-measured` |
-| Dropped render frames | `TBD — owner-measured` |
-| Actual project hours | `TBD — owner-measured` |
+| Group | Metrics | Value |
+|---|---|---|
+| Latency (§11.1) | end-of-speech → first audio p50 / p95; per-stage breakdown | `TBD — owner-measured` |
+| Engagement (§11.3) | engage and disengage precision / recall; median time-to-engage; trials per condition (4) | `TBD — owner-measured` |
+| Resources (§11.4) | peak RSS core / browser; CPU% per thread; tick jitter p99; dropped render frames | `TBD — owner-measured` |
+| Effort | actual project hours | `TBD — owner-measured` |
 
 **Three disclosures.**
 
 1. **Measurements will be taken on macOS and do not transfer to the Ubuntu
-   target.** whisper.cpp uses Accelerate/Metal on Apple Silicon and individual
-   cores far outpace four x86 cores, so any macOS figure is optimistic by a large
+   target.** whisper.cpp uses Accelerate/Metal on Apple Silicon and single cores
+   far outpace four x86 cores, so any macOS figure is optimistic by a large
    multiple.
-2. **The Ubuntu component benchmark was deliberately cut.** No measured Linux
+2. **The Ubuntu component benchmark was deliberately cut**, so no measured Linux
    figure exists. As reasoning, not data: whisper.cpp and Piper are the two
    CPU-bound core components, and both should be materially slower on four x86
-   cores without Accelerate — enough that a macOS figure must not be read as
-   representative of the target. The size of that gap is unmeasured.
+   cores without Accelerate — enough that a macOS figure is not representative.
+   The size of that gap is unmeasured.
 3. **The recording will use the OpenRouter `free` profile.** Free endpoints
    generally permit provider retention and training, which is **incompatible**
    with the `private` profile's `zdr: true` + `data_collection: "deny"`. Both are
@@ -189,7 +175,7 @@ root `README.md` are not yet in the tree, and no Linux smoke check has been run.
   as **whole-body lean and crane** — the same constraint that makes the lamp
   stoop to inspect something low. The character design accommodates this; it is
   not a bug.
-- No full IK; no physics dynamics; single subject only; no barge-in; no wake word
+- No full IK; no physics dynamics; single subject; no barge-in; no wake word
   (gaze is the signal); no cross-frame tracking (`observe` is discrete);
   localhost only.
 - **`core/main.py` does not yet assemble the character loop** (§0) — the gap
