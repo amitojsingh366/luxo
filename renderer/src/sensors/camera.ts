@@ -56,7 +56,7 @@ export function isWithinJpegBudget(
   byteLength: number,
   maximum = JPEG_MAX_BYTES,
 ): boolean {
-  return Number.isInteger(byteLength) && byteLength >= 0 && byteLength <= maximum;
+  return Number.isInteger(byteLength) && byteLength > 0 && byteLength < maximum;
 }
 
 export function bestHorizontalFov(...sources: readonly unknown[]): number {
@@ -76,7 +76,7 @@ export function bestHorizontalFov(...sources: readonly unknown[]): number {
 
 export class CameraCaptureBudgetError extends Error {
   constructor(readonly lastByteLength: number) {
-    super(`JPEG capture exceeds ${JPEG_MAX_BYTES} bytes after bounded fallback`);
+    super(`JPEG capture does not fit the ${JPEG_MAX_BYTES}-byte budget`);
     this.name = 'CameraCaptureBudgetError';
   }
 }
