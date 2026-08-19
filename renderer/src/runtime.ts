@@ -249,17 +249,17 @@ export class LuxoBrowserRuntime {
         scorer,
         publish: (message) => this.route(generation, "vad", () => { protocol.sendVad(message.event, message.t); }),
         onUtterance: (pcm) => this.route(generation, "vad", () => { protocol.sendUtterancePcm(pcm); }),
-        onError: (error) => this.report("vad", error),
+        onError: (error) => this.route(generation, "vad", () => this.report("vad", error)),
       });
       scorerTransferred = true;
       this.microphone = this.dependencies.createMicrophone({
         sink: this.vad,
-        onError: (error) => this.report("microphone", error),
+        onError: (error) => this.route(generation, "microphone", () => this.report("microphone", error)),
       });
       this.gaze = this.dependencies.createGaze({
         camera: this.camera as CameraSensor,
         publish: ({ type: _type, ...fact }) => this.route(generation, "gaze", () => { protocol.sendGaze(fact); }),
-        onError: (error) => this.report("gaze", error),
+        onError: (error) => this.route(generation, "gaze", () => this.report("gaze", error)),
       });
       const sensorResults = await Promise.allSettled([this.gaze.start(), this.microphone.start()]);
       const sensorFailure = sensorResults.find(
