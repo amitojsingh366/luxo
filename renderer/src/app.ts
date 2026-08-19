@@ -173,13 +173,23 @@ export async function mountRenderer(root: HTMLElement): Promise<RendererHandle> 
   const teardown = (clearRoot: boolean) => {
     if (destroyed) return;
     destroyed = true;
-    renderer.setAnimationLoop(null);
-    resizeObserver.disconnect();
-    lightingRig?.dispose();
+    let firstError: unknown;
+    const release = (operation: () => void) => {
+      try {
+        operation();
+      } catch (error) {
+        firstError ??= error;
+      }
+    };
+    release(() => renderer.setAnimationLoop(null));
+    release(() => resizeObserver.disconnect());
+    const rig = lightingRig;
     lightingRig = null;
-    cameraRig.dispose();
-    renderer.dispose();
-    if (clearRoot) root.replaceChildren();
+    release(() => rig?.dispose());
+    release(() => cameraRig.dispose());
+    release(() => renderer.dispose());
+    if (clearRoot) release(() => root.replaceChildren());
+    if (firstError !== undefined) throw firstError;
   };
 
   let robot: URDFRobot;
@@ -200,7 +210,11 @@ export async function mountRenderer(root: HTMLElement): Promise<RendererHandle> 
   } catch (error) {
     status.textContent = failureStatus;
     status.dataset.tone = "error";
-    teardown(false);
+    try {
+      teardown(false);
+    } catch {
+      // Setup failure remains the actionable error; cleanup is best effort.
+    }
     throw error;
   }
 
