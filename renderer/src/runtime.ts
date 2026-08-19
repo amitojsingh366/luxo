@@ -239,12 +239,13 @@ export class LuxoBrowserRuntime {
     const cameraSpec = cameraResult.value;
     const scorer = scorerResult.value;
     try {
-      this.protocol = this.dependencies.createProtocol(this.protocolOptions(cameraSpec));
+      this.protocol = this.dependencies.createProtocol(this.protocolOptions(cameraSpec, generation));
       const protocol = this.protocol;
+      protocol.connect();
       this.vad = this.dependencies.createVad({
         scorer,
-        publish: (message) => this.guard("vad", () => { protocol.sendVad(message.event, message.t); }),
-        onUtterance: (pcm) => this.guard("vad", () => { protocol.sendUtterancePcm(pcm); }),
+        publish: (message) => this.route(generation, "vad", () => { protocol.sendVad(message.event, message.t); }),
+        onUtterance: (pcm) => this.route(generation, "vad", () => { protocol.sendUtterancePcm(pcm); }),
         onError: (error) => this.report("vad", error),
       });
       this.microphone = this.dependencies.createMicrophone({
@@ -253,7 +254,7 @@ export class LuxoBrowserRuntime {
       });
       this.gaze = this.dependencies.createGaze({
         camera: this.camera as CameraSensor,
-        publish: ({ type: _type, ...fact }) => this.guard("gaze", () => { protocol.sendGaze(fact); }),
+        publish: ({ type: _type, ...fact }) => this.route(generation, "gaze", () => { protocol.sendGaze(fact); }),
         onError: (error) => this.report("gaze", error),
       });
       const sensorResults = await Promise.allSettled([this.gaze.start(), this.microphone.start()]);
@@ -264,7 +265,6 @@ export class LuxoBrowserRuntime {
       if (generation !== this.generation || this.destroyed) {
         throw new Error("Luxo startup was cancelled");
       }
-      protocol.connect();
       this.started = true;
       this.clearPrompt();
     } catch (error) {
@@ -283,19 +283,19 @@ export class LuxoBrowserRuntime {
     }
   }
 
-  private protocolOptions(camera: CameraSpec): ProtocolClientOptions {
+  private protocolOptions(camera: CameraSpec, generation: number): ProtocolClientOptions {
     return {
       url: "ws://127.0.0.1:8765",
       hello: { type: "hello", fps: 60, camera },
-      onConnected: () => this.handleConnected(),
-      onDisconnected: () => this.handleDisconnected(),
-      onBodyState: (state) => this.guard("body_state", () => this.handleBodyState(state)),
-      onCue: (cue) => this.guard("audio", () => this.mixer.playCue(cue)),
-      onCaptureFrame: () => this.captureFrame(),
-      onSpeakBegin: (message) => this.guard("tts", () => this.mixer.speakBegin(message)),
-      onTtsPcm: (pcm) => this.guard("tts", () => this.mixer.enqueueTtsPcm(pcm)),
-      onSpeakEnd: () => this.guard("tts", () => this.mixer.speakEnd({ type: "speak_end" })),
-      onError: (error) => this.report("protocol", error),
+      onConnected: () => this.route(generation, "protocol", () => this.handleConnected()),
+      onDisconnected: () => this.route(generation, "protocol", () => this.handleDisconnected()),
+      onBodyState: (state) => this.route(generation, "body_state", () => this.handleBodyState(state)),
+      onCue: (cue) => this.route(generation, "audio", () => this.mixer.playCue(cue)),
+      onCaptureFrame: () => this.route(generation, "camera", () => this.captureFrame()),
+      onSpeakBegin: (message) => this.route(generation, "tts", () => this.mixer.speakBegin(message)),
+      onTtsPcm: (pcm) => this.route(generation, "tts", () => this.mixer.enqueueTtsPcm(pcm)),
+      onSpeakEnd: () => this.route(generation, "tts", () => this.mixer.speakEnd({ type: "speak_end" })),
+      onError: (error) => this.route(generation, "protocol", () => this.report("protocol", error)),
     };
   }
 
@@ -399,6 +399,10 @@ export class LuxoBrowserRuntime {
 
   private guard(where: string, operation: () => void): void {
     try { operation(); } catch (error) { this.report(where, errorOf(error)); }
+  }
+
+  private route(generation: number, where: string, operation: () => void): void {
+    if (!this.destroyed && generation === this.generation) this.guard(where, operation);
   }
 
   private report(where: string, error: Error): void {
