@@ -6,7 +6,7 @@ export const CHECK_DEFINITIONS = Object.freeze([
   { id: 'mediapipe', title: 'Face Landmarker', detail: 'Loads the local MediaPipe WASM and model assets.' },
   { id: 'silero', title: 'Silero VAD', detail: 'Loads local ONNX/WASM and runs one silent frame.' },
   { id: 'audio', title: 'Audio output', detail: 'Use Play tone for a user-gesture-gated local sample.', gesture: true },
-  { id: 'websocket', title: 'Core socket', detail: 'Connects to ws://127.0.0.1:8765 and sends only hello.' },
+  { id: 'websocket', title: 'Core socket', detail: 'Opens and closes ws://127.0.0.1:8765 without sending anything.' },
 ] as const);
 
 export type CheckId = (typeof CHECK_DEFINITIONS)[number]['id'];
@@ -302,28 +302,31 @@ async function audioCheck({ signal }: CheckContext): Promise<string> {
   }
 }
 
+// Reachability only. A hello would announce browser and camera readiness and
+// can push the core to DORMANT (PRD 10.4) even when this page's own camera
+// check failed, so this check opens and closes the socket and sends nothing.
 async function websocketCheck({ signal }: CheckContext): Promise<string> {
-  const { ProtocolClient } = await import('./protocol/client');
-  let resolveConnected!: () => void;
-  let rejectConnected!: (error: Error) => void;
-  const connected = new Promise<void>((resolve, reject) => {
-    resolveConnected = resolve;
-    rejectConnected = reject;
+  const url = 'ws://127.0.0.1:8765';
+  const socket = new WebSocket(url);
+  const stop = () => {
+    if (socket.readyState < WebSocket.CLOSING) socket.close(1000, 'preflight complete');
+  };
+  const opened = new Promise<void>((resolve, reject) => {
+    socket.addEventListener('open', () => resolve(), { once: true });
+    socket.addEventListener('error', () => reject(new Error('WebSocket transport error')), { once: true });
+    socket.addEventListener(
+      'close',
+      (event) => reject(new Error(`Socket closed before opening (code ${event.code})`)),
+      { once: true },
+    );
   });
-  const client = new ProtocolClient({
-    url: 'ws://127.0.0.1:8765',
-    onConnected: resolveConnected,
-    onError: rejectConnected,
-  });
-  const stop = () => client.disconnect();
   signal.addEventListener('abort', stop, { once: true });
   try {
-    client.connect();
-    await withDeadline(connected, 2_000, signal);
-    return 'Connected to ws://127.0.0.1:8765; normal hello sent.';
+    await withDeadline(opened, 2_000, signal);
+    return `Reached ${url} and closed again; no hello sent.`;
   } finally {
     signal.removeEventListener('abort', stop);
-    client.disconnect();
+    stop();
   }
 }
 
