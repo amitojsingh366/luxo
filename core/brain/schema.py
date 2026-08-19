@@ -9,10 +9,10 @@ Validation and JSON repair are assigned to the later ``plan-schema`` packet.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 
 
-class ActionOp(StrEnum):
+class ActionOp(str, Enum):
     GESTURE = "gesture"
     LOOK_AT = "look_at"
     LIGHT = "light"
@@ -23,7 +23,7 @@ class ActionOp(StrEnum):
     WAIT = "wait"
 
 
-class GestureName(StrEnum):
+class GestureName(str, Enum):
     PERK_UP = "perk_up"
     NOD = "nod"
     DOUBLE_TAKE = "double_take"
@@ -36,7 +36,7 @@ class GestureName(StrEnum):
     REGARD = "regard"
 
 
-class LightPreset(StrEnum):
+class LightPreset(str, Enum):
     WARM_IDLE = "warm_idle"
     WARM_BRIGHT = "warm_bright"
     COOL_DIM = "cool_dim"
@@ -46,14 +46,14 @@ class LightPreset(StrEnum):
     SAD_FADE = "sad_fade"
 
 
-class LightPattern(StrEnum):
+class LightPattern(str, Enum):
     STEADY = "steady"
     PULSE = "pulse"
     FLICKER = "flicker"
     BLINK = "blink"
 
 
-class SfxName(StrEnum):
+class SfxName(str, Enum):
     CHIRP_UP = "chirp_up"
     CHIRP_FOUND = "chirp_found"
     BOING = "boing"
@@ -64,7 +64,7 @@ class SfxName(StrEnum):
     CLICK = "click"
 
 
-class PostureName(StrEnum):
+class PostureName(str, Enum):
     REST = "rest"
     ALERT = "alert"
     SLUMP = "slump"

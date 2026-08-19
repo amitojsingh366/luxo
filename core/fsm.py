@@ -7,13 +7,13 @@ the only component permitted to assign character intent from blackboard facts.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 from typing import Protocol
 
 from .blackboard import BlackboardSnapshot
 
 
-class BehaviorState(StrEnum):
+class BehaviorState(str, Enum):
     BOOT = "BOOT"
     DORMANT = "DORMANT"
     NOTICING = "NOTICING"
