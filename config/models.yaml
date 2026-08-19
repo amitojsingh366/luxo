@@ -1,0 +1,248 @@
+{
+  "manifest_version": 1,
+  "about": [
+    "Pinned asset manifest. setup.sh downloads these into ~/.cache/lumen (core)",
+    "or renderer/public (browser), verifies SHA-256, and never commits weights.",
+    "This file is JSON-compatible YAML for the same reason as config/default.yaml:",
+    "JSON is a strict YAML subset, so the repo needs no YAML dependency. JSON has",
+    "no comment syntax, so every provenance note that would have been a comment is",
+    "an explicit field instead - sha256_source, license_source, verify_command and",
+    "notes. Those fields are greppable and are asserted by the validation tooling",
+    "RULE: sha256 is either a 64-character lowercase hex digest or the literal",
+    "marker UNVERIFIED. Never write a guessed digest. An UNVERIFIED entry is a known",
+    "gap with a recorded reason and the exact command that closes it."
+  ],
+  "unverified_marker": "UNVERIFIED",
+  "destinations": {
+    "core_cache": {
+      "root": "~/.cache/lumen",
+      "note": "PRD 12.1. Core-side weights, outside the repo, never committed."
+    },
+    "browser_public": {
+      "root": "renderer/public",
+      "note": "Vite static root. Served at the paths the sensors already request. The repo .gitignore ignores models/, so weights staged here are never committed."
+    }
+  },
+  "assets": [
+    {
+      "name": "whisper_base_en_q5",
+      "kind": "file",
+      "consumers": ["core/speech/stt.py"],
+      "consumer_detail": "WhisperCppSpeechToText model_path. _MODEL_NAME accepts ggml-base.en-q5_0.bin or ggml-base.en-q5_1.bin.",
+      "destination": {
+        "layout": "core_cache",
+        "path": "~/.cache/lumen/ggml-base.en-q5_1.bin",
+        "served_at": null
+      },
+      "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en-q5_1.bin",
+      "url_canonical": true,
+      "url_note": "Upstream whisper.cpp model repo, pinned to commit 5359861c739e955e79d9a303bcbc70fb988958b1 rather than main so the bytes cannot move.",
+      "sha256": "4baf70dd0d7c4247ba2b81fafd9c01005ac77c2f9ef064e00dcf195d0e2fdd2f",
+      "sha256_source": "https://huggingface.co/api/models/ggerganov/whisper.cpp/tree/main - Hugging Face publishes lfs.oid for this file, and git-lfs uses SHA-256 as its object-id algorithm. The same digest is returned as the X-Linked-Etag header on a HEAD of the download URL. Two independent publisher responses agree; no bytes were downloaded.",
+      "size_bytes": 59721011,
+      "size_note": "57 MiB",
+      "license": "MIT",
+      "license_source": "https://huggingface.co/ggerganov/whisper.cpp - repo card license: mit. OpenAI Whisper weights are MIT and the ggml conversion is published under the whisper.cpp MIT licence.",
+      "verify_command": "sha256sum ~/.cache/lumen/ggml-base.en-q5_1.bin   # macOS: shasum -a 256 ~/.cache/lumen/ggml-base.en-q5_1.bin",
+      "notes": "PRD 2 names base.en Q5. The canonical repo publishes ONLY q5_1 for base.en - there is no ggml-base.en-q5_0.bin in ggerganov/whisper.cpp, so q5_1 is the approved q5 variant and is what stt.py's regex must match. Build whisper.cpp from source with CPU-only flags per PRD 12.3; the binary is not an asset in this manifest."
+    },
+    {
+      "name": "piper_voice_en_us_lessac_medium",
+      "kind": "file",
+      "consumers": ["core/speech/tts.py", "core/speech/phonemes.py"],
+      "consumer_detail": "PiperTextToSpeech model_path, loaded through onnxruntime (PRD 12.3 pip path, not a prebuilt Linux binary).",
+      "destination": {
+        "layout": "core_cache",
+        "path": "~/.cache/lumen/en_US-lessac-medium.onnx",
+        "served_at": null
+      },
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/f5a6e9094787fd865d65cb024472f977f9c542b5/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+      "url_canonical": true,
+      "url_note": "Official Piper voice repository, pinned to commit f5a6e9094787fd865d65cb024472f977f9c542b5 rather than main.",
+      "sha256": "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f",
+      "sha256_source": "https://huggingface.co/api/models/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium - published as lfs.oid, and confirmed identical to the X-Linked-Etag header on a HEAD of the download URL. git-lfs object ids are SHA-256. No bytes were downloaded.",
+      "size_bytes": 63201294,
+      "size_note": "60 MiB",
+      "license": "Blizzard Challenge 2013 Lessac corpus licence",
+      "license_source": "https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html - cited by the voice's own MODEL_CARD at the pinned commit.",
+      "verify_command": "sha256sum ~/.cache/lumen/en_US-lessac-medium.onnx   # macOS: shasum -a 256 ~/.cache/lumen/en_US-lessac-medium.onnx",
+      "notes": "OWNER ACTION: this is a research-corpus licence, not a permissive one. It is fine for a recorded challenge demo but must be reviewed before any commercial or redistributed use. Permissively-licensed alternatives were checked: en_US-ryan-medium is CC BY-NC-SA 4.0 (also non-commercial) and en_US-amy-medium's MODEL_CARD says only 'See URL'. No clearly permissive 22.05 kHz espeak-type en_US voice was found.",
+      "voice": {
+        "phoneme_type": "espeak",
+        "espeak_voice": "en-us",
+        "sample_rate": 22050,
+        "length_scale": 0.88,
+        "num_symbols": 256,
+        "num_speakers": 1,
+        "quality": "medium",
+        "voice_note": "phoneme_type espeak is required by core/speech/phonemes.py. sample_rate 22050 satisfies tts.SAMPLE_HZ and PRD 8.4; length_scale 0.88 is the PRD 8.4 value and overrides the config's own inference.length_scale of 1.0. Quality 'medium' is the only en_US tier at 22.05 kHz - 'low' voices are 16 kHz and would fail tts.load_piper_metadata."
+      }
+    },
+    {
+      "name": "piper_voice_en_us_lessac_medium_config",
+      "kind": "file",
+      "consumers": ["core/speech/tts.py", "core/speech/phonemes.py"],
+      "consumer_detail": "tts.load_piper_metadata and phonemes.load_voice_phoneme_config both read this file. It carries phoneme_id_map, phoneme_type, espeak.voice, and the noise scales.",
+      "destination": {
+        "layout": "core_cache",
+        "path": "~/.cache/lumen/en_US-lessac-medium.onnx.json",
+        "served_at": null
+      },
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/f5a6e9094787fd865d65cb024472f977f9c542b5/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
+      "url_canonical": true,
+      "url_note": "Same pinned commit as the voice weights. Piper requires the config to sit beside the .onnx it describes.",
+      "sha256": "efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0",
+      "sha256_source": "Computed locally with shasum -a 256 over the 4885-byte file fetched from the pinned URL above. This file is a small JSON config, not model weights, so it was downloaded and hashed directly rather than trusted from a header. It is not a git-lfs object, so no publisher digest exists for it.",
+      "size_bytes": 4885,
+      "size_note": "4.8 KiB",
+      "license": "Blizzard Challenge 2013 Lessac corpus licence",
+      "license_source": "https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html - inherits the voice's licence.",
+      "verify_command": "sha256sum ~/.cache/lumen/en_US-lessac-medium.onnx.json   # macOS: shasum -a 256 ~/.cache/lumen/en_US-lessac-medium.onnx.json",
+      "notes": "Verified content at this digest: audio.sample_rate 22050, phoneme_type espeak, espeak.voice en-us, num_symbols 256, num_speakers 1, phoneme_map {}, and a 154-entry phoneme_id_map whose special symbols are _ = 0, ^ = 1, $ = 2, space = 3. Every key in that map is a single codepoint, so multi-codepoint handling in phonemes.py is defensive rather than exercised by this voice."
+    },
+    {
+      "name": "mediapipe_face_landmarker",
+      "kind": "file",
+      "consumers": ["renderer/src/sensors/gaze.ts"],
+      "consumer_detail": "DEFAULT_MODEL_PATH. Loaded by FaceLandmarker with outputFacialTransformationMatrixes for PRD 5.1 gaze.",
+      "destination": {
+        "layout": "browser_public",
+        "path": "renderer/public/models/face_landmarker.task",
+        "served_at": "/models/face_landmarker.task"
+      },
+      "url": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+      "url_canonical": true,
+      "url_note": "Google's documented bucket. The docs page links the float16/latest/ path; the float16/1/ path pinned here is the immutable versioned alias. A HEAD of both returns the same size and the same md5, so they are currently identical bytes, and /1/ cannot be moved under us.",
+      "sha256": "UNVERIFIED",
+      "sha256_source": "Google publishes no SHA-256 for this bundle. The bucket returns only crc32c and md5 in the x-goog-hash header, and the docs page states no digest. Downloading the 3.6 MiB bundle to compute one was out of scope for this packet, so the field is left explicitly unpinned rather than guessed.",
+      "size_bytes": 3758596,
+      "size_note": "3.6 MiB, from the Content-Length and x-goog-stored-content-length of a HEAD request",
+      "license": "Apache-2.0",
+      "license_source": "UNCONFIRMED. https://developers.google.com/edge/mediapipe/solutions/vision/face_landmarker does not restate a licence for the model bundle itself; its footer covers only documentation (CC BY 4.0) and code samples (Apache 2.0). MediaPipe Solutions model bundles are published under Apache-2.0, but the owner should confirm against the model card before redistributing.",
+      "verify_command": "curl -fsSL 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task' -o renderer/public/models/face_landmarker.task && sha256sum renderer/public/models/face_landmarker.task   # macOS: shasum -a 256; paste the digest over UNVERIFIED in this file",
+      "additional_digests": {
+        "md5": "b0e7274907a1644404fef66b28dd6d85",
+        "md5_source": "x-goog-hash: md5=sOcnSQehZEQE/vZrKN1thQ== on a HEAD of the pinned URL, base64-decoded to hex. Also matches the returned ETag. This is a publisher digest and is enough to detect a corrupted download, but MD5 is not collision-resistant and must not be treated as the supply-chain pin."
+      },
+      "notes": "Object generation 1683136941916318, last modified 2023-05-03. Requires the MediaPipe WASM bundle below."
+    },
+    {
+      "name": "silero_vad",
+      "kind": "file",
+      "consumers": ["renderer/src/sensors/vad.ts"],
+      "consumer_detail": "DEFAULT_SILERO_MODEL_PATH, run by SileroVadScorer through onnxruntime-web.",
+      "destination": {
+        "layout": "browser_public",
+        "path": "renderer/public/models/silero_vad.onnx",
+        "served_at": "/models/silero_vad.onnx"
+      },
+      "url": "https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx",
+      "url_canonical": true,
+      "url_note": "Upstream Silero repository at release tag v5.1.2. The project ships no release assets, so the tagged path in the source tree is the canonical download.",
+      "sha256": "UNVERIFIED",
+      "sha256_source": "Silero publishes no checksum: there are no release assets, and the GitHub contents API returns only a git blob SHA-1, which is not a content SHA-256. raw.githubusercontent.com does return a 64-hex ETag that looks like a SHA-256 - it is NOT. This was tested by fetching two small files from the same tag and comparing: LICENSE has ETag a03c519c...f591 but content SHA-256 2e63e9a3...520b, and README.md has ETag 281a4a7e...ac01 but content SHA-256 aa941df0...2b85. Do not copy that ETag into the sha256 field.",
+      "size_bytes": 2327524,
+      "size_note": "2.2 MiB, from the GitHub contents API and the Content-Length of a HEAD request",
+      "license": "MIT",
+      "license_source": "https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/LICENSE - MIT License, Copyright (c) 2020-present Silero Team.",
+      "verify_command": "curl -fsSL 'https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx' -o renderer/public/models/silero_vad.onnx && sha256sum renderer/public/models/silero_vad.onnx   # macOS: shasum -a 256; paste the digest over UNVERIFIED in this file",
+      "notes": "v5.1.2 is pinned deliberately, not because it is newest. vad.ts implements the v5 graph signature - inputs input [1,512], state [2,1,128], sr int64, outputs output and stateN. v6.x tags exist (v6.2.1 is current) and have NOT been validated against that adapter, so upgrading requires re-checking the tensor names and state shape in renderer/src/sensors/vad.ts first."
+    },
+    {
+      "name": "mediapipe_tasks_vision_wasm",
+      "kind": "directory",
+      "consumers": ["renderer/src/sensors/gaze.ts"],
+      "consumer_detail": "DEFAULT_WASM_PATH, passed to FilesetResolver.forVisionTasks. The resolver picks the SIMD or the nosimd build at runtime.",
+      "destination": {
+        "layout": "browser_public",
+        "path": "renderer/public/mediapipe/wasm",
+        "served_at": "/mediapipe/wasm"
+      },
+      "url": "https://registry.npmjs.org/@mediapipe/tasks-vision/-/tasks-vision-1.0.1.tgz",
+      "url_canonical": true,
+      "url_note": "Not a separate download. renderer/package.json already pins @mediapipe/tasks-vision 1.0.1, so setup.sh should copy node_modules/@mediapipe/tasks-vision/wasm/ into the destination after npm ci rather than fetching this tarball by hand.",
+      "sha256": "UNVERIFIED",
+      "sha256_source": "A directory has no single SHA-256, so the entry-level field cannot be pinned by construction. The real supply-chain pin for this asset is the npm tarball integrity below, which npm ci already enforces against renderer/package-lock.json. Per-file digests are recorded in required_files.",
+      "size_bytes": 23363753,
+      "size_note": "22 MiB for the four required files. The full wasm/ directory is 35444140 bytes because it also contains vision_wasm_module_internal.js and .wasm, which FilesetResolver does not fetch.",
+      "license": "Apache-2.0",
+      "license_source": "https://registry.npmjs.org/@mediapipe/tasks-vision/1.0.1 - package license field: Apache-2.0.",
+      "verify_command": "sha256sum renderer/public/mediapipe/wasm/*   # macOS: shasum -a 256 renderer/public/mediapipe/wasm/*; compare against required_files below",
+      "npm": {
+        "package": "@mediapipe/tasks-vision",
+        "version": "1.0.1",
+        "integrity": "sha512-rvRE2FmAZ6ZxKSw7wq+e+jQDpN3t1B/tD2mJz9SmAzb1msoDkd4dMoE4wAh8Z30Um0PQwLiHr9QtomhmXk3aUQ==",
+        "integrity_source": "Published by the npm registry at https://registry.npmjs.org/@mediapipe/tasks-vision/1.0.1 and identical to the integrity already recorded in renderer/package-lock.json. This is the authoritative check and it runs automatically during npm ci."
+      },
+      "required_files": [
+        {
+          "path": "wasm/vision_wasm_internal.js",
+          "size_bytes": 323377,
+          "sha256": "e170ee67dd4e16c1a6fcd8840a206687e5a59b22c20e4a902bc445b095454d73",
+          "sha256_source": "MIRROR, not publisher: https://data.jsdelivr.com/v1/packages/npm/@mediapipe/tasks-vision@1.0.1?structure=flat indexes the npm tarball and publishes a base64 SHA-256 per file, decoded to hex here. The algorithm was confirmed by fetching that package's own package.json from the jsDelivr CDN and reproducing its published hash locally."
+        },
+        {
+          "path": "wasm/vision_wasm_internal.wasm",
+          "size_bytes": 11756954,
+          "sha256": "8da277a733926eacd0474b8704b36742d6ec3231c57a860c5b889dff8f1df886",
+          "sha256_source": "MIRROR, not publisher: jsDelivr package index for @mediapipe/tasks-vision@1.0.1, as above."
+        },
+        {
+          "path": "wasm/vision_wasm_nosimd_internal.js",
+          "size_bytes": 323180,
+          "sha256": "e81d715a3d42cc3373602eb2f7aff795d164934db680e32496b65dab537f9658",
+          "sha256_source": "MIRROR, not publisher: jsDelivr package index for @mediapipe/tasks-vision@1.0.1, as above."
+        },
+        {
+          "path": "wasm/vision_wasm_nosimd_internal.wasm",
+          "size_bytes": 10960242,
+          "sha256": "a28483cd42e74e855bf5ebdb6b40d9b66a5b49e35e95020bc97669e6822a3192",
+          "sha256_source": "MIRROR, not publisher: jsDelivr package index for @mediapipe/tasks-vision@1.0.1, as above."
+        }
+      ],
+      "notes": "The per-file digests are a convenience cross-check, not the pin. They were read from a CDN index of the npm tarball, not from Google or from npm itself, so they are labelled MIRROR. If one of them ever disagrees with a locally staged file, trust npm ci and investigate rather than editing this file."
+    },
+    {
+      "name": "onnxruntime_web_wasm",
+      "kind": "directory",
+      "consumers": ["renderer/src/sensors/vad.ts"],
+      "consumer_detail": "DEFAULT_ORT_WASM_PATH, assigned to ort.env.wasm.wasmPaths with numThreads 1 and proxy false.",
+      "destination": {
+        "layout": "browser_public",
+        "path": "renderer/public/onnxruntime/wasm",
+        "served_at": "/onnxruntime/wasm/"
+      },
+      "url": "https://registry.npmjs.org/onnxruntime-web/-/onnxruntime-web-1.27.0.tgz",
+      "url_canonical": true,
+      "url_note": "Not a separate download. renderer/package.json already pins onnxruntime-web 1.27.0, so setup.sh should copy the required files out of node_modules/onnxruntime-web/dist/ after npm ci.",
+      "sha256": "UNVERIFIED",
+      "sha256_source": "A directory has no single SHA-256, so the entry-level field cannot be pinned by construction. The real supply-chain pin is the npm tarball integrity below, enforced by npm ci against renderer/package-lock.json. Per-file digests are recorded in required_files.",
+      "size_bytes": 13504158,
+      "size_note": "13 MiB for the two required files. Copying every dist/*.wasm and its .mjs would cost about 76 MiB because it pulls in the asyncify, jsep, and jspi builds, none of which the wasm-only execution provider in vad.ts loads.",
+      "license": "MIT",
+      "license_source": "https://registry.npmjs.org/onnxruntime-web/1.27.0 - package license field: MIT.",
+      "verify_command": "sha256sum renderer/public/onnxruntime/wasm/*   # macOS: shasum -a 256 renderer/public/onnxruntime/wasm/*; compare against required_files below",
+      "npm": {
+        "package": "onnxruntime-web",
+        "version": "1.27.0",
+        "integrity": "sha512-ogDLsqIozHZwifPuN37OproAo0byX6t43/bP8GzeZWBWD6MOGExswFAx3up4NS/vvWBOg2u2PXomDt3rMmdQSg==",
+        "integrity_source": "Published by the npm registry at https://registry.npmjs.org/onnxruntime-web/1.27.0 and identical to the integrity already recorded in renderer/package-lock.json. This is the authoritative check and it runs automatically during npm ci."
+      },
+      "required_files": [
+        {
+          "path": "ort-wasm-simd-threaded.mjs",
+          "size_bytes": 24180,
+          "sha256": "0a1e718d99c41b22c21f2520ff4f9e883a6b5533856e398d21816ee8eb8185d3",
+          "sha256_source": "MIRROR, not publisher: https://data.jsdelivr.com/v1/packages/npm/onnxruntime-web@1.27.0?structure=flat, base64 SHA-256 decoded to hex. Algorithm confirmed as described on the MediaPipe entry."
+        },
+        {
+          "path": "ort-wasm-simd-threaded.wasm",
+          "size_bytes": 13479978,
+          "sha256": "d1ab1b94b16a65b29d710d0b587b29e7bed336827577623913479b8afe8113e6",
+          "sha256_source": "MIRROR, not publisher: jsDelivr package index for onnxruntime-web@1.27.0, as above."
+        }
+      ],
+      "notes": "PRD 12.3 requires the pip onnxruntime path for the Python side; this browser-side bundle is the separate onnxruntime-web package and is unrelated to that constraint. Source files are under node_modules/onnxruntime-web/dist/ but are served flat from /onnxruntime/wasm/, because ort.env.wasm.wasmPaths is a directory prefix."
+    }
+  ]
+}
