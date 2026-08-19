@@ -2,9 +2,11 @@
 """Core-side preflight for Luxo (PRD 12.2).
 
 Run ``python3 doctor.py`` before ``./run.sh``. Every check reports PASS, FAIL,
-or SKIP with actionable remediation, and the process exits non-zero when any
-check fails. The browser half of preflight lives in the ``/selftest`` page and
-is deliberately not duplicated here.
+WARN, or SKIP with actionable remediation, and the process exits non-zero when
+any check fails. Only FAIL affects the exit code: a WARN records a real but
+accepted gap -- an asset that is present but that the manifest cannot pin to a
+digest -- and must not block the demo. The browser half of preflight lives in
+the ``/selftest`` page and is deliberately not duplicated here.
 
 Design: every check takes its environment probe as a parameter with a real
 default, so the whole module runs offline against injected fakes -- no network,
@@ -80,6 +82,7 @@ class Status(str, Enum):
 
     PASS = "PASS"
     FAIL = "FAIL"
+    WARN = "WARN"
     SKIP = "SKIP"
 
 
@@ -94,6 +97,10 @@ class CheckResult:
     def failed(self) -> bool:
         return self.status is Status.FAIL
 
+    @property
+    def warned(self) -> bool:
+        return self.status is Status.WARN
+
 
 def _passed(name: str, detail: str) -> CheckResult:
     return CheckResult(name, Status.PASS, detail)
@@ -101,6 +108,10 @@ def _passed(name: str, detail: str) -> CheckResult:
 
 def _failed(name: str, detail: str, remediation: Sequence[str] = ()) -> CheckResult:
     return CheckResult(name, Status.FAIL, detail, tuple(remediation))
+
+
+def _warned(name: str, detail: str, remediation: Sequence[str] = ()) -> CheckResult:
+    return CheckResult(name, Status.WARN, detail, tuple(remediation))
 
 
 def _skipped(name: str, detail: str, remediation: Sequence[str] = ()) -> CheckResult:
@@ -408,6 +419,19 @@ MANIFEST_HASH_KEYS = ("sha256", "sha256sum", "sha256_hex", "hash", "digest", "ch
 MANIFEST_NAME_KEYS = ("name", "id", "key", "label")
 MANIFEST_SIZE_KEYS = ("size_bytes", "bytes", "size")
 
+# config/models.yaml nests each destination as {layout, path, served_at}, so a
+# path field may be a bare string or a mapping that carries the path under this
+# key. Both shapes are accepted; the layout roots in the manifest's own
+# 'destinations' table are a lookup for setup.sh, not part of the asset path.
+MANIFEST_NESTED_PATH_KEY = "path"
+MANIFEST_VERIFY_KEY = "verify_command"
+
+# The manifest may record a literal marker in place of a digest for an asset
+# whose publisher ships no SHA-256. It declares the marker itself; this is only
+# the fallback for a manifest that uses one without naming it.
+MANIFEST_MARKER_KEY = "unverified_marker"
+DEFAULT_UNVERIFIED_MARKER = "UNVERIFIED"
+
 
 @dataclass(frozen=True, slots=True)
 class AssetEntry:
@@ -415,6 +439,7 @@ class AssetEntry:
     path: str
     sha256: str
     size_bytes: int | None = None
+    verify_command: str | None = None
 
 
 class ManifestShapeError(ValueError):
@@ -457,6 +482,42 @@ def _first_string(entry: Mapping[str, Any], keys: Sequence[str]) -> str | None:
     return None
 
 
+def _entry_path(entry: Mapping[str, Any], keys: Sequence[str] = MANIFEST_PATH_KEYS) -> str | None:
+    """Read the destination path, accepting a bare string or a nested mapping.
+
+    ``{"destination": "~/.cache/lumen/x.bin"}`` and
+    ``{"destination": {"layout": "core_cache", "path": "~/.cache/lumen/x.bin"}}``
+    both yield the same path. Only the ``path`` member of the mapping is read;
+    ``layout`` and ``served_at`` are consumed by setup.sh and the renderer.
+    """
+
+    for key in keys:
+        if key not in entry:
+            continue
+        value = entry[key]
+        if isinstance(value, Mapping):
+            nested = value.get(MANIFEST_NESTED_PATH_KEY)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+            raise ManifestShapeError(
+                f"manifest field '{key}' is a mapping, so it must carry a non-empty "
+                f"string '{MANIFEST_NESTED_PATH_KEY}'"
+            )
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        raise ManifestShapeError(f"manifest field '{key}' must be a non-empty string")
+    return None
+
+
+def _optional_string(entry: Mapping[str, Any], key: str) -> str | None:
+    """Read a purely informational field. A bad value is dropped, never fatal."""
+
+    value = entry.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
 def _first_size(entry: Mapping[str, Any], keys: Sequence[str]) -> int | None:
     for key in keys:
         if key in entry:
@@ -476,7 +537,7 @@ def _asset_entry(name_hint: str | None, raw: Any) -> AssetEntry:
     if not isinstance(raw, Mapping):
         raise ManifestShapeError(f"asset '{label}' must be a mapping or a sha256 string")
 
-    path = _first_string(raw, MANIFEST_PATH_KEYS) or name_hint
+    path = _entry_path(raw) or name_hint
     if path is None:
         raise ManifestShapeError(
             f"asset '{label}' has no path field (any of {list(MANIFEST_PATH_KEYS)})"
@@ -492,6 +553,7 @@ def _asset_entry(name_hint: str | None, raw: Any) -> AssetEntry:
         path=path,
         sha256=digest,
         size_bytes=_first_size(raw, MANIFEST_SIZE_KEYS),
+        verify_command=_optional_string(raw, MANIFEST_VERIFY_KEY),
     )
 
 
@@ -499,6 +561,24 @@ def normalize_manifest(document: Any) -> list[AssetEntry]:
     """Turn an injected manifest document into entries, tolerating its shape."""
 
     return [_asset_entry(name, raw) for name, raw in _manifest_pairs(document)]
+
+
+def manifest_unverified_marker(document: Any) -> str:
+    """Read the manifest's own declaration of its UNVERIFIED marker."""
+
+    if isinstance(document, Mapping):
+        declared = document.get(MANIFEST_MARKER_KEY)
+        if isinstance(declared, str) and declared.strip():
+            return declared.strip()
+    return DEFAULT_UNVERIFIED_MARKER
+
+
+def _is_unverified(digest: str, marker: str) -> bool:
+    """True when the manifest recorded the marker instead of a real digest."""
+
+    if not marker or not marker.strip():
+        return False
+    return digest.strip().casefold() == marker.strip().casefold()
 
 
 def load_manifest_document(
@@ -571,14 +651,29 @@ def check_asset(
     filesystem: Filesystem,
     *,
     base_dir: Path = REPO_ROOT,
+    unverified_marker: str = DEFAULT_UNVERIFIED_MARKER,
 ) -> CheckResult:
+    """Verify one asset. Missing or corrupt is a FAIL; unpinnable is a WARN.
+
+    Three outcomes stay distinguishable on purpose. A missing file blocks the
+    run. A digest that disagrees with the manifest is the corruption and
+    supply-chain signal and must stay loud. A file that is present but whose
+    manifest entry carries the UNVERIFIED marker instead of a digest is a
+    recorded, deliberate gap: it warns, and it does not fail preflight.
+    """
+
     name = f"asset {entry.name}"
     expected = entry.sha256.strip().lower()
-    if not _HEX64.fullmatch(expected):
+    unverified = _is_unverified(entry.sha256, unverified_marker)
+    if not unverified and not _HEX64.fullmatch(expected):
         return _failed(
             name,
             "the manifest sha256 is not 64 hexadecimal characters",
-            ("fix the manifest entry; hashes are lowercase sha256 hex digests",),
+            (
+                "fix the manifest entry; hashes are lowercase sha256 hex digests",
+                "an asset with no published digest is recorded as "
+                f"{unverified_marker or DEFAULT_UNVERIFIED_MARKER}",
+            ),
         )
 
     resolved = _resolve_asset_path(entry.path, filesystem, base_dir)
@@ -594,7 +689,9 @@ def check_asset(
 
     try:
         actual_size = filesystem.size_bytes(resolved)
-        actual = filesystem.sha256(resolved).lower()
+        # An unverified entry has no digest to compare against, so the file is
+        # deliberately not hashed here.
+        actual = None if unverified else filesystem.sha256(resolved).lower()
     except OSError as exc:
         return _failed(
             name,
@@ -607,6 +704,22 @@ def check_asset(
             name,
             f"size mismatch at {resolved}: expected {entry.size_bytes} bytes, found {actual_size}",
             ("delete the file and re-run ./setup.sh to download it again",),
+        )
+    if unverified:
+        verify_hint = entry.verify_command or (
+            f"hash it yourself, then paste the digest over {unverified_marker} in the manifest"
+        )
+        return _warned(
+            name,
+            (
+                f"present at {resolved} ({actual_size} bytes) but the manifest records "
+                f"sha256 {unverified_marker}, so these bytes cannot be hash-checked"
+            ),
+            (
+                f"verify it by hand: {verify_hint}",
+                "the publisher ships no sha256 for this asset; the manifest records "
+                "why, and this is a known gap rather than a corrupt download",
+            ),
         )
     if actual != expected:
         return _failed(
@@ -646,7 +759,11 @@ def check_assets(
         return [_failed("assets", f"{source}: {exc}", manifest_help)]
     if not entries:
         return [_failed("assets", f"{source} lists no assets", manifest_help)]
-    return [check_asset(entry, filesystem, base_dir=base_dir) for entry in entries]
+    marker = manifest_unverified_marker(document)
+    return [
+        check_asset(entry, filesystem, base_dir=base_dir, unverified_marker=marker)
+        for entry in entries
+    ]
 
 
 def _mib(value: int) -> int:
@@ -863,10 +980,16 @@ def format_report(results: Sequence[CheckResult]) -> str:
     passed = sum(1 for result in results if result.status is Status.PASS)
     failed = sum(1 for result in results if result.status is Status.FAIL)
     skipped = sum(1 for result in results if result.status is Status.SKIP)
+    warned = sum(1 for result in results if result.status is Status.WARN)
     lines.append("")
-    lines.append(f"{passed} passed, {failed} failed, {skipped} skipped")
+    lines.append(f"{passed} passed, {failed} failed, {skipped} skipped, {warned} warned")
     if failed:
         lines.append("preflight failed; fix the items above before running ./run.sh")
+    elif warned:
+        lines.append(
+            "core preflight passed with warnings; they do not block ./run.sh. "
+            "Run the browser /selftest page next"
+        )
     else:
         lines.append("core preflight is clean; run the browser /selftest page next")
     return "\n".join(lines)
