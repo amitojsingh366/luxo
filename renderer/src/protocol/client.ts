@@ -221,7 +221,7 @@ export class ProtocolClient {
     }
     if (frame[0] !== BinaryPrefix.tts_pcm) {
       this.callbacks.onError?.(
-        new Error(`Core sent unknown binary prefix: 0x${frame[0].toString(16)}`),
+        new Error(`Core sent unknown binary prefix: 0x${frame[0]!.toString(16)}`),
       );
       return;
     }
