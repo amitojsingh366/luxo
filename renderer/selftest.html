@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#090d14" />
+    <meta name="description" content="Local browser preflight for Luxo's sensors and output." />
+    <title>Luxo · Browser preflight</title>
+    <style>
+      :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; color: #edf2f7; background:
+        radial-gradient(circle at 8% 0%, #263550 0, transparent 34rem), #090d14; }
+      main { width: min(960px, calc(100% - 32px)); margin: 0 auto; padding: 56px 0 72px; }
+      header { display: grid; gap: 12px; margin-bottom: 30px; }
+      .eyebrow { color: #f6c96b; font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+      h1 { margin: 0; max-width: 700px; font-size: clamp(34px, 6vw, 62px); line-height: .98; letter-spacing: -.04em; }
+      .lede { max-width: 720px; margin: 0; color: #aeb9c9; font-size: 16px; line-height: 1.6; }
+      .privacy { display: flex; gap: 10px; align-items: flex-start; padding: 13px 15px; border: 1px solid #26364c;
+        border-radius: 12px; color: #cbd6e5; background: #101823cc; }
+      .privacy strong { color: #8ee8c1; white-space: nowrap; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 10px; margin: 24px 0; }
+      button, .back { border: 1px solid #34445a; border-radius: 10px; padding: 10px 14px; color: #f7fafc;
+        background: #172231; font: inherit; font-weight: 750; cursor: pointer; text-decoration: none; }
+      button.primary { border-color: #f6c96b; color: #15100a; background: #f6c96b; }
+      button:disabled { cursor: not-allowed; opacity: .48; }
+      button:focus-visible, .back:focus-visible { outline: 3px solid #79b8ff; outline-offset: 2px; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      article { min-height: 152px; padding: 18px; border: 1px solid #26364c; border-radius: 14px; background: #101823e8; }
+      article[data-status="pass"] { border-color: #26775c; }
+      article[data-status="fail"] { border-color: #a7464e; }
+      .card-top { display: flex; justify-content: space-between; gap: 14px; align-items: start; }
+      h2 { margin: 0; font-size: 17px; }
+      .status { flex: none; border-radius: 999px; padding: 4px 8px; color: #aeb9c9; background: #1c2736;
+        font-size: 11px; font-weight: 850; letter-spacing: .08em; text-transform: uppercase; }
+      [data-status="pass"] .status { color: #9bf0cb; background: #14392e; }
+      [data-status="fail"] .status { color: #ffb5bb; background: #482229; }
+      .detail { min-height: 42px; margin: 12px 0 0; color: #9daabd; font-size: 13px; line-height: 1.5; }
+      .meter { height: 7px; margin-top: 12px; overflow: hidden; border-radius: 999px; background: #202b39; }
+      .meter > span { display: block; width: 0; height: 100%; background: #8ee8c1; transition: width 80ms linear; }
+      .card-action { margin-top: 12px; padding: 7px 10px; font-size: 12px; }
+      footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 24px; color: #758398; font-size: 12px; }
+      @media (max-width: 680px) { main { padding-top: 32px; } .grid { grid-template-columns: 1fr; } .privacy { display: block; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <span class="eyebrow">Luxo / local preflight</span>
+        <h1>Check the body before the performance.</h1>
+        <p class="lede">Run each browser-owned sensor and output path on this machine. Camera and microphone permission are requested only after you press Run preflight.</p>
+        <div class="privacy"><strong>Local by design.</strong><span>No frame, audio sample, face landmark, or model result is uploaded, recorded, or stored. The socket check reaches loopback only.</span></div>
+      </header>
+      <div class="toolbar">
+        <button class="primary" id="run" type="button">Run preflight</button>
+        <button id="stop" type="button">Stop and release devices</button>
+        <a class="back" href="/">Back to Luxo</a>
+      </div>
+      <section class="grid" id="checks" aria-label="Browser preflight checks"></section>
+      <footer><span id="summary" aria-live="polite">Eight checks pending.</span><span>Use localhost only · no LAN mode</span></footer>
+    </main>
+    <script type="module" src="/src/selftest.ts"></script>
+  </body>
+</html>
