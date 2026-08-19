@@ -174,6 +174,11 @@ class AnimationRuntime:
 
         self._blink_pending = True
 
+    def cancel_punctuation_blink(self) -> None:
+        """Cancel a pending or active punctuation bob."""
+        self._blink_pending = False
+        self._blink_started_at = None
+
     def reset(self) -> None:
         """Return all temporal state to the canonical rest boundary."""
 

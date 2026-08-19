@@ -166,7 +166,7 @@ class AnimationDirector:
         if state is BehaviorState.DORMANT:
             self._notice_due = None
             self._droop_due = None
-            self._scan = None
+            self._cancel_observation()
             self._desired_target = None
             self._runtime.clear_look_at_target()
             self._runtime.start_posture(PostureName.REST)
@@ -197,6 +197,7 @@ class AnimationDirector:
             self._set_light(LightPreset.CURIOUS_FOCUS)
         elif state is BehaviorState.DISENGAGING:
             self._notice_due = None
+            self._cancel_observation()
             self._desired_target = None
             self._runtime.clear_look_at_target()
             self._set_light(LightPreset.COOL_DIM)
@@ -253,6 +254,7 @@ class AnimationDirector:
             self._nonblink_light = (preset, selected)
             self._blink_restore = None
             self._blink_started_at = None
+            self._runtime.cancel_punctuation_blink()
         self._runtime.set_light(preset, selected)
         if selected is LightPattern.BLINK:
             self._runtime.start_punctuation_blink()
@@ -279,6 +281,13 @@ class AnimationDirector:
         if self._droop_due is not None and now >= self._droop_due:
             self._droop_due = None
             self._runtime.start_gesture(GestureName.DROOP)
+
+    def _cancel_observation(self) -> None:
+        self._scan = None
+        self._pending_capture_id = None
+        self._effects[:] = [
+            effect for effect in self._effects if not isinstance(effect, CaptureRequest)
+        ]
 
     def _target_for_tick(
         self,
@@ -361,16 +370,8 @@ def _validate_transition(transition: object) -> None:
 
 
 __all__ = [
-    "AnimationDirector",
-    "CaptureRequest",
-    "DirectorEffect",
-    "NOTICE_FREEZE_S",
-    "SCAN_DEFAULT_ARC_RAD",
-    "SCAN_DEFAULT_SPEED_RAD_S",
-    "SCAN_MAX_ARC_RAD",
-    "SCAN_MAX_SPEED_RAD_S",
-    "SCAN_MIN_ARC_RAD",
-    "SCAN_MIN_SPEED_RAD_S",
-    "SfxCue",
-    "TargetResolver",
+    "AnimationDirector", "CaptureRequest", "DirectorEffect", "NOTICE_FREEZE_S",
+    "SCAN_DEFAULT_ARC_RAD", "SCAN_DEFAULT_SPEED_RAD_S", "SCAN_MAX_ARC_RAD",
+    "SCAN_MAX_SPEED_RAD_S", "SCAN_MIN_ARC_RAD", "SCAN_MIN_SPEED_RAD_S",
+    "SfxCue", "TargetResolver",
 ]
