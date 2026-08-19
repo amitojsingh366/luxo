@@ -90,6 +90,7 @@ class WakeSequenceCoordinator:
         self._owns_executor = executor is None
         self._lock = threading.RLock()
         self._attempt = 0
+        self._generation = 0
         self._attempt_future: Future[None] | None = None
         self._pending: set[str] = set()
         self._failures: dict[str, BaseException] = {}
@@ -98,7 +99,7 @@ class WakeSequenceCoordinator:
         self._camera_ready = False
         self._models_event_sent = False
         self._browser_event_sent = False
-        self._opening_actions_sent = False
+        self._opening_action_index = 0
         self._rest_action_sent = False
         self._closed = False
 
@@ -145,18 +146,26 @@ class WakeSequenceCoordinator:
                 self._models_warm or not self._attempt_future.done()
             ):
                 return self._attempt_future
-            self._emit_opening_actions_locked()
+            self._attempt += 1
+            self._generation += 1
+            generation = self._generation
+            aggregate: Future[None] = Future()
+            self._attempt_future = aggregate
+            self._pending = set()
+            self._failures = {}
+            try:
+                self._emit_opening_actions_locked(generation)
+            except BaseException as error:
+                if not aggregate.done():
+                    self._failures = {"opening_action": error}
+                    aggregate.set_exception(WakeSequenceError(self._failures))
+                return aggregate
             if self._executor is None:
                 self._executor = ThreadPoolExecutor(
                     max_workers=len(self._COMPONENTS),
                     thread_name_prefix="luxo-warm",
                 )
-            self._attempt += 1
-            attempt = self._attempt
-            aggregate: Future[None] = Future()
-            self._attempt_future = aggregate
             self._pending = set(self._COMPONENTS)
-            self._failures = {}
             for name in self._COMPONENTS:
                 try:
                     worker = self._executor.submit(self._warmers[name].warm)
@@ -165,7 +174,7 @@ class WakeSequenceCoordinator:
                     worker.set_exception(error)
                 worker.add_done_callback(
                     lambda completed, component=name: self._worker_done(
-                        attempt, component, completed
+                        generation, component, completed
                     )
                 )
             return aggregate
@@ -175,18 +184,27 @@ class WakeSequenceCoordinator:
             if self._closed:
                 return
             self._closed = True
+            self._generation += 1
+            self._pending.clear()
+            aggregate = self._attempt_future
+            if aggregate is not None and not aggregate.done():
+                aggregate.cancel()
             executor = self._executor if self._owns_executor else None
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def _worker_done(
         self,
-        attempt: int,
+        generation: int,
         component: str,
         worker: Future[object],
     ) -> None:
         with self._lock:
-            if attempt != self._attempt or component not in self._pending:
+            if (
+                self._closed
+                or generation != self._generation
+                or component not in self._pending
+            ):
                 return
             try:
                 error = worker.exception()
@@ -207,6 +225,8 @@ class WakeSequenceCoordinator:
                 if not self._rest_action_sent:
                     self._emit_action(WAKE_ACTIONS[-1])
                     self._rest_action_sent = True
+                    if self._closed or generation != self._generation or aggregate.done():
+                        return
                 if not self._models_event_sent:
                     self._post_event(BehaviorEvent.MODELS_WARM)
                     self._models_event_sent = True
@@ -217,12 +237,13 @@ class WakeSequenceCoordinator:
             self._models_warm = True
             aggregate.set_result(None)
 
-    def _emit_opening_actions_locked(self) -> None:
-        if self._opening_actions_sent:
-            return
-        for action in WAKE_ACTIONS[:-1]:
+    def _emit_opening_actions_locked(self, generation: int) -> None:
+        while self._opening_action_index < len(WAKE_ACTIONS) - 1:
+            action = WAKE_ACTIONS[self._opening_action_index]
             self._emit_action(action)
-        self._opening_actions_sent = True
+            self._opening_action_index += 1
+            if self._closed or generation != self._generation:
+                raise RuntimeError("wake sequence closed while emitting startup actions")
 
     def _publish_browser_ready_locked(self) -> None:
         if self._browser_hello and self._camera_ready and not self._browser_event_sent:
