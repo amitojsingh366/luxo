@@ -11,6 +11,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, TypeAlias, Union
 
 
@@ -35,7 +36,7 @@ class FrozenConfig(Mapping[str, ConfigValue]):
         object.__setattr__(
             self,
             "_values",
-            {key: _freeze(value) for key, value in values.items()},
+            MappingProxyType({key: _freeze(value) for key, value in values.items()}),
         )
 
     def __getitem__(self, key: str) -> ConfigValue:
