@@ -21,6 +21,8 @@ TICK_HZ = 120
 FIXED_DT = 1.0 / TICK_HZ
 LOOK_TARGET_MAX_AGE_S = 1.0
 SPEECH_BOB_MAX_RAD = 0.025
+PUNCTUATION_BLINK_DURATION_S = 0.090
+PUNCTUATION_BLINK_HEAD_BOB_RAD = -0.020
 
 # At contemporary epoch values a binary64 timestamp has an approximately
 # 0.24 microsecond ULP. One microsecond admits accumulated 1/120 calculations
@@ -78,6 +80,7 @@ class AnimationSample:
     look_target: str | None
     requested_posture: PostureName | None
     speaking: bool
+    punctuation_blink: bool
 
 
 class AnimationRuntime:
@@ -104,6 +107,8 @@ class AnimationRuntime:
         self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
         self._speaking = False
+        self._blink_pending = False
+        self._blink_started_at: float | None = None
         self._light_preset = LightPreset.WARM_IDLE
         self._light_pattern = LightPattern.STEADY
         self._output.reset(self._poses.home)
@@ -164,6 +169,11 @@ class AnimationRuntime:
         self._speech_amplitude = 0.0
         self._speaking = False
 
+    def start_punctuation_blink(self) -> None:
+        """Queue the body-owned 90 ms punctuation bob for the next tick."""
+
+        self._blink_pending = True
+
     def reset(self) -> None:
         """Return all temporal state to the canonical rest boundary."""
 
@@ -175,6 +185,8 @@ class AnimationRuntime:
         self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
         self._speaking = False
+        self._blink_pending = False
+        self._blink_started_at = None
         self._light_preset = LightPreset.WARM_IDLE
         self._light_pattern = LightPattern.STEADY
         self._look_solver.reset()
@@ -190,6 +202,7 @@ class AnimationRuntime:
         if timestamp < 0.0:
             raise ValueError("now must be non-negative")
         self._validate_step(timestamp)
+        punctuation_blink = self._punctuation_blink_active(timestamp)
 
         self._apply_pending_motion(timestamp)
         home = LayerSample(joints=self._poses.home)
@@ -222,6 +235,11 @@ class AnimationRuntime:
                     if self._speaking
                     else 0.0
                 )
+                + (
+                    PUNCTUATION_BLINK_HEAD_BOB_RAD
+                    if punctuation_blink
+                    else 0.0
+                )
             )
         )
 
@@ -240,6 +258,7 @@ class AnimationRuntime:
             look_target=look_target,
             requested_posture=requested_posture,
             speaking=self._speaking,
+            punctuation_blink=punctuation_blink,
         )
 
     def _validate_step(self, now: float) -> None:
@@ -282,6 +301,17 @@ class AnimationRuntime:
             self._look_solver.reset()
             return None
         return fact
+
+    def _punctuation_blink_active(self, now: float) -> bool:
+        if self._blink_pending:
+            self._blink_pending = False
+            self._blink_started_at = now
+        if self._blink_started_at is None:
+            return False
+        if now - self._blink_started_at < PUNCTUATION_BLINK_DURATION_S:
+            return True
+        self._blink_started_at = None
+        return False
 
     def _handoff_look_posture(
         self, requested: PostureName | None, now: float
@@ -332,6 +362,8 @@ __all__ = [
     "FIXED_DT",
     "LOOK_TARGET_MAX_AGE_S",
     "LookAtFact",
+    "PUNCTUATION_BLINK_DURATION_S",
+    "PUNCTUATION_BLINK_HEAD_BOB_RAD",
     "SPEECH_BOB_MAX_RAD",
     "TICK_HZ",
 ]
