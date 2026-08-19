@@ -8,6 +8,8 @@ __pycache__/
 node_modules/
 renderer/dist/
 models/
+renderer/public/mediapipe/
+renderer/public/onnxruntime/
 recordings/
 *.wav
 *.pcm
