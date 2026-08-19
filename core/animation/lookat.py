@@ -39,7 +39,7 @@ class LookAtTarget:
 
 @dataclass(frozen=True, slots=True)
 class LookAtSolution:
-    """Gaze-layer joint values plus an optional whole-body posture request."""
+    """Additive gaze offsets plus an optional whole-body posture request."""
 
     offsets: JointVector
     requested_posture: PostureName | None = None
@@ -80,39 +80,46 @@ class LookAtSolver:
         current: JointVector,
         dt: float,
     ) -> LookAtSolution:
-        """Return the next analytic gaze target.
+        """Return gaze offsets relative to the supplied composed pose.
 
         ``dt`` advances recentering only for an already-held target. A target
         acquired on this call receives its full neck lead immediately; decay
-        begins on the next call. All inputs are validated before state changes.
+        begins on the next call. Desired aiming angles are absolute internally,
+        but the layer contract returns ``desired - current`` for additive
+        composition. All inputs are validated before state changes.
         """
 
         target_name, raw_azimuth, elevation, current_base, current_heading = (
             _validated_inputs(target, current, dt)
         )
 
-        if self._target is None or target_name != self._target:
+        if self._target is None:
             unwrapped_azimuth = current_heading + _wrapped_delta(
                 raw_azimuth, current_heading
             )
-            changed = True
-        else:
-            target_delta = _wrapped_delta(raw_azimuth, self._raw_azimuth_rad)
-            unwrapped_azimuth = self._unwrapped_azimuth_rad + target_delta
-            changed = target_delta != 0.0
-
-        if changed:
-            # Measuring from the current base retains any current neck angle:
-            # when already aimed, the first solution is exactly continuous.
             lead = _clamp(
                 unwrapped_azimuth - current_base,
                 -NECK_LEAD_LIMIT_RAD,
                 NECK_LEAD_LIMIT_RAD,
             )
         else:
-            lead = self._lead_rad * exp(
-                -float(dt) / NECK_RECENTER_TIME_CONSTANT_S
-            )
+            target_delta = _wrapped_delta(raw_azimuth, self._raw_azimuth_rad)
+            unwrapped_azimuth = self._unwrapped_azimuth_rad + target_delta
+            if target_name != self._target or target_delta != 0.0:
+                # Preserve the prior absolute base target when the neck can
+                # absorb a target change; the neck is the authored lead.
+                prior_base = (
+                    self._unwrapped_azimuth_rad - self._lead_rad
+                )
+                lead = _clamp(
+                    unwrapped_azimuth - prior_base,
+                    -NECK_LEAD_LIMIT_RAD,
+                    NECK_LEAD_LIMIT_RAD,
+                )
+            else:
+                lead = self._lead_rad * exp(
+                    -float(dt) / NECK_RECENTER_TIME_CONSTANT_S
+                )
 
         self._target = target_name
         self._raw_azimuth_rad = raw_azimuth
@@ -122,9 +129,9 @@ class LookAtSolver:
         head_pitch, posture = _elevation_solution(elevation)
         return LookAtSolution(
             offsets=JointVector(
-                base_yaw=unwrapped_azimuth - lead,
-                neck_yaw=lead,
-                head_pitch=head_pitch,
+                base_yaw=unwrapped_azimuth - lead - current.base_yaw,
+                neck_yaw=lead - current.neck_yaw,
+                head_pitch=head_pitch - current.head_pitch,
             ),
             requested_posture=posture,
         )
