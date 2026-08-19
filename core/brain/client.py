@@ -78,6 +78,10 @@ class OpenRouterTransportError(RuntimeError):
     """The endpoint returned an unusable streaming response."""
 
 
+class BrainWarmError(RuntimeError):
+    """Warm-up exhausted its repair attempt without a validated response."""
+
+
 class CompletionTransport(Protocol):
     def complete(
         self,
@@ -203,7 +207,7 @@ class OpenRouterBrainClient:
         with self._warm_lock:
             if self._warmed:
                 return
-            self.narrate(())
+            self._narrate((), strict=True)
             self._warmed = True
 
     def converse(
@@ -225,8 +229,13 @@ class OpenRouterBrainClient:
         return self._run("observe", self._messages(content), parse_observation_response)
 
     def narrate(self, missing: Sequence[str]) -> PlanResponse:
+        return self._narrate(missing, strict=False)
+
+    def _narrate(self, missing: Sequence[str], *, strict: bool) -> PlanResponse:
         payload = self._prompts.narrate_payload(missing)
-        return self._run("narrate", self._text_messages(payload), parse_plan_response)
+        return self._run(
+            "narrate", self._text_messages(payload), parse_plan_response, strict=strict
+        )
 
     def _text_messages(self, payload: Mapping[str, object]) -> list[dict[str, object]]:
         return self._messages(_compact_json(payload))
@@ -242,6 +251,8 @@ class OpenRouterBrainClient:
         call_type: CallType,
         messages: list[dict[str, object]],
         parser: Callable[[str], T],
+        *,
+        strict: bool = False,
     ) -> T:
         for attempt in range(2):
             repair = [{"role": "user", "content": REPAIR_INSTRUCTION}] if attempt else []
@@ -267,6 +278,8 @@ class OpenRouterBrainClient:
                 else:
                     self._emit_metrics(call_type, attempt, latency_ms, response, "valid")
                     return parsed
+        if strict:
+            raise BrainWarmError("OpenRouter warm-up failed after its repair attempt")
         if call_type == "observe":
             return ObservationResponse((), ())  # type: ignore[return-value]
         return PlanResponse("Oops—my thoughts got tangled! Can we try that again?", ())  # type: ignore[return-value]
@@ -323,6 +336,7 @@ def _token_count(value: object) -> int:
 
 __all__ = [
     "BrainClient",
+    "BrainWarmError",
     "CallMetrics",
     "CompletionTransport",
     "MAX_RESPONSE_BYTES",
