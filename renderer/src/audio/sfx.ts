@@ -89,6 +89,11 @@ interface Disposable {
   dispose(): unknown;
 }
 
+export interface RoutedSfxGraph {
+  play(name: SfxName): void;
+  dispose(): void;
+}
+
 function seconds(milliseconds: number): number {
   return milliseconds / 1_000;
 }
@@ -124,8 +129,18 @@ function makeSineSynth(
   });
 }
 
-class LuxoSfxGraph {
-  private readonly master = new Tone.Gain(0.32).toDestination();
+class SfxOutput {
+  protected readonly master: Tone.Gain;
+
+  constructor(destination?: Tone.InputNode) {
+    this.master =
+      destination === undefined
+        ? new Tone.Gain(0.32).toDestination()
+        : new Tone.Gain(0.32).connect(destination);
+  }
+}
+
+class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
   private readonly chirpUp = makeSineSynth(-10, {
     attack: 0.003,
     decay: 0.116,
@@ -203,7 +218,8 @@ class LuxoSfxGraph {
   private readonly resources: readonly Disposable[];
   private disposed = false;
 
-  constructor() {
+  constructor(destination?: Tone.InputNode) {
+    super(destination);
     this.resources = [
       this.chirpUp,
       ...this.chirpFound,
@@ -339,6 +355,10 @@ class LuxoSfxGraph {
       );
     }
   }
+}
+
+export function createSfxGraph(destination: Tone.InputNode): RoutedSfxGraph {
+  return new LuxoSfxGraph(destination);
 }
 
 export interface SfxPlayer {
