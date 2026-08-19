@@ -77,10 +77,22 @@ interface Disposable {
   dispose(): unknown;
 }
 
-class LuxoMusicGraph {
-  private readonly output = new Tone.Gain(MUSIC_CONFIG.masterHeadroom).connect(
-    browserAudioOutput.destination(),
-  );
+export interface RoutedMusicGraph {
+  setBodyAudio(audio: BodyAudioState): void;
+  dispose(): void;
+}
+
+class MusicOutput {
+  protected readonly output: Tone.Gain;
+
+  constructor(destination?: Tone.InputNode) {
+    this.output = new Tone.Gain(MUSIC_CONFIG.masterHeadroom).connect(
+      destination ?? browserAudioOutput.destination(),
+    );
+  }
+}
+
+class LuxoMusicGraph extends MusicOutput implements RoutedMusicGraph {
   private readonly musicGain = new Tone.Gain(1).connect(this.output);
   private readonly padGain = new Tone.Gain(0).connect(this.musicGain);
   private readonly padFilter = new Tone.Filter({
@@ -117,7 +129,8 @@ class LuxoMusicGraph {
   private speaking = false;
   private disposed = false;
 
-  constructor(initial: BodyAudioState) {
+  constructor(initial: BodyAudioState, destination?: Tone.InputNode) {
+    super(destination);
     this.resources = [
       this.scheduler,
       this.pluck,
@@ -133,6 +146,13 @@ class LuxoMusicGraph {
     this.scheduler.start(transport.seconds);
     if (transport.state !== "started") transport.start();
     this.setBodyAudio(initial);
+  }
+
+  static routed(
+    destination: Tone.InputNode,
+    initial: BodyAudioState,
+  ): LuxoMusicGraph {
+    return new this(initial, destination);
   }
 
   setBodyAudio(audio: BodyAudioState): void {
@@ -174,6 +194,13 @@ class LuxoMusicGraph {
     this.patternIndex += 1;
     if (note !== undefined) this.pluck.triggerAttack(note, time);
   }
+}
+
+export function createMusicGraph(
+  destination: Tone.InputNode,
+  initial: BodyAudioState,
+): RoutedMusicGraph {
+  return LuxoMusicGraph.routed(destination, normalizeBodyAudio(initial));
 }
 
 let requestedState = normalizeBodyAudio({ arousal: 0, speaking: false });
