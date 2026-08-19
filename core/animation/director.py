@@ -1,0 +1,349 @@
+"""Body-owned routing from semantic intent to deterministic Luxo animation."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+import math
+import re
+from typing import TypeAlias
+
+from core.animation.lookat import LookAtTarget
+from core.animation.runtime import (
+    FIXED_DT,
+    AnimationDiscontinuityError,
+    AnimationRuntime,
+    AnimationSample,
+)
+from core.blackboard import BlackboardSnapshot
+from core.brain.schema import (
+    Action,
+    ActionOp,
+    GestureName,
+    LightPattern,
+    LightPreset,
+    PostureName,
+    SfxName,
+)
+from core.fsm import BehaviorState, Transition
+
+
+NOTICE_FREEZE_S = 0.150
+SCAN_DEFAULT_ARC_RAD = 1.20
+SCAN_DEFAULT_SPEED_RAD_S = 0.80
+SCAN_MIN_ARC_RAD = 0.30
+SCAN_MAX_ARC_RAD = 1.50
+SCAN_MIN_SPEED_RAD_S = 0.30
+SCAN_MAX_SPEED_RAD_S = 1.20
+SCAN_ELEVATION_RAD = 0.15
+
+_OBSERVATION_ID = re.compile(r"obs_[1-9][0-9]*\Z")
+_STEP_TOLERANCE_S = 1.0e-6
+_DEFAULT_LIGHT_PATTERN = {
+    LightPreset.WARM_IDLE: LightPattern.STEADY,
+    LightPreset.WARM_BRIGHT: LightPattern.STEADY,
+    LightPreset.COOL_DIM: LightPattern.STEADY,
+    LightPreset.CURIOUS_FOCUS: LightPattern.STEADY,
+    LightPreset.THINKING_PULSE: LightPattern.PULSE,
+    LightPreset.EXCITED_FLASH: LightPattern.FLICKER,
+    LightPreset.SAD_FADE: LightPattern.STEADY,
+}
+
+TargetResolver = Callable[[str, BlackboardSnapshot], LookAtTarget | None]
+
+
+@dataclass(frozen=True, slots=True)
+class SfxCue:
+    name: SfxName
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, SfxName):
+            raise TypeError("name must be an SfxName")
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureRequest:
+    request_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request_id, str) or not _OBSERVATION_ID.fullmatch(
+            self.request_id
+        ):
+            raise ValueError("request_id must be obs_<positive integer>")
+
+
+DirectorEffect: TypeAlias = SfxCue | CaptureRequest
+
+
+@dataclass(frozen=True, slots=True)
+class _Scan:
+    arc_rad: float
+    speed_rad_s: float
+    started_at: float | None = None
+
+
+class AnimationDirector:
+    """Translate closed intent into body-authored runtime commands and facts."""
+
+    def __init__(
+        self,
+        runtime: AnimationRuntime,
+        target_resolver: TargetResolver,
+    ) -> None:
+        if not isinstance(runtime, AnimationRuntime):
+            raise TypeError("runtime must be an AnimationRuntime")
+        if not callable(target_resolver):
+            raise TypeError("target_resolver must be callable")
+        self._runtime = runtime
+        self._target_resolver = target_resolver
+        self._effects: list[DirectorEffect] = []
+        self._desired_target: str | None = None
+        self._scan: _Scan | None = None
+        self._pending_capture_id: str | None = None
+        self._notice_due: float | None = None
+        self._droop_due: float | None = None
+        self._last_transition: Transition | None = None
+        self._last_tick = runtime.last_timestamp
+
+    @property
+    def pending_effects(self) -> tuple[DirectorEffect, ...]:
+        return tuple(self._effects)
+
+    def apply_action(
+        self,
+        action: Action,
+        *,
+        observation_id: str | None = None,
+    ) -> None:
+        """Route one validated semantic action without accepting joint values."""
+
+        if not isinstance(action, Action):
+            raise TypeError("action must be a validated Action")
+        if action.op is ActionOp.OBSERVE:
+            capture = CaptureRequest(observation_id)  # type: ignore[arg-type]
+            if self._pending_capture_id is not None:
+                raise ValueError("an observation capture is already pending")
+            if self._scan is None:
+                self._effects.append(capture)
+            else:
+                self._pending_capture_id = capture.request_id
+            return
+        if observation_id is not None:
+            raise ValueError("observation_id is valid only for observe")
+
+        if action.op is ActionOp.GESTURE:
+            self._runtime.start_gesture(action.name)  # type: ignore[arg-type]
+        elif action.op is ActionOp.POSTURE:
+            self._runtime.start_posture(action.name)  # type: ignore[arg-type]
+        elif action.op is ActionOp.LIGHT:
+            self._set_light(action.preset, action.pattern)  # type: ignore[arg-type]
+        elif action.op is ActionOp.SFX:
+            self._effects.append(SfxCue(action.name))  # type: ignore[arg-type]
+        elif action.op is ActionOp.LOOK_AT:
+            self._desired_target = action.target
+        elif action.op is ActionOp.SCAN:
+            self._scan = _scan_from_action(action)
+        # WAIT is deliberately PlanExecutor-owned and creates no director timer.
+
+    def apply_transition(self, transition: Transition) -> bool:
+        """Apply a state beat once, returning false for an exact replay."""
+
+        _validate_transition(transition)
+        if transition == self._last_transition:
+            return False
+        if (
+            self._last_transition is not None
+            and transition.t < self._last_transition.t
+        ):
+            raise ValueError("transition time must be monotonic")
+        self._last_transition = transition
+        state = transition.current
+
+        if state is BehaviorState.DORMANT:
+            self._notice_due = None
+            self._droop_due = None
+            self._scan = None
+            self._desired_target = None
+            self._runtime.clear_look_at_target()
+            self._runtime.start_posture(PostureName.REST)
+            self._set_light(LightPreset.WARM_IDLE)
+        elif state is BehaviorState.NOTICING:
+            self._notice_due = transition.t + NOTICE_FREEZE_S
+        elif state is BehaviorState.ENGAGED:
+            self._desired_target = "person"
+            if transition.previous is BehaviorState.DISENGAGING:
+                self._droop_due = None
+                self._runtime.start_gesture(GestureName.PERK_UP)
+                self._set_light(LightPreset.EXCITED_FLASH)
+                self._effects.append(SfxCue(SfxName.BOING))
+            else:
+                self._set_light(LightPreset.WARM_BRIGHT)
+        elif state is BehaviorState.LISTENING:
+            self._desired_target = "person"
+            self._set_light(LightPreset.WARM_BRIGHT)
+        elif state is BehaviorState.THINKING:
+            self._desired_target = "scene"
+            self._set_light(LightPreset.THINKING_PULSE)
+            self._effects.append(SfxCue(SfxName.HMM))
+        elif state is BehaviorState.SPEAKING:
+            self._desired_target = "person"
+            self._set_light(LightPreset.WARM_BRIGHT)
+        elif state is BehaviorState.INSPECTING:
+            self._runtime.start_gesture(GestureName.LEAN_IN)
+            self._set_light(LightPreset.CURIOUS_FOCUS)
+        elif state is BehaviorState.DISENGAGING:
+            self._notice_due = None
+            self._desired_target = None
+            self._runtime.clear_look_at_target()
+            self._set_light(LightPreset.COOL_DIM)
+            self._droop_due = transition.t + FIXED_DT
+        return True
+
+    def tick(self, snapshot: BlackboardSnapshot, now: float) -> AnimationSample:
+        """Advance scheduled body beats and exactly one runtime fixed step."""
+
+        if not isinstance(snapshot, BlackboardSnapshot):
+            raise TypeError("snapshot must be a BlackboardSnapshot")
+        instant = _finite_time(now)
+        self._validate_tick_time(instant)
+        self._apply_due_beats(instant)
+        target = self._target_for_tick(snapshot, instant)
+        if target is None:
+            self._runtime.clear_look_at_target()
+        else:
+            self._runtime.set_look_at_target(target, instant)
+        sample = self._runtime.tick(snapshot, instant)
+        self._last_tick = instant
+        return sample
+
+    def drain_effects(self) -> tuple[DirectorEffect, ...]:
+        effects = tuple(self._effects)
+        self._effects.clear()
+        return effects
+
+    def reset(self) -> None:
+        self._runtime.reset()
+        self._effects.clear()
+        self._desired_target = None
+        self._scan = None
+        self._pending_capture_id = None
+        self._notice_due = None
+        self._droop_due = None
+        self._last_transition = None
+        self._last_tick = None
+
+    def _set_light(
+        self,
+        preset: LightPreset,
+        pattern: LightPattern | None = None,
+    ) -> None:
+        selected = pattern or _DEFAULT_LIGHT_PATTERN[preset]
+        self._runtime.set_light(preset, selected)
+        if selected is LightPattern.BLINK:
+            self._runtime.start_punctuation_blink()
+
+    def _apply_due_beats(self, now: float) -> None:
+        if self._notice_due is not None and now >= self._notice_due:
+            self._notice_due = None
+            self._desired_target = "person"
+            self._runtime.start_gesture(GestureName.REGARD)
+            self._set_light(LightPreset.WARM_BRIGHT)
+            self._effects.append(SfxCue(SfxName.CHIRP_UP))
+        if self._droop_due is not None and now >= self._droop_due:
+            self._droop_due = None
+            self._runtime.start_gesture(GestureName.DROOP)
+
+    def _target_for_tick(
+        self,
+        snapshot: BlackboardSnapshot,
+        now: float,
+    ) -> LookAtTarget | None:
+        if self._scan is not None:
+            scan = self._scan
+            if scan.started_at is None:
+                scan = _Scan(scan.arc_rad, scan.speed_rad_s, now)
+                self._scan = scan
+            elapsed = now - scan.started_at
+            duration = abs(scan.arc_rad) / scan.speed_rad_s
+            if elapsed >= duration:
+                self._scan = None
+                if self._pending_capture_id is not None:
+                    self._effects.append(CaptureRequest(self._pending_capture_id))
+                    self._pending_capture_id = None
+            else:
+                phase = elapsed / duration
+                return LookAtTarget(
+                    "scene",
+                    -scan.arc_rad / 2.0 + scan.arc_rad * phase,
+                    SCAN_ELEVATION_RAD,
+                )
+        if self._desired_target is None:
+            return None
+        target = self._target_resolver(self._desired_target, snapshot)
+        if target is None:
+            return None
+        if not isinstance(target, LookAtTarget):
+            raise TypeError("target_resolver must return LookAtTarget or None")
+        if target.target != self._desired_target:
+            raise ValueError("resolved target name must match the semantic target")
+        return target
+
+    def _validate_tick_time(self, now: float) -> None:
+        if now < 0.0:
+            raise ValueError("now must be non-negative")
+        if self._last_tick is None:
+            return
+        delta = now - self._last_tick
+        if delta <= 0.0:
+            raise ValueError("now must increase monotonically")
+        if not math.isclose(
+            delta, FIXED_DT, rel_tol=0.0, abs_tol=_STEP_TOLERANCE_S
+        ):
+            raise AnimationDiscontinuityError("director tick must advance by 1/120 s")
+
+
+def _scan_from_action(action: Action) -> _Scan:
+    raw_arc = SCAN_DEFAULT_ARC_RAD if action.arc is None else action.arc
+    raw_speed = SCAN_DEFAULT_SPEED_RAD_S if action.speed is None else action.speed
+    direction = -1.0 if raw_arc < 0.0 else 1.0
+    arc = direction * min(max(abs(raw_arc), SCAN_MIN_ARC_RAD), SCAN_MAX_ARC_RAD)
+    speed = min(max(raw_speed, SCAN_MIN_SPEED_RAD_S), SCAN_MAX_SPEED_RAD_S)
+    return _Scan(arc, speed)
+
+
+def _finite_time(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("time must be a finite number")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("time must be a finite number")
+    return parsed
+
+
+def _validate_transition(transition: object) -> None:
+    if not isinstance(transition, Transition):
+        raise TypeError("transition must be a Transition")
+    if _finite_time(transition.t) < 0.0:
+        raise ValueError("transition time must be non-negative")
+    if not isinstance(transition.previous, BehaviorState) or not isinstance(
+        transition.current, BehaviorState
+    ):
+        raise TypeError("transition states must be BehaviorState values")
+    if not isinstance(transition.reason, str) or not transition.reason:
+        raise ValueError("transition reason must be non-empty")
+
+
+__all__ = [
+    "AnimationDirector",
+    "CaptureRequest",
+    "DirectorEffect",
+    "NOTICE_FREEZE_S",
+    "SCAN_DEFAULT_ARC_RAD",
+    "SCAN_DEFAULT_SPEED_RAD_S",
+    "SCAN_MAX_ARC_RAD",
+    "SCAN_MAX_SPEED_RAD_S",
+    "SCAN_MIN_ARC_RAD",
+    "SCAN_MIN_SPEED_RAD_S",
+    "SfxCue",
+    "TargetResolver",
+]
