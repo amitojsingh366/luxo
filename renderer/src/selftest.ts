@@ -57,22 +57,38 @@ export function rmsLevel(samples: Float32Array): number {
   return Math.max(0, Math.min(1, Math.sqrt(sum / samples.length)));
 }
 
-function withDeadline<T>(
+export function withDeadline<T>(
   operation: Promise<T>,
   milliseconds: number,
   signal: AbortSignal,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timeout = globalThis.setTimeout(
-      () => reject(new Error(`Check timed out after ${milliseconds} ms`)),
-      milliseconds,
-    );
-    const abort = () => reject(stoppedError());
-    signal.addEventListener('abort', abort, { once: true });
-    operation.then(resolve, reject).finally(() => {
+    let settled = false;
+    let timeout: ReturnType<typeof globalThis.setTimeout>;
+    const cleanup = () => {
       globalThis.clearTimeout(timeout);
       signal.removeEventListener('abort', abort);
-    });
+    };
+    const resolveOnce = (value: T) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const rejectOnce = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const abort = () => rejectOnce(stoppedError());
+    timeout = globalThis.setTimeout(
+      () => rejectOnce(new Error(`Check timed out after ${milliseconds} ms`)),
+      milliseconds,
+    );
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+    operation.then(resolveOnce, rejectOnce);
   });
 }
 
