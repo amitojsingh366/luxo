@@ -264,8 +264,7 @@ class ConversationCoordinator:
                 raise ValueError("vad_end must not precede the VAD start")
             self._emit(Milestone.VAD_END, end)
             self._emit(Milestone.PCM_RECEIVED, self._now())
-            self._start_locked("stt", self._stt.transcribe, pcm, STT_SAMPLE_HZ)
-            return True
+            return self._start_locked("stt", self._stt.transcribe, pcm, STT_SAMPLE_HZ)
 
     def tick(self) -> None:
         """Drain completions and issue eligible work; never blocks on I/O."""
@@ -288,9 +287,16 @@ class ConversationCoordinator:
                 )
             elif self._stage is Stage.REPLIED and state is BehaviorState.SPEAKING:
                 self._stage = Stage.DELIVERING
-                self._future = self._executor.submit(
-                    self._deliver, self._generation, self._reply
-                )
+                try:
+                    self._future = self._executor.submit(
+                        self._deliver, self._generation, self._reply
+                    )
+                except Exception as error:
+                    # A refused worker is an unstarted delivery, so it lands in
+                    # the same explicit recovery path as an exhausted retry.
+                    self._stage = Stage.FAILED
+                    self._speech_attempts = MAX_SPEECH_ATTEMPTS
+                    self._last_error = type(error).__name__
             self._mirror_plan_locked()
 
     def on_tts_done(self, t: float) -> bool:
@@ -355,14 +361,23 @@ class ConversationCoordinator:
 
     def _start_locked(
         self, kind: str, work: Callable[..., object], *args: object
-    ) -> None:
+    ) -> bool:
+        """Submit one worker job; a refused submission never reaches the tick."""
+
         generation = self._generation
         self._stage = Stage.TRANSCRIBING if kind == "stt" else Stage.REQUESTING
-        future = self._executor.submit(work, *args)
+        try:
+            future = self._executor.submit(work, *args)
+        except Exception as error:
+            self._stage = Stage.IDLE
+            self._vad_start = None
+            self._last_error = type(error).__name__
+            return False
         self._future = future
         future.add_done_callback(
             lambda done, token=generation, label=kind: self._queue(token, label, done)
         )
+        return True
 
     def _queue(self, generation: int, kind: str, future: Future[object]) -> None:
         """Enqueue only: this may run inline on the registering thread."""
