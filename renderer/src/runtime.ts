@@ -188,11 +188,7 @@ export class LuxoBrowserRuntime {
     };
     this.cancelFallbackFrame();
     this.fallbackEndSeconds = null;
-    await release(() => this.protocol?.disconnect());
-    await release(() => this.gaze?.dispose());
-    await release(() => this.microphone?.dispose());
-    await release(() => this.vad?.dispose());
-    this.protocol = null; this.gaze = null; this.microphone = null; this.vad = null;
+    await release(() => this.cleanupOperational());
     await release(() => this.camera.stop());
     await release(() => this.mixer.dispose());
     await release(() => this.fallback.dispose());
@@ -238,6 +234,7 @@ export class LuxoBrowserRuntime {
     }
     const cameraSpec = cameraResult.value;
     const scorer = scorerResult.value;
+    let scorerTransferred = false;
     try {
       this.protocol = this.dependencies.createProtocol(this.protocolOptions(cameraSpec, generation));
       const protocol = this.protocol;
@@ -248,6 +245,7 @@ export class LuxoBrowserRuntime {
         onUtterance: (pcm) => this.route(generation, "vad", () => { protocol.sendUtterancePcm(pcm); }),
         onError: (error) => this.report("vad", error),
       });
+      scorerTransferred = true;
       this.microphone = this.dependencies.createMicrophone({
         sink: this.vad,
         onError: (error) => this.report("microphone", error),
@@ -268,10 +266,9 @@ export class LuxoBrowserRuntime {
       this.started = true;
       this.clearPrompt();
     } catch (error) {
-      const scorerOwnedByVad = this.vad !== null;
       try { await this.cleanupOperational(); }
       catch (cleanupError) { this.report("startup_cleanup", errorOf(cleanupError)); }
-      if (!scorerOwnedByVad) {
+      if (!scorerTransferred) {
         try { await scorer.dispose?.(); }
         catch (cleanupError) { this.report("startup_cleanup", errorOf(cleanupError)); }
       }
@@ -363,15 +360,19 @@ export class LuxoBrowserRuntime {
   }
 
   private async cleanupOperational(): Promise<void> {
+    const protocol = this.protocol;
+    const gaze = this.gaze;
+    const microphone = this.microphone;
+    const vad = this.vad;
+    this.protocol = null; this.gaze = null; this.microphone = null; this.vad = null;
     let first: unknown;
     const release = async (operation: () => MaybePromise) => {
       try { await operation(); } catch (error) { first ??= error; }
     };
-    await release(() => this.protocol?.disconnect());
-    await release(() => this.gaze?.dispose());
-    await release(() => this.microphone?.dispose());
-    await release(() => this.vad?.dispose());
-    this.protocol = null; this.gaze = null; this.microphone = null; this.vad = null;
+    await release(() => protocol?.disconnect());
+    await release(() => gaze?.dispose());
+    await release(() => microphone?.dispose());
+    await release(() => vad?.dispose());
     if (first !== undefined) throw first;
   }
 
