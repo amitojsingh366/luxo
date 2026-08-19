@@ -163,15 +163,12 @@ def _require_keys(value: Mapping[str, Any], path: str, keys: set[str]) -> None:
 
 def _validate(raw: dict[str, Any]) -> None:
     top_keys = {
-        "character", "runtime", "network", "gaze", "speech", "vision", "joints",
+        "name", "runtime", "network", "gaze", "speech", "vision", "joints",
         "animation", "brain", "vocabulary",
     }
     _require_keys(raw, "root", top_keys)
-
-    character = _object(raw["character"], "character")
-    _require_keys(character, "character", {"name"})
-    if character["name"] != "Luxo":
-        raise ConfigError("character.name must be the owner-selected value 'Luxo'")
+    if raw["name"] != "Luxo":
+        raise ConfigError("name must be the owner-selected value 'Luxo'")
 
     runtime = _object(raw["runtime"], "runtime")
     _require_keys(
@@ -296,12 +293,12 @@ def _validate_brain(value: Any) -> None:
     _require_keys(
         brain, "brain",
         {
-            "selected_profile", "say_max_characters", "recent_exchange_pairs",
+            "profile", "say_max_characters", "recent_exchange_pairs",
             "response_stream_max_bytes", "json_repair_retries", "profiles",
         },
     )
-    if brain["selected_profile"] != "free":
-        raise ConfigError("brain.selected_profile must be the owner-selected value 'free'")
+    if brain["profile"] != "free":
+        raise ConfigError("brain.profile must be the owner-selected value 'free'")
     for key in ("say_max_characters", "recent_exchange_pairs", "response_stream_max_bytes", "json_repair_retries"):
         _number(brain[key], f"brain.{key}", positive=True)
     profiles = _object(brain["profiles"], "brain.profiles")

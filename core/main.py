@@ -27,7 +27,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.getLogger(__name__).info(
         "loaded %s core configuration for %s",
         config.runtime.python,
-        config.character.name,
+        config.name,
     )
     return 0
 
