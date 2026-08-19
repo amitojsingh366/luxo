@@ -11,6 +11,7 @@ from typing import TypeAlias
 from core.animation.lookat import LookAtTarget
 from core.animation.runtime import (
     FIXED_DT,
+    PUNCTUATION_BLINK_DURATION_S,
     AnimationDiscontinuityError,
     AnimationRuntime,
     AnimationSample,
@@ -102,6 +103,9 @@ class AnimationDirector:
         self._pending_capture_id: str | None = None
         self._notice_due: float | None = None
         self._droop_due: float | None = None
+        self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
+        self._blink_restore: tuple[LightPreset, LightPattern] | None = None
+        self._blink_started_at: float | None = None
         self._last_transition: Transition | None = None
         self._last_tick = runtime.last_timestamp
 
@@ -207,6 +211,7 @@ class AnimationDirector:
         instant = _finite_time(now)
         self._validate_tick_time(instant)
         self._apply_due_beats(instant)
+        self._update_blink(instant)
         target = self._target_for_tick(snapshot, instant)
         if target is None:
             self._runtime.clear_look_at_target()
@@ -229,18 +234,40 @@ class AnimationDirector:
         self._pending_capture_id = None
         self._notice_due = None
         self._droop_due = None
+        self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
+        self._blink_restore = None
+        self._blink_started_at = None
         self._last_transition = None
         self._last_tick = None
 
     def _set_light(
-        self,
-        preset: LightPreset,
-        pattern: LightPattern | None = None,
+        self, preset: LightPreset, pattern: LightPattern | None = None
     ) -> None:
         selected = pattern or _DEFAULT_LIGHT_PATTERN[preset]
+        if selected is LightPattern.BLINK:
+            self._blink_restore = self._nonblink_light
+            if self._nonblink_light[0] is not preset:
+                self._blink_restore = (preset, _DEFAULT_LIGHT_PATTERN[preset])
+            self._blink_started_at = None
+        else:
+            self._nonblink_light = (preset, selected)
+            self._blink_restore = None
+            self._blink_started_at = None
         self._runtime.set_light(preset, selected)
         if selected is LightPattern.BLINK:
             self._runtime.start_punctuation_blink()
+
+    def _update_blink(self, now: float) -> None:
+        if self._blink_restore is None:
+            return
+        if self._blink_started_at is None:
+            self._blink_started_at = now
+            return
+        if now - self._blink_started_at >= PUNCTUATION_BLINK_DURATION_S:
+            self._runtime.set_light(*self._blink_restore)
+            self._nonblink_light = self._blink_restore
+            self._blink_restore = None
+            self._blink_started_at = None
 
     def _apply_due_beats(self, now: float) -> None:
         if self._notice_due is not None and now >= self._notice_due:
