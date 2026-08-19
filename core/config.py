@@ -11,7 +11,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, Union
 
 
 class ConfigError(ValueError):
@@ -19,7 +19,11 @@ class ConfigError(ValueError):
 
 
 ConfigScalar: TypeAlias = str | int | float | bool | None
-ConfigValue: TypeAlias = ConfigScalar | "FrozenConfig" | tuple["ConfigValue", ...]
+ConfigValue: TypeAlias = Union[
+    ConfigScalar,
+    "FrozenConfig",
+    tuple["ConfigValue", ...],
+]
 
 
 class FrozenConfig(Mapping[str, ConfigValue]):
