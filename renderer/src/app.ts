@@ -11,14 +11,15 @@ import {
   MeshStandardMaterial,
   PCFSoftShadowMap,
   PlaneGeometry,
-  PointLight,
   Scene,
   SRGBColorSpace,
   WebGLRenderer,
 } from "three";
 import type { URDFRobot } from "urdf-loader";
 
+import type { LightState } from "./protocol/types";
 import { createStudioCamera } from "./scene/camera";
+import { LightingRig } from "./scene/lighting";
 import {
   anchorLampBase,
   applyJointPositions,
@@ -29,10 +30,7 @@ import {
 
 export interface BodyStateLike {
   readonly joints: JointPositions;
-  readonly light?: {
-    readonly intensity: number;
-    readonly color_k: number;
-  };
+  readonly light: LightState;
 }
 
 export interface RendererHandle {
@@ -45,16 +43,10 @@ export const STATIC_REST_BODY_STATE: BodyStateLike = Object.freeze({
   light: Object.freeze({
     intensity: 0.55,
     color_k: 2700,
+    pattern: "steady",
+    bloom: 0.6,
   }),
 });
-
-const WARM_LIGHT = new Color("#ffd0a0");
-const COOL_LIGHT = new Color("#d7e7ff");
-
-function colorFromKelvin(kelvin: number, target: Color): Color {
-  const mix = Math.min(1, Math.max(0, (kelvin - 2700) / (4500 - 2700)));
-  return target.lerpColors(WARM_LIGHT, COOL_LIGHT, mix);
-}
 
 function makeElement<K extends keyof HTMLElementTagNameMap>(
   name: K,
@@ -139,21 +131,6 @@ function addStudio(scene: Scene): void {
   scene.add(rim);
 }
 
-function attachEmitterLight(robot: URDFRobot): PointLight {
-  const emitter = robot.links.light_emitter_link;
-  if (!emitter) {
-    throw new Error("Lamp light_emitter_link is unavailable");
-  }
-
-  const light = new PointLight(WARM_LIGHT, 12, 2.4, 2);
-  light.name = "lumen-emitter-light";
-  light.castShadow = true;
-  light.shadow.mapSize.set(1024, 1024);
-  light.shadow.bias = -0.0001;
-  emitter.add(light);
-  return light;
-}
-
 /**
  * Mount the browser-owned body. The returned method accepts any structurally
  * compatible protocol body state; this module never makes behavior choices.
@@ -177,55 +154,86 @@ export async function mountRenderer(root: HTMLElement): Promise<RendererHandle> 
   renderer.shadowMap.type = PCFSoftShadowMap;
 
   const cameraRig = createStudioCamera(canvas);
+  let lightingRig: LightingRig | null = null;
+  let destroyed = false;
   const resize = () => {
     const { width, height } = stage.getBoundingClientRect();
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-    renderer.setSize(Math.max(width, 1), Math.max(height, 1), false);
-    cameraRig.resize(width, height);
+    const safeWidth = Math.max(width, 1);
+    const safeHeight = Math.max(height, 1);
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    renderer.setPixelRatio(pixelRatio);
+    renderer.setSize(safeWidth, safeHeight, false);
+    cameraRig.resize(safeWidth, safeHeight);
+    lightingRig?.resize(safeWidth, safeHeight, pixelRatio);
   };
   const resizeObserver = new ResizeObserver(resize);
   resizeObserver.observe(stage);
   resize();
 
-  renderer.setAnimationLoop(() => {
-    cameraRig.controls.update();
-    renderer.render(scene, cameraRig.camera);
-  });
+  const teardown = (clearRoot: boolean) => {
+    if (destroyed) return;
+    destroyed = true;
+    let firstError: unknown;
+    const release = (operation: () => void) => {
+      try {
+        operation();
+      } catch (error) {
+        firstError ??= error;
+      }
+    };
+    release(() => renderer.setAnimationLoop(null));
+    release(() => resizeObserver.disconnect());
+    const rig = lightingRig;
+    lightingRig = null;
+    release(() => rig?.dispose());
+    release(() => cameraRig.dispose());
+    release(() => renderer.dispose());
+    if (clearRoot) release(() => root.replaceChildren());
+    if (firstError !== undefined) throw firstError;
+  };
 
   let robot: URDFRobot;
+  let failureStatus = "Body model failed to load";
   try {
     robot = await loadLampRobot();
+    scene.add(anchorLampBase(robot));
+    failureStatus = "Body scene failed to initialise";
+    lightingRig = new LightingRig({
+      robot,
+      renderer,
+      scene,
+      camera: cameraRig.camera,
+    });
+    resize();
+    applyJointPositions(robot, STATIC_REST_BODY_STATE.joints);
+    lightingRig.applyState(STATIC_REST_BODY_STATE.light);
   } catch (error) {
-    status.textContent = "Body model failed to load";
+    status.textContent = failureStatus;
     status.dataset.tone = "error";
+    try {
+      teardown(false);
+    } catch {
+      // Setup failure remains the actionable error; cleanup is best effort.
+    }
     throw error;
   }
 
-  scene.add(anchorLampBase(robot));
-  const emitterLight = attachEmitterLight(robot);
-  const lightColor = new Color();
-
   const applyBodyState = (bodyState: BodyStateLike) => {
     applyJointPositions(robot, bodyState.joints);
-
-    if (bodyState.light) {
-      emitterLight.intensity = Math.max(0, bodyState.light.intensity) * 22;
-      emitterLight.color.copy(colorFromKelvin(bodyState.light.color_k, lightColor));
-    }
+    lightingRig?.applyState(bodyState.light);
   };
 
-  applyBodyState(STATIC_REST_BODY_STATE);
+  renderer.setAnimationLoop((nowMs) => {
+    cameraRig.controls.update();
+    lightingRig?.render(nowMs);
+  });
   status.textContent = "Body ready · rest pose";
   status.dataset.tone = "ready";
 
   return {
     applyBodyState,
     destroy() {
-      renderer.setAnimationLoop(null);
-      resizeObserver.disconnect();
-      cameraRig.dispose();
-      renderer.dispose();
-      root.replaceChildren();
+      teardown(true);
     },
   };
 }

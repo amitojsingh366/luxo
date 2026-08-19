@@ -129,6 +129,21 @@ interface ApertureEdit {
   readonly emissive: ReadonlyArray<MeshPhongMaterial | MeshStandardMaterial>;
 }
 
+const attempt = (operation: () => void): void => {
+  try {
+    operation();
+  } catch {
+    // Cleanup must not replace the failure that initiated rollback.
+  }
+};
+
+function restoreApertureEdits(edits: readonly ApertureEdit[]): void {
+  for (const edit of edits) {
+    attempt(() => { edit.mesh.material = edit.original; });
+    for (const material of edit.emissive) attempt(() => material.dispose());
+  }
+}
+
 const findFrame = (robot: SemanticRobot, name: string): Object3D | undefined =>
   robot.links?.[name] ?? robot.getObjectByName(name);
 
@@ -137,35 +152,47 @@ function findApertureEdits(robot: SemanticRobot, emitter: Object3D): ApertureEdi
   if (!head) throw new Error("Luxo lighting cannot resolve lamp_head_link");
   const edits: ApertureEdit[] = [];
 
-  head.traverse((node) => {
-    if (!(node instanceof Mesh) || emitter === node || emitter.getObjectById(node.id)) return;
-    const original = node.material;
-    const materials = Array.isArray(original) ? original : [original];
-    const emissive: Array<MeshPhongMaterial | MeshStandardMaterial> = [];
-    const replacements = materials.map((material) => {
-      if (
-        material.name !== "fixture_light" ||
-        !(material instanceof MeshPhongMaterial || material instanceof MeshStandardMaterial)
-      ) return material;
-      const replacement = material.clone();
-      replacement.name = `${material.name}-emissive`;
-      emissive.push(replacement);
-      return replacement;
+  try {
+    head.traverse((node) => {
+      if (!(node instanceof Mesh) || emitter === node || emitter.getObjectById(node.id)) return;
+      const original = node.material;
+      const materials = Array.isArray(original) ? original : [original];
+      const emissive: Array<MeshPhongMaterial | MeshStandardMaterial> = [];
+      let replacements: Material[];
+      try {
+        replacements = materials.map((material) => {
+          if (
+            material.name !== "fixture_light" ||
+            !(material instanceof MeshPhongMaterial || material instanceof MeshStandardMaterial)
+          ) return material;
+          const replacement = material.clone();
+          replacement.name = `${material.name}-emissive`;
+          emissive.push(replacement);
+          return replacement;
+        });
+      } catch (error) {
+        for (const material of emissive) attempt(() => material.dispose());
+        throw error;
+      }
+      if (emissive.length === 0) return;
+      edits.push({ mesh: node, original, emissive });
+      node.material = Array.isArray(original) ? replacements : replacements[0]!;
     });
-    if (emissive.length === 0) return;
-    node.material = Array.isArray(original) ? replacements : replacements[0]!;
-    edits.push({ mesh: node, original, emissive });
-  });
 
-  if (edits.length === 0) {
-    throw new Error("Luxo lighting cannot find the fixture_light shade aperture");
+    if (edits.length === 0) {
+      throw new Error("Luxo lighting cannot find the fixture_light shade aperture");
+    }
+    return edits;
+  } catch (error) {
+    restoreApertureEdits(edits);
+    throw error;
   }
-  return edits;
 }
 
 export class LightingRig {
   readonly source: PointLight;
   readonly composer: EffectComposer;
+  readonly renderPass: RenderPass;
   readonly bloomPass: UnrealBloomPass;
   private readonly apertureEdits: ApertureEdit[];
   private readonly color = new Color();
@@ -183,20 +210,45 @@ export class LightingRig {
     if (!emitter) {
       throw new Error("Luxo lighting requires semantic frame light_emitter_link");
     }
-    this.apertureEdits = findApertureEdits(options.robot, emitter);
-    this.source = new PointLight(0xffffff, 0, 2.4, 2);
-    this.source.name = "luxo-light-source";
-    this.source.castShadow = true;
-    this.source.shadow.mapSize.set(512, 512);
-    this.source.shadow.bias = -0.0001;
-    emitter.add(this.source);
-    options.renderer.shadowMap.enabled = true;
-    options.renderer.shadowMap.type = PCFSoftShadowMap;
-
-    this.composer = new EffectComposer(options.renderer);
-    this.composer.addPass(new RenderPass(options.scene, options.camera));
-    this.bloomPass = new UnrealBloomPass(new Vector2(1, 1), 0, 0.35, 0.18);
-    this.composer.addPass(this.bloomPass);
+    const shadowEnabled = options.renderer.shadowMap.enabled;
+    const shadowType = options.renderer.shadowMap.type;
+    const apertureEdits = findApertureEdits(options.robot, emitter);
+    let source: PointLight | undefined;
+    let composer: EffectComposer | undefined;
+    let renderPass: RenderPass | undefined;
+    let bloomPass: UnrealBloomPass | undefined;
+    try {
+      source = new PointLight(0xffffff, 0, 2.4, 2);
+      source.name = "luxo-light-source";
+      source.castShadow = true;
+      source.shadow.mapSize.set(512, 512);
+      source.shadow.bias = -0.0001;
+      emitter.add(source);
+      options.renderer.shadowMap.enabled = true;
+      options.renderer.shadowMap.type = PCFSoftShadowMap;
+      composer = new EffectComposer(options.renderer);
+      renderPass = new RenderPass(options.scene, options.camera);
+      composer.addPass(renderPass);
+      bloomPass = new UnrealBloomPass(new Vector2(1, 1), 0, 0.35, 0.18);
+      composer.addPass(bloomPass);
+    } catch (error) {
+      if (bloomPass) attempt(() => bloomPass?.dispose());
+      if (renderPass) attempt(() => renderPass?.dispose());
+      if (composer) attempt(() => composer?.dispose());
+      if (source) {
+        attempt(() => source?.removeFromParent());
+        attempt(() => source?.dispose());
+      }
+      restoreApertureEdits(apertureEdits);
+      attempt(() => { options.renderer.shadowMap.enabled = shadowEnabled; });
+      attempt(() => { options.renderer.shadowMap.type = shadowType; });
+      throw error;
+    }
+    this.apertureEdits = apertureEdits;
+    this.source = source;
+    this.composer = composer;
+    this.renderPass = renderPass;
+    this.bloomPass = bloomPass;
   }
 
   applyState(state: LightState, nowMs = performance.now()): void {
@@ -248,13 +300,19 @@ export class LightingRig {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
-    this.source.removeFromParent();
-    this.source.dispose();
+    let firstError: unknown;
+    const release = (operation: () => void) => {
+      try { operation(); } catch (error) { firstError ??= error; }
+    };
+    release(() => this.source.removeFromParent());
+    release(() => this.source.dispose());
     for (const edit of this.apertureEdits) {
-      edit.mesh.material = edit.original;
-      for (const material of edit.emissive) material.dispose();
+      release(() => { edit.mesh.material = edit.original; });
+      for (const material of edit.emissive) release(() => material.dispose());
     }
-    this.bloomPass.dispose();
-    this.composer.dispose();
+    release(() => this.renderPass.dispose());
+    release(() => this.bloomPass.dispose());
+    release(() => this.composer.dispose());
+    if (firstError !== undefined) throw firstError;
   }
 }
