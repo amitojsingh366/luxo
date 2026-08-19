@@ -1,31 +1,14 @@
-import { mountRenderer } from './app';
-import { ProtocolClient } from './protocol/client';
+import { mountLuxoBrowserRuntime } from "./runtime";
 
 async function main(): Promise<void> {
-  const root = document.querySelector<HTMLElement>('#app');
-  if (!root) throw new Error('Missing #app mount element');
-
-  const renderer = await mountRenderer(root);
-  const protocol = new ProtocolClient({
-    url: 'ws://127.0.0.1:8765',
-    hello: {
-      type: 'hello',
-      fps: 60,
-      camera: { w: 640, h: 480, hfov_deg: 60 },
-    },
-    onBodyState: (state) => renderer.applyBodyState(state),
-    onError: (error) => console.error(error),
-  });
-
-  protocol.connect();
+  const root = document.querySelector<HTMLElement>("#app");
+  if (!root) throw new Error("Missing #app mount element");
+  const runtime = await mountLuxoBrowserRuntime(root);
   window.addEventListener(
-    'beforeunload',
-    () => {
-      protocol.disconnect();
-      renderer.destroy();
-    },
+    "beforeunload",
+    () => { void runtime.destroySafely(); },
     { once: true },
   );
 }
 
-void main();
+void main().catch((error: unknown) => console.error(error));

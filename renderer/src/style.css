@@ -143,6 +143,51 @@ canvas {
   text-transform: uppercase;
 }
 
+.lumen-start {
+  position: absolute;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 0.8rem;
+  padding: 1.5rem;
+  background: rgb(4 6 10 / 74%);
+  backdrop-filter: blur(12px);
+}
+
+.lumen-start__button {
+  min-width: 10rem;
+  padding: 0.8rem 1.25rem;
+  border: 1px solid rgb(255 225 181 / 38%);
+  border-radius: 999px;
+  color: #17100a;
+  background: #f3b96b;
+  box-shadow: 0 0.8rem 2.5rem rgb(243 185 107 / 25%);
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.lumen-start__button:focus-visible {
+  outline: 3px solid #fff;
+  outline-offset: 4px;
+}
+
+.lumen-start__button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.lumen-start__status {
+  max-width: 26rem;
+  margin: 0;
+  color: rgb(240 229 210 / 72%);
+  font-size: 0.72rem;
+  text-align: center;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .boot-mark {
     animation: lumen-breathe 1.6s ease-in-out infinite;
