@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lumen.local/schema/messages.schema.json",
+  "title": "LumenTextMessage",
+  "description": "The complete JSON text-frame protocol for the Lumen body/mind WebSocket.",
+  "oneOf": [
+    { "$ref": "#/$defs/HelloMessage" },
+    { "$ref": "#/$defs/GazeMessage" },
+    { "$ref": "#/$defs/VadMessage" },
+    { "$ref": "#/$defs/TtsDoneMessage" },
+    { "$ref": "#/$defs/ErrorMessage" },
+    { "$ref": "#/$defs/BodyStateMessage" },
+    { "$ref": "#/$defs/CueMessage" },
+    { "$ref": "#/$defs/CaptureFrameMessage" },
+    { "$ref": "#/$defs/SpeakBeginMessage" },
+    { "$ref": "#/$defs/SpeakEndMessage" }
+  ],
+  "x-message-directions": {
+    "browser-to-core": [
+      "HelloMessage",
+      "GazeMessage",
+      "VadMessage",
+      "TtsDoneMessage",
+      "ErrorMessage"
+    ],
+    "core-to-browser": [
+      "BodyStateMessage",
+      "CueMessage",
+      "CaptureFrameMessage",
+      "SpeakBeginMessage",
+      "SpeakEndMessage"
+    ]
+  },
+  "x-binary-frames": [
+    {
+      "name": "utterance_pcm",
+      "prefix": 1,
+      "hex_prefix": "0x01",
+      "direction": "browser-to-core",
+      "payload": "16 kHz mono signed 16-bit PCM"
+    },
+    {
+      "name": "capture_jpeg",
+      "prefix": 2,
+      "hex_prefix": "0x02",
+      "direction": "browser-to-core",
+      "payload": "JPEG, 512 px longest edge, quality 80"
+    },
+    {
+      "name": "tts_pcm",
+      "prefix": 3,
+      "hex_prefix": "0x03",
+      "direction": "core-to-browser",
+      "payload": "22.05 kHz mono signed 16-bit PCM chunk"
+    }
+  ],
+  "$defs": {
+    "CameraSpec": {
+      "title": "CameraSpec",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["w", "h", "hfov_deg"],
+      "properties": {
+        "w": { "type": "integer", "minimum": 1 },
+        "h": { "type": "integer", "minimum": 1 },
+        "hfov_deg": { "type": "number", "exclusiveMinimum": 0, "maximum": 180 }
+      }
+    },
+    "HelloMessage": {
+      "title": "HelloMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "fps", "camera"],
+      "properties": {
+        "type": { "const": "hello" },
+        "fps": { "type": "integer", "minimum": 1 },
+        "camera": { "$ref": "#/$defs/CameraSpec" }
+      }
+    },
+    "GazeMessage": {
+      "title": "GazeMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "t", "present", "yaw_deg", "pitch_deg", "az", "el", "conf"],
+      "properties": {
+        "type": { "const": "gaze" },
+        "t": { "type": "number" },
+        "present": { "type": "boolean" },
+        "yaw_deg": { "type": "number" },
+        "pitch_deg": { "type": "number" },
+        "az": { "type": "number" },
+        "el": { "type": "number" },
+        "conf": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "VadMessage": {
+      "title": "VadMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "t", "event"],
+      "properties": {
+        "type": { "const": "vad" },
+        "t": { "type": "number" },
+        "event": { "type": "string", "enum": ["start"] }
+      }
+    },
+    "TtsDoneMessage": {
+      "title": "TtsDoneMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "t"],
+      "properties": {
+        "type": { "const": "tts_done" },
+        "t": { "type": "number" }
+      }
+    },
+    "ErrorMessage": {
+      "title": "ErrorMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "where", "detail"],
+      "properties": {
+        "type": { "const": "error" },
+        "where": { "type": "string", "minLength": 1 },
+        "detail": { "type": "string" }
+      }
+    },
+    "JointsState": {
+      "title": "JointsState",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_yaw", "shoulder_pitch", "elbow_pitch", "neck_yaw", "head_pitch"],
+      "properties": {
+        "base_yaw": { "type": "number" },
+        "shoulder_pitch": { "type": "number" },
+        "elbow_pitch": { "type": "number" },
+        "neck_yaw": { "type": "number" },
+        "head_pitch": { "type": "number" }
+      }
+    },
+    "LightState": {
+      "title": "LightState",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["intensity", "color_k", "pattern", "bloom"],
+      "properties": {
+        "intensity": { "type": "number", "minimum": 0 },
+        "color_k": { "type": "integer", "minimum": 1 },
+        "pattern": {
+          "type": "string",
+          "enum": ["steady", "pulse", "flicker", "blink"]
+        },
+        "bloom": { "type": "number", "minimum": 0 }
+      }
+    },
+    "AudioState": {
+      "title": "AudioState",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["speaking", "arousal"],
+      "properties": {
+        "speaking": { "type": "boolean" },
+        "arousal": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "ClampCounts": {
+      "title": "ClampCounts",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vel", "limit"],
+      "properties": {
+        "vel": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "TelemetryGaze": {
+      "title": "TelemetryGaze",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["present", "yaw_deg", "pitch_deg"],
+      "properties": {
+        "present": { "type": "boolean" },
+        "yaw_deg": { "type": "number" },
+        "pitch_deg": { "type": "number" }
+      }
+    },
+    "TelemetryState": {
+      "title": "TelemetryState",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "plan_depth",
+        "memory_count",
+        "last_latency_ms",
+        "clamps",
+        "gaze"
+      ],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "BOOT",
+            "DORMANT",
+            "NOTICING",
+            "ENGAGED",
+            "LISTENING",
+            "THINKING",
+            "SPEAKING",
+            "INSPECTING",
+            "ACTING",
+            "DISENGAGING"
+          ]
+        },
+        "plan_depth": { "type": "integer", "minimum": 0 },
+        "memory_count": { "type": "integer", "minimum": 0 },
+        "last_latency_ms": { "type": "number", "minimum": 0 },
+        "clamps": { "$ref": "#/$defs/ClampCounts" },
+        "gaze": { "$ref": "#/$defs/TelemetryGaze" }
+      }
+    },
+    "BodyStateMessage": {
+      "title": "BodyStateMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "t", "seq", "joints", "light", "audio", "telemetry"],
+      "properties": {
+        "type": { "const": "body_state" },
+        "t": { "type": "number" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "joints": { "$ref": "#/$defs/JointsState" },
+        "light": { "$ref": "#/$defs/LightState" },
+        "audio": { "$ref": "#/$defs/AudioState" },
+        "telemetry": { "$ref": "#/$defs/TelemetryState" }
+      }
+    },
+    "CueMessage": {
+      "title": "CueMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "sfx"],
+      "properties": {
+        "type": { "const": "cue" },
+        "sfx": {
+          "type": "string",
+          "enum": [
+            "chirp_up",
+            "chirp_found",
+            "boing",
+            "whirr_short",
+            "hmm",
+            "blip_sad",
+            "fanfare_small",
+            "click"
+          ]
+        }
+      }
+    },
+    "CaptureFrameMessage": {
+      "title": "CaptureFrameMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "req_id"],
+      "properties": {
+        "type": { "const": "capture_frame" },
+        "req_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "SpeakBeginMessage": {
+      "title": "SpeakBeginMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "envelope_hz"],
+      "properties": {
+        "type": { "const": "speak_begin" },
+        "envelope_hz": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "SpeakEndMessage": {
+      "title": "SpeakEndMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "speak_end" }
+      }
+    }
+  }
+}
