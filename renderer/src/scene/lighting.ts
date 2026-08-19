@@ -249,7 +249,6 @@ export class LightingRig {
     if (this.disposed) return;
     this.disposed = true;
     this.source.removeFromParent();
-    this.source.shadow.dispose();
     this.source.dispose();
     for (const edit of this.apertureEdits) {
       edit.mesh.material = edit.original;
