@@ -24,7 +24,9 @@ accepts body state from the core, but it makes no behavioral decisions.
 `mountRenderer(root)` in `src/app.ts` returns `applyBodyState(state)` and
 `destroy()`. Its parameter is structural, so the generated protocol
 `BodyStateMessage` can be passed directly without importing protocol files into
-the scene foundation.
+the scene module. `src/runtime.ts` assembles that renderer with the WebSocket
+client, camera, gaze and hand tracking, microphone, VAD, audio mixer, telemetry,
+and the disconnected fallback.
 
 ## Checks
 
@@ -33,16 +35,17 @@ From this directory:
 ```sh
 npm ci
 npm run typecheck
+npm run build
 ```
 
-`npm run build` also runs the typecheck. On the isolated foundation-renderer
-branch, the build's Vite phase intentionally waits for the separately owned
-`src/main.ts` from the foundation-protocol packet.
+`npm run build` also runs the typecheck. All renderer checks are offline; camera,
+microphone, WebGL, audio output, and the live loopback socket still require a
+browser check.
 
 ## Exact browser verification
 
-Rendering requires a browser and cannot be covered by the Node check. After the
-protocol packet has supplied `src/main.ts`:
+Rendering and device integration require a browser and cannot be covered fully
+by the Node suites:
 
 1. Run `npm ci`, then `npm run dev`, and open `http://127.0.0.1:5173`.
 2. Confirm one supplied lamp appears in rest pose on the circular plinth, with
@@ -59,10 +62,10 @@ protocol packet has supplied `src/main.ts`:
    `base_yaw: 0.45` and `head_pitch: -0.40`, then reload. Confirm the base turns
    and the head visibly looks higher. Change `head_pitch` to `0.50` and confirm
    it looks lower. Restore the canonical rest values afterward.
-7. Hand a structurally compatible body state to `applyBodyState` through the
-   protocol callback and repeat for all five keys. Confirm only the mapped URDF
-   joint moves and that no sideways roll is synthesized.
+7. Open `/selftest`, run the browser preflight, and confirm camera, microphone,
+   gaze, VAD, audio, WebGL, and the loopback WebSocket checks pass.
+8. With the core running, confirm live body state moves all five mapped joints,
+   light presets and bloom render, SFX and TTS play, and telemetry updates.
 
-Orbit controls are a development aid. Animation, light presets, bloom,
-sensors, audio, and telemetry are separate packets and are not implemented in
-this foundation.
+Orbit controls remain a development aid; live tracking and animation move the
+lamp itself and never depend on moving the viewer camera.
