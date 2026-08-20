@@ -124,6 +124,23 @@ steps. A failure in any one is logged and the rest still run, so a director that
 rejects a transition can never leave the plan queue, the speech staging, or the
 observation blocker live on its own.
 
+The demo reset (PRD 13.1)
+-------------------------
+
+``reset.py`` owns the between-takes reset and documents its own guarantees.
+Two things about it belong here, because they are wiring decisions:
+
+* :meth:`LuxoApp.request_reset` only records the request. The whole reset is
+  applied by :meth:`LuxoApp.tick_behavior`, at the very top of the beat and
+  before the blackboard snapshot is taken, so the rest of that tick runs on the
+  new baseline instead of on a mixture of both. This is the same discipline the
+  conversation coordinator uses for worker completions, and it is what makes
+  the request path safe to call from a POSIX signal handler.
+* Nothing about the reset reaches the transport. It publishes no message, adds
+  no message type, and never touches ``_hellos``, ``_camera``, or
+  ``_camera_ready``, so the connected browser keeps its page, its socket, and
+  its camera and microphone permission across as many resets as a shoot needs.
+
 Outbound ownership
 ------------------
 
@@ -229,6 +246,7 @@ from ..wake_sequence import WakeSequenceCoordinator
 from .actions import CANCELLING_STATES, ActionRouter
 from .interactions import ConversationCoordinator
 from .observations import ObservationRuntime, ObservationStage
+from .reset import DemoReset, ResetReport
 
 LOGGER = logging.getLogger(__name__)
 
@@ -351,6 +369,7 @@ class AppStatus:
     router_capture_signals: int
     observation_arm_timeouts: int
     narrations_spoken: int
+    resets_applied: int
     last_latency_ms: float
     running: bool
 
@@ -727,6 +746,7 @@ class LuxoApp:
         narration_executor: Executor | None = None,
         warm_executor: Executor | None = None,
         latency_executor: Executor | None = None,
+        reset_executor: Executor | None = None,
         idle_seed: int = 0,
     ) -> None:
         self._config = config if config is not None else load_config()
@@ -854,6 +874,22 @@ class LuxoApp:
         self._state_name = BehaviorState.BOOT
         self._arousal = AROUSAL_BY_STATE[BehaviorState.BOOT]
 
+        # The between-takes reset. It is handed the same director lock every
+        # other entry into the animation body takes, so its body step is
+        # serialized against the 120 Hz tick like any other.
+        self._reset = DemoReset(
+            fsm=self._fsm,
+            blackboard=self._blackboard,
+            conversation=self._conversation,
+            narration=self._narration,
+            observations=self._observations,
+            router=self._router,
+            director_lock=self._director_lock,
+            memory_store=self._memory,
+            on_cleared=self._on_reset_cleared,
+            executor=reset_executor,
+        )
+
     # ---------------------------------------------------------------- status
 
     @property
@@ -896,10 +932,15 @@ class LuxoApp:
     def latency_recorder(self) -> LatencyRecorder | None:
         return self._latency
 
+    @property
+    def demo_reset(self) -> DemoReset:
+        return self._reset
+
     def status(self) -> AppStatus:
         snapshot = self._blackboard.snapshot()
         state = self._fsm.state
         narrations = self._narration.spoken
+        resets = self._reset.status.applied
         with self._lock:
             return AppStatus(
                 state=state,
@@ -913,6 +954,7 @@ class LuxoApp:
                 router_capture_signals=self._router_capture_signals,
                 observation_arm_timeouts=self._observation_arm_timeouts,
                 narrations_spoken=narrations,
+                resets_applied=resets,
                 last_latency_ms=0.0 if self._latency is None else self._latency.last_latency_ms,
                 running=self._started and not self._stopping.is_set(),
             )
@@ -968,6 +1010,7 @@ class LuxoApp:
             ("conversation", self._conversation.close),
             ("observations", self._observations.close),
             ("narration", self._narration.close),
+            ("reset", self._reset.close),
         ):
             try:
                 close()
@@ -978,6 +1021,46 @@ class LuxoApp:
         with self._lock:
             self._started = False
         LOGGER.info("character core stopped")
+
+    def request_reset(self, reason: str = "reset") -> None:
+        """Ask for a between-takes reset (PRD 13.1). Records only; does nothing.
+
+        Safe to call from a POSIX signal handler running between bytecodes on
+        the main thread, from the transport thread, or from a check. The reset
+        itself is applied by the next :meth:`tick_behavior`, which is the only
+        thread allowed to advance any stage.
+        """
+
+        self._reset.request(reason)
+
+    def _drain_reset(self, now: float) -> ResetReport | None:
+        """Apply a requested reset before anything else in the beat."""
+
+        try:
+            return self._reset.drain(now)
+        except Exception:
+            # A reset that raises must never take the behaviour tick with it;
+            # the character keeps running on whatever state survived.
+            LOGGER.exception("the demo reset failed and was abandoned")
+            return None
+
+    def _on_reset_cleared(self) -> None:
+        """Clear the runtime's own arming state as the last reset step.
+
+        These four are the only pieces of the observation handshake this module
+        owns rather than delegates. ``_capture_armed_id`` in particular must go
+        with the plan it belonged to: a stale arming signal that outlived its
+        blocker would let the next blocker be ticked before the director's
+        capture beat, which is exactly the deferral the watchdog exists to
+        bound. Every counter above them is cumulative telemetry and is kept.
+        """
+
+        with self._lock:
+            self._capture_armed_id = None
+            self._pending_blocker_id = None
+            self._pending_blocker_since = None
+            self._state_name = BehaviorState.DORMANT
+            self._arousal = AROUSAL_BY_STATE[BehaviorState.DORMANT]
 
     def _load_memory(self) -> None:
         """One startup disk read; scene memory is mirrored for cheap lookups."""
@@ -1181,8 +1264,12 @@ class LuxoApp:
         ``BehaviorFSM.tick`` -> ``ConversationCoordinator.tick`` ->
         ``ActionRouter.tick`` -> ``ObservationRuntime.tick``. The router ticks
         the plan executor internally; this method never does.
+
+        A requested demo reset is drained before any of that, and before the
+        snapshot is read, so the whole beat runs on exactly one baseline.
         """
 
+        self._drain_reset(now)
         snapshot = self._blackboard.snapshot()
 
         transition = self._fsm.tick(snapshot, now)
@@ -1501,6 +1588,7 @@ __all__ = [
     "ANIMATION_HZ",
     "AROUSAL_BY_STATE",
     "AppStatus",
+    "DemoReset",
     "BEHAVIOR_HZ",
     "BODY_STATE_EVERY_N_TICKS",
     "BODY_STATE_HZ",
