@@ -403,6 +403,12 @@ class OpenRouterBrainClient:
             if presence is not None and any(value not in prior_ids for value in presence):
                 LOGGER.warning("dropping present_prior_ids with unknown prior ids")
                 presence = None
+            elif presence is not None and not response.raw_saturated:
+                # A list below the ten-object ceiling has room to report every
+                # meaningful visible prior. Treat unmatched presence claims as
+                # stale prompt-copying rather than letting them defeat the
+                # Python missing-object comparison.
+                presence = None
             return ObservationResponse(
                 tuple(visible),
                 response.focus,
