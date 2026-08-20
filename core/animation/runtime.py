@@ -97,12 +97,14 @@ class AnimationRuntime:
         self._mixer = LayerMixer()
         self._look_solver = LookAtSolver()
         self._gestures = GestureController(poses)
+        self._inspection = GestureController(poses)
         self._output = OutputStage(SpringBank())
 
         self._last_now: float | None = None
         self._look_fact: LookAtFact | None = None
         self._pending_motion: GestureName | PostureName | None = None
         self._pending_cancel = False
+        self._pending_inspection: bool | None = None
         self._posture_name: PostureName | None = PostureName.REST
         self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
@@ -138,6 +140,13 @@ class AnimationRuntime:
 
         self._pending_motion = None
         self._pending_cancel = True
+
+    def set_inspection_reach(self, active: bool) -> None:
+        """Enter or leave the held, gaze-preserving inspection reach."""
+
+        if not isinstance(active, bool):
+            raise TypeError("active must be a boolean")
+        self._pending_inspection = active
 
     def set_look_at_target(self, target: LookAtTarget, observed_at: float) -> None:
         """Set a timestamped local target fact without accepting model angles."""
@@ -186,6 +195,7 @@ class AnimationRuntime:
         self._look_fact = None
         self._pending_motion = None
         self._pending_cancel = False
+        self._pending_inspection = None
         self._posture_name = PostureName.REST
         self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
@@ -196,6 +206,7 @@ class AnimationRuntime:
         self._light_pattern = LightPattern.STEADY
         self._look_solver.reset()
         self._gestures = GestureController(self._poses)
+        self._inspection = GestureController(self._poses)
         self._output.reset(self._poses.home)
 
     def tick(self, snapshot: BlackboardSnapshot, now: float) -> AnimationSample:
@@ -210,9 +221,12 @@ class AnimationRuntime:
         punctuation_blink = self._punctuation_blink_active(timestamp)
 
         self._apply_pending_motion(timestamp)
+        self._apply_pending_inspection(timestamp)
         home = LayerSample(joints=self._poses.home)
         idle = self._idle.sample(snapshot, timestamp)
         pre_gaze = self._mixer.sum((home, idle))
+        inspection_sample = self._inspection.sample(timestamp)
+        inspection = LayerSample(joints=inspection_sample.offsets)
 
         gaze = LayerSample()
         requested_posture: PostureName | None = None
@@ -248,7 +262,9 @@ class AnimationRuntime:
             )
         )
 
-        summed = self._mixer.sum((home, idle, gaze, gesture, light, speech))
+        summed = self._mixer.sum(
+            (home, idle, gaze, gesture, inspection, light, speech)
+        )
         output = self._output.emit(summed.joints, FIXED_DT)
         self._last_now = timestamp
         if summed.light is None:  # Defensive: the fixed light layer is never empty.
@@ -259,7 +275,7 @@ class AnimationRuntime:
             velocities=output.velocities,
             light=summed.light,
             clamps=output.clamps,
-            active_motion=self._gestures.active,
+            active_motion=self._gestures.active or self._inspection.active,
             look_target=look_target,
             requested_posture=requested_posture,
             speaking=self._speaking,
@@ -295,6 +311,16 @@ class AnimationRuntime:
                 self._posture_name = None
         self._pending_motion = None
         self._pending_cancel = False
+
+    def _apply_pending_inspection(self, now: float) -> None:
+        active = self._pending_inspection
+        if active is None:
+            return
+        if active:
+            self._inspection.start(GestureName.LEAN_IN, now, hold=True)
+        else:
+            self._inspection.cancel(now)
+        self._pending_inspection = None
 
     def _fresh_look_fact(self, now: float) -> LookAtFact | None:
         fact = self._look_fact
