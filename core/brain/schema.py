@@ -78,6 +78,10 @@ _NON_DURABLE_SCENE_CANONICALS: Final = frozenset(
         # These names contain no recallable identity or attributes and otherwise
         # consume the nearest-first memory budget on weak vision responses.
         "generic object",
+        "apparel",
+        "clothes",
+        "clothing",
+        "garment",
         "item",
         "miscellaneous object",
         "object",

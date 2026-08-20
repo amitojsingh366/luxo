@@ -23,7 +23,7 @@ MAX_SCENE_OBJECTS: Final = 10
 _LEGACY_MAX_OBJECTS: Final = 19
 _FORMAT_VERSION: Final = 2
 _ENVELOPE_FIELDS: Final = frozenset({"version", "next_id", "objects"})
-_FIELDS: Final = frozenset(
+_LEGACY_FIELDS: Final = frozenset(
     {
         "id",
         "label",
@@ -35,6 +35,8 @@ _FIELDS: Final = frozenset(
         "present",
     }
 )
+_FIELDS: Final = _LEGACY_FIELDS | {"priority", "requested_at"}
+_MEMORY_PRIORITIES: Final = frozenset({"incidental", "requested"})
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _OBJECT_ID = re.compile(r"obj_(\d+)\Z")
 _COMPACT_DELIMITERS: Final = frozenset(":;(),")
@@ -136,6 +138,8 @@ class SceneObject:
     first_seen: float
     last_seen: float
     present: bool
+    priority: str = "incidental"
+    requested_at: float | None = None
 
     def __post_init__(self) -> None:
         object_id = _text(self.id, "id", compact_safe=True)
@@ -189,6 +193,16 @@ class SceneObject:
             raise SceneMemoryError("first_seen must not exceed last_seen")
         if type(self.present) is not bool:
             raise SceneMemoryError("present must be a boolean")
+        if not isinstance(self.priority, str) or self.priority not in _MEMORY_PRIORITIES:
+            raise SceneMemoryError("priority must be incidental or requested")
+        if self.requested_at is None:
+            requested_at = None
+        else:
+            requested_at = _number(self.requested_at, "requested_at")
+            if requested_at < 0.0:
+                raise SceneMemoryError("requested_at must be nonnegative")
+        if (self.priority == "requested") != (requested_at is not None):
+            raise SceneMemoryError("requested priority requires requested_at")
 
         object.__setattr__(self, "id", object_id)
         object.__setattr__(self, "label", label)
@@ -197,6 +211,7 @@ class SceneObject:
         object.__setattr__(self, "bbox_norm", bbox)
         object.__setattr__(self, "first_seen", first_seen)
         object.__setattr__(self, "last_seen", last_seen)
+        object.__setattr__(self, "requested_at", requested_at)
 
 
 def _id_key(item: SceneObject) -> tuple[int, int | str, str]:
@@ -236,6 +251,8 @@ def _durable_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, .
         sorted(
             eligible,
             key=lambda record: (
+                record.priority != "requested",
+                -(record.requested_at or 0.0),
                 not record.present,
                 -record.last_seen,
                 _id_key(record),
@@ -254,6 +271,8 @@ def _record_dict(record: SceneObject) -> dict[str, Any]:
         "first_seen": record.first_seen,
         "last_seen": record.last_seen,
         "present": record.present,
+        "priority": record.priority,
+        "requested_at": record.requested_at,
     }
 
 
@@ -317,12 +336,17 @@ class SceneMemoryStore:
                 "or versioned envelope"
             )
         records: list[SceneObject] = []
+        migrated_record = False
         for index, value in enumerate(raw_records):
             if not isinstance(value, dict):
                 raise SceneMemoryError(
                     f"invalid scene memory {self._path}: entry {index} must be an object"
                 )
             keys = frozenset(value)
+            if keys == _LEGACY_FIELDS:
+                value = {**value, "priority": "incidental", "requested_at": None}
+                keys = _FIELDS
+                migrated_record = True
             if keys != _FIELDS:
                 missing = sorted(_FIELDS - keys)
                 unknown = sorted(keys - _FIELDS)
@@ -346,7 +370,7 @@ class SceneMemoryStore:
             selected = _durable_selection(validated)
         except SceneMemoryError as exc:
             raise SceneMemoryError(f"invalid scene memory {self._path}: {exc}") from exc
-        if legacy or len(selected) != len(validated):
+        if legacy or migrated_record or len(selected) != len(validated):
             try:
                 self._save(selected, next_id)
             except OSError as exc:
@@ -436,16 +460,28 @@ class SceneMemoryStore:
             )
 
         visible_ids = {record.id for record in visible}
-        historical = sorted(
-            (
-                replace(record, present=False)
-                for record in existing
-                if record.id not in visible_ids
-            ),
-            key=lambda record: (-record.last_seen, _id_key(record)),
+        historical = [
+            replace(record, present=False)
+            for record in existing
+            if record.id not in visible_ids
+        ]
+        pool = (*visible, *historical)
+        order = {record.id: index for index, record in enumerate(pool)}
+        result = _validate_collection(
+            tuple(
+                sorted(
+                    pool,
+                    key=lambda record: (
+                        record.priority != "requested",
+                        -(record.requested_at or 0.0),
+                        not record.present,
+                        -record.last_seen,
+                        order[record.id],
+                        _id_key(record),
+                    ),
+                )[:MAX_SCENE_OBJECTS]
+            )
         )
-        remaining = MAX_SCENE_OBJECTS - len(visible)
-        result = _validate_collection((*visible, *historical[:remaining]))
         self._save(result, next_id)
         return result
 
