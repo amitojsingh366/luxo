@@ -30,6 +30,8 @@ from core.fsm import BehaviorState, Transition
 
 
 NOTICE_FREEZE_S = 0.150
+FACE_EYE_LEVEL_RAISE_RAD = 0.10
+THINKING_DIP_RAD = math.radians(2.0)
 SCAN_DEFAULT_ARC_RAD = 1.20
 SCAN_DEFAULT_SPEED_RAD_S = 0.80
 SCAN_MIN_ARC_RAD = 0.30
@@ -103,6 +105,7 @@ class AnimationDirector:
         self._pending_capture_id: str | None = None
         self._notice_due: float | None = None
         self._droop_due: float | None = None
+        self._thinking_dip = False
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore: tuple[LightPreset, LightPattern] | None = None
         self._blink_started_at: float | None = None
@@ -162,6 +165,7 @@ class AnimationDirector:
             raise ValueError("transition time must be monotonic")
         self._last_transition = transition
         state = transition.current
+        self._thinking_dip = state is BehaviorState.THINKING
 
         if state is BehaviorState.DORMANT:
             self._notice_due = None
@@ -192,7 +196,9 @@ class AnimationDirector:
             self._desired_target = "person"
             self._set_light(LightPreset.WARM_BRIGHT)
         elif state is BehaviorState.THINKING:
-            self._desired_target = "scene"
+            # Owner-directed performance tuning overrides PRD 7.2's glance
+            # away: Luxo keeps eye contact and shows thought mainly in light.
+            self._desired_target = "person"
             self._set_light(LightPreset.THINKING_PULSE)
             self._effects.append(SfxCue(SfxName.HMM))
         elif state is BehaviorState.SPEAKING:
@@ -241,6 +247,7 @@ class AnimationDirector:
         self._pending_capture_id = None
         self._notice_due = None
         self._droop_due = None
+        self._thinking_dip = False
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore = None
         self._blink_started_at = None
@@ -327,7 +334,26 @@ class AnimationDirector:
             raise TypeError("target_resolver must return LookAtTarget or None")
         if target.target != self._desired_target:
             raise ValueError("resolved target name must match the semantic target")
-        return target
+        return self._adjust_person_elevation(target, snapshot)
+
+    def _adjust_person_elevation(
+        self,
+        target: LookAtTarget,
+        snapshot: BlackboardSnapshot,
+    ) -> LookAtTarget:
+        """Aim faces at eye level while leaving hand measurements untouched."""
+
+        if target.target != "person":
+            return target
+        gaze = snapshot.gaze
+        tracking_hand = gaze.hands_present and gaze.hand_conf >= 0.5
+        elevation = target.elevation_rad
+        if not tracking_hand:
+            # Positive head pitch looks down after the URDF's pi frame flip.
+            elevation -= FACE_EYE_LEVEL_RAISE_RAD
+        if self._thinking_dip:
+            elevation += THINKING_DIP_RAD
+        return LookAtTarget(target.target, target.azimuth_rad, elevation)
 
     def _validate_tick_time(self, now: float) -> None:
         if now < 0.0:
