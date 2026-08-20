@@ -403,7 +403,12 @@ class OpenRouterBrainClient:
             if presence is not None and any(value not in prior_ids for value in presence):
                 LOGGER.warning("dropping present_prior_ids with unknown prior ids")
                 presence = None
-            return ObservationResponse(tuple(visible), response.focus, presence)
+            return ObservationResponse(
+                tuple(visible),
+                response.focus,
+                presence,
+                raw_saturated=response.raw_saturated,
+            )
 
         return self._run("observe", self._messages(content), parse_observation)
 

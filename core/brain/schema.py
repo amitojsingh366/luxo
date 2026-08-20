@@ -174,6 +174,7 @@ class ObservationResponse:
     visible: tuple[ObservedObject, ...]
     focus: int | None = None
     present_prior_ids: tuple[str, ...] | None = None
+    raw_saturated: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.visible, tuple) or not all(
@@ -196,6 +197,8 @@ class ObservationResponse:
                 raise TypeError("present_prior_ids must be null or a tuple of safe ids")
             if len(self.present_prior_ids) != len(set(self.present_prior_ids)):
                 raise ValueError("present_prior_ids must not contain duplicates")
+        if type(self.raw_saturated) is not bool:
+            raise TypeError("raw_saturated must be a boolean")
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -287,6 +290,7 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
         visible=visible,
         focus=focus,
         present_prior_ids=presence,
+        raw_saturated=len(raw_visible) >= OBSERVATION_MAX_VISIBLE,
     )
 
 

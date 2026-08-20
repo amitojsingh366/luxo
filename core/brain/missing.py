@@ -10,12 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .schema import (
-    OBSERVATION_MAX_VISIBLE,
-    ObservationPrior,
-    ObservationResponse,
-    normalize_canonical_label,
-)
+from .schema import ObservationPrior, ObservationResponse, normalize_canonical_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,7 +96,7 @@ def compute_observation_missing(
     )
     if evidence_valid:
         retained.extend(evidence or ())
-    elif len(observation.visible) == OBSERVATION_MAX_VISIBLE:
+    elif observation.raw_saturated:
         # A saturated detail list may omit lower-priority objects that remain
         # visible. Without trustworthy presence evidence, silence is safer
         # than claiming that every omitted prior disappeared.

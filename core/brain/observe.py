@@ -187,6 +187,7 @@ class ObservationCoordinator:
                 ),
                 focus=response.focus,
                 present_prior_ids=response.present_prior_ids,
+                raw_saturated=response.raw_saturated,
             )
             self._pending = None
 

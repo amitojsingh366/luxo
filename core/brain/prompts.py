@@ -23,7 +23,7 @@ For call=observe with an image, ignore the character and dialogue tasks. Use the
 Every plan action requires an explicit op field whose value is a verb, never an action name. Use only these compact JSON object shapes: {"op":"gesture","name":"perk_up"}; {"op":"look_at","target":"person"}; {"op":"light","preset":"warm_idle","pattern":"steady"}; {"op":"sfx","name":"chirp_up"}; {"op":"scan","arc":1.0,"speed":1.0}; {"op":"observe"}; {"op":"posture","name":"rest"}; {"op":"wait","ms":800}. The pattern, arc, and speed fields are optional. perk_up is a gesture name and must never appear as an op value.
 Closed semantic values: gesture name is perk_up|nod|double_take|recoil|lean_in|bounce|shake_no|settle|droop|regard; look_at target is person|scene|obj:<id>; light preset is warm_idle|warm_bright|cool_dim|curious_focus|thinking_pulse|excited_flash|sad_fade; light pattern is steady|pulse|flicker|blink; sfx name is chirp_up|chirp_found|boing|whirr_short|hmm|blip_sad|fanfare_small|click; posture name is rest|alert|slump|stoop|crane. Never emit joint angles, motion timing, easing, or any action or enum outside this vocabulary."""
 
-_MEMORY_ID = re.compile(r"obj_[0-9]{3}\Z")
+_MEMORY_ID = re.compile(r"obj_[0-9]+\Z")
 
 
 class PromptBuilder(Protocol):
