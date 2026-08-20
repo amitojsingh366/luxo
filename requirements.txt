@@ -1,7 +1,68 @@
 # Runtime dependencies named by the locked architecture.  Model weights and
 # whisper.cpp are installed separately and are never vendored in this repo.
+#
+# Any --hash below puts pip into hash-checking mode, which then demands a hash
+# for every distribution it installs -- transitive dependencies included.  The
+# complete closure of onnxruntime and websockets is therefore pinned here.
+#
+# Python: CPython 3.12 exactly, not a floor.  onnxruntime 1.20.1 publishes no
+# sdist and no pure-Python wheel, so pip must take an ABI-tagged binary wheel;
+# only the cp312 ones are hashed here.  On 3.11 or 3.13 pip selects a cp311 or
+# cp313 wheel instead, finds no matching hash and aborts the install.
+#
+# Platforms: Linux x86_64 (manylinux, glibc >= 2.28) and macOS arm64 (>= 13.0,
+# via universal2).  Linux aarch64 is deliberately NOT covered -- the deploy
+# target is x86_64 Ubuntu 24.04.  Upstream aarch64 wheels do exist, so this is
+# a documented scope limit rather than an upstream gap.  Windows and musl are
+# out of scope for the same reason.
+#
+# Regenerate hashes from the PyPI JSON API, e.g.
+#   https://pypi.org/pypi/onnxruntime/1.20.1/json
+
+# via onnxruntime
+coloredlogs==15.0.1 \
+    --hash=sha256:612ee75c546f53e92e70049c9dbfcc18c935a2b9a53b66085ce9ef6a6e5c0934
+
+# via onnxruntime
+flatbuffers==25.12.19 \
+    --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+
+# via coloredlogs
+humanfriendly==10.0 \
+    --hash=sha256:1697e1a8a8f550fd43c2865cd84542fc175a61dcb779b6fee18cf6b6ccba1477
+
+# via sympy (mpmath<1.4)
+mpmath==1.3.0 \
+    --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
+
+# via onnxruntime (numpy>=1.21.6)
+numpy==2.5.2 \
+    --hash=sha256:4bbd96c833ecc8cc069ce518078fc8c60cb9cbfb0fea5b7a803ad65035596d03 \
+    --hash=sha256:6e8172ddfcf5cf74b811d372b570b83c60bd2de87a6fbfbebdadb4a9bd9c6cbb \
+    --hash=sha256:3cdec01fa790a186d430433fdd4d4ffb70eed6f0eeb4bf05c8dbe2dce0a9bcb8
+
+# direct dependency
 onnxruntime==1.20.1 \
     --hash=sha256:22b0655e2bf4f2161d52706e31f517a0e54939dc393e92577df51808a7edc8c9 \
     --hash=sha256:bb71a814f66517a65628c9e4a2bb530a6edd2cd5d87ffa0af0f6f773a027d99e
+
+# via onnxruntime
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+
+# via onnxruntime
+protobuf==7.35.1 \
+    --hash=sha256:24f857477359a85c0c235261b8ba905fd51b2562f4a64ca1df5473f29850cbf6 \
+    --hash=sha256:74758715c53d7158fb76caf4f0cfdacc5329a4b1bb994f865d6cf302d413a1c4 \
+    --hash=sha256:4bc97768d8fe4ad6743c8a19403e314511ed9f6d13205b687e52421c023ac1b9
+
+# via onnxruntime
+sympy==1.14.0 \
+    --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
+
+# direct dependency
 websockets==15.0.1 \
+    --hash=sha256:3e90baa811a5d73f3ca0bcbf32064d663ed81318ab225ee4f427ad4e26e5aff3 \
+    --hash=sha256:0701bc3cfcb9164d04a14b149fd74be7347a530ad3bbf15ab2c678a2cd3dd9a2 \
+    --hash=sha256:64dee438fed052b52e4f98f76c5790513235efaa1ef7f3f2192c392cd7c91b65 \
     --hash=sha256:f7a866fbc1e97b5c617ee4116daaa09b722101d4a3c170c787450ba409f9736f
