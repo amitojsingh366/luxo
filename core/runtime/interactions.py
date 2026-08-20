@@ -83,7 +83,13 @@ SpeakCallback = Callable[[SpeakBeginMessage | SpeakEndMessage], None]
 PcmCallback = Callable[[bytes], None]
 MilestoneCallback = Callable[[Milestone, float], None]
 ObservationOriginCallback = Callable[
-    [ObservationOrigin, tuple[RecentExchange, ...], ObservationPresentation], bool
+    [
+        ObservationOrigin,
+        tuple[RecentExchange, ...],
+        ObservationPresentation,
+        tuple[str, ...],
+    ],
+    bool,
 ]
 MemoryReferenceCallback = Callable[[tuple[str, ...], float], None]
 
@@ -672,6 +678,7 @@ class ConversationCoordinator:
                     origin,
                     tuple(self._recent),
                     presentation,
+                    reply.memory_refs,
                 )
             except Exception:
                 LOGGER.exception("observation origin callback failed")
@@ -702,6 +709,12 @@ class ConversationCoordinator:
             )
         else:
             LOGGER.info("CHAT Luxo: %s", _log_text(say))
+        if reply.visual_intent is not None:
+            LOGGER.info(
+                "BRAIN decision visual_intent=%s memory_refs=%s",
+                reply.visual_intent.value,
+                json.dumps(reply.memory_refs, ensure_ascii=False, separators=(",", ":")),
+            )
         LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
         now = self._now()
         if reply.memory_refs and self._memory_reference_callback is not None:
