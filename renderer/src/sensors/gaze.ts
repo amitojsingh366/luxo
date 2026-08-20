@@ -81,6 +81,7 @@ export interface GazeSensorOptions {
   readonly wasmBasePath?: string;
   readonly modelAssetPath?: string;
   readonly handModelAssetPath?: string;
+  readonly onDebugFrame?: (frame: LocalVisionDebugFrame) => void;
   readonly onError?: (error: Error) => void;
 }
 
@@ -98,6 +99,28 @@ export interface TargetAngles {
   readonly az: number;
   readonly el: number;
   readonly vfovRad: number;
+}
+
+export interface NormalizedRegion {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface LocalVisionDetection {
+  readonly kind: 'face' | 'hand';
+  readonly index: number;
+  readonly bounds: NormalizedRegion;
+  readonly centroid: FaceCentroid;
+  readonly confidence: number;
+}
+
+export interface LocalVisionDebugFrame {
+  readonly t: number;
+  readonly face: LocalVisionDetection | null;
+  readonly hands: readonly LocalVisionDetection[];
+  readonly handCentroid: FaceCentroid | null;
 }
 
 export function createFaceLandmarkerConfiguration(
@@ -232,6 +255,30 @@ export function handsCentroid(
   return faceCentroid(landmarks);
 }
 
+export function normalizedLandmarkBounds(
+  landmarks: readonly Pick<NormalizedLandmark, 'x' | 'y'>[],
+): NormalizedRegion {
+  if (landmarks.length === 0) throw new RangeError('Detection has no landmarks');
+  let left = 1;
+  let top = 1;
+  let right = 0;
+  let bottom = 0;
+  for (const landmark of landmarks) {
+    const x = clamp(finite(landmark.x, 'landmark.x'), 0, 1);
+    const y = clamp(finite(landmark.y, 'landmark.y'), 0, 1);
+    left = Math.min(left, x);
+    top = Math.min(top, y);
+    right = Math.max(right, x);
+    bottom = Math.max(bottom, y);
+  }
+  return Object.freeze({
+    x: left,
+    y: top,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top),
+  });
+}
+
 export function acceptedHandConfidence(result: HandTrackingResult | null): number {
   const values = (result?.handedness ?? [])
     .flat()
@@ -299,6 +346,7 @@ export class GazeSensor {
   private readonly configuration: FaceLandmarkerConfiguration;
   private readonly handConfiguration: HandLandmarkerConfiguration;
   private readonly handTrackingEnabled: boolean;
+  private readonly onDebugFrame?: (frame: LocalVisionDebugFrame) => void;
   private readonly onError?: (error: Error) => void;
   private readonly ema = new GazeEma();
   private landmarker: GazeLandmarker | null = null;
@@ -335,6 +383,7 @@ export class GazeSensor {
       options.handModelAssetPath,
       options.wasmBasePath,
     );
+    this.onDebugFrame = options.onDebugFrame;
     this.onError = options.onError;
   }
 
@@ -480,12 +529,20 @@ export class GazeSensor {
     const matrix = result?.facialTransformationMatrixes[0];
     if (!landmarks || landmarks.length === 0 || !matrix) {
       this.ema.reset();
+      this.publishDebugFrame(t, null, hands);
       this.publish(this.withHandFact(absentGazeMessage(t), hands));
       return;
     }
     try {
       const orientation = this.ema.update(extractFaceOrientation(matrix));
       const centroid = faceCentroid(landmarks);
+      this.publishDebugFrame(t, {
+        kind: 'face',
+        index: 0,
+        bounds: normalizedLandmarkBounds(landmarks),
+        centroid,
+        confidence: acceptedFaceConfidence(landmarks),
+      }, hands);
       const spec = this.camera.cameraSpec;
       const target = targetAnglesFromCentroid(centroid, spec.hfov_deg, spec.w, spec.h);
       this.publish(this.withHandFact({
@@ -500,6 +557,7 @@ export class GazeSensor {
       }, hands));
     } catch (value) {
       this.ema.reset();
+      this.publishDebugFrame(t, null, hands);
       this.publish(this.withHandFact(absentGazeMessage(t), hands));
       this.reportError(toError(value));
     }
@@ -535,6 +593,36 @@ export class GazeSensor {
       hand_el: clamp(target.el, -Math.PI / 2, Math.PI / 2),
       hand_conf: acceptedHandConfidence(result),
     };
+  }
+
+  private publishDebugFrame(
+    t: number,
+    face: LocalVisionDetection | null,
+    result: HandTrackingResult | null,
+  ): void {
+    if (!this.onDebugFrame) return;
+    try {
+      const handLandmarks = result?.landmarks ?? [];
+      const hands = handLandmarks.flatMap((landmarks, index): LocalVisionDetection[] =>
+        landmarks.length === 0 ? [] : [{
+          kind: 'hand',
+          index,
+          bounds: normalizedLandmarkBounds(landmarks),
+          centroid: faceCentroid(landmarks),
+          confidence: acceptedHandConfidence({
+            landmarks: [landmarks],
+            handedness: result?.handedness[index] ? [result.handedness[index]] : [],
+          }),
+        }]);
+      this.onDebugFrame(Object.freeze({
+        t,
+        face,
+        hands: Object.freeze(hands),
+        handCentroid: handsCentroid(handLandmarks.filter((landmarks) => landmarks.length > 0)),
+      }));
+    } catch (value) {
+      this.reportError(toError(value));
+    }
   }
 
   private nextMediaTimestamp(): number {
