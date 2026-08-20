@@ -355,7 +355,7 @@ class OpenRouterBrainClient:
         ]
 
         def parse_observation(raw: str) -> ObservationResponse:
-            response = parse_observation_response(raw, require_known=True)
+            response = parse_observation_response(raw)
             prior_set = frozenset(prior)
             if any(label not in prior_set for label in response.present):
                 raise ResponseSchemaError(
