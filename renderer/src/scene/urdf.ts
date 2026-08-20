@@ -24,7 +24,7 @@ export type UrdfJointName = (typeof BODY_TO_URDF_JOINT)[BodyJointName];
 export type JointPositions = Readonly<Record<BodyJointName, number>>;
 
 export const REST_JOINTS: JointPositions = Object.freeze({
-  base_yaw: 0,
+  base_yaw: 0.44,
   shoulder_pitch: 0.654,
   elbow_pitch: -1.265,
   neck_yaw: 0,
