@@ -716,6 +716,7 @@ class LumenApp:
         config: FrozenConfig | None = None,
         poses: PoseLibrary | None = None,
         latency_logger: InteractionCSVLogger | None = None,
+        latency_recorder: LatencyRecorder | None = None,
         brain_model: str = "unknown",
         brain_profile: str = "free",
         clock: Callable[[], float] = time.time,
@@ -752,16 +753,22 @@ class LumenApp:
             capture_callback=self._on_router_capture,
         )
 
-        self._latency = (
-            LatencyRecorder(
+        # A caller that needs token counts must build the recorder itself and
+        # hand the same object to the brain as its metrics callback, because
+        # ``BrainClient`` takes that callback at construction and the brain is
+        # built before the app. Passing only a logger is still supported; those
+        # rows carry the configured model id and zero tokens.
+        if latency_recorder is not None:
+            self._latency: LatencyRecorder | None = latency_recorder
+        elif latency_logger is not None:
+            self._latency = LatencyRecorder(
                 latency_logger,
                 model=brain_model,
                 profile=brain_profile,
                 executor=latency_executor,
             )
-            if latency_logger is not None
-            else None
-        )
+        else:
+            self._latency = None
 
         self._conversation = ConversationCoordinator(
             blackboard=self._blackboard,
@@ -884,6 +891,10 @@ class LumenApp:
     @property
     def director(self) -> AnimationDirector:
         return self._director
+
+    @property
+    def latency_recorder(self) -> LatencyRecorder | None:
+        return self._latency
 
     def status(self) -> AppStatus:
         snapshot = self._blackboard.snapshot()

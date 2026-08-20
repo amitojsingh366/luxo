@@ -106,12 +106,16 @@ def _endpoint(config: FrozenConfig) -> tuple[str, int]:
     return host, port
 
 
-def build_models(config: FrozenConfig) -> dict[str, object]:
+def build_models(config: FrozenConfig, metrics_callback: object = None) -> dict[str, object]:
     """Construct the three real model boundaries from the environment.
 
     Every construction here can fail on a machine without assets, and that is
     intentional: a missing model must be reported by name at startup rather
     than discovered as a dead character during the recording.
+
+    ``metrics_callback`` is passed straight to the brain. It is the only way
+    OpenRouter's reported model id and token counts reach the PRD 11.1 CSV,
+    because ``BrainClient`` takes that callback at construction time.
     """
 
     from .brain.client import OpenRouterBrainClient
@@ -135,18 +139,33 @@ def build_models(config: FrozenConfig) -> dict[str, object]:
         create_phoneme_encoder(piper_config),
         length_scale=float(config.speech.piper_length_scale),
     )
-    brain = OpenRouterBrainClient(profile=profile, model=model or None)
+    brain = OpenRouterBrainClient(
+        profile=profile,
+        model=model or None,
+        metrics_callback=metrics_callback,  # type: ignore[arg-type]
+    )
     return {"stt": stt, "tts": tts, "brain": brain, "model": brain.model, "profile": profile}
 
 
 def build_app(config: FrozenConfig, server: object):
-    """Assemble one :class:`LumenApp` around an already-built server."""
+    """Assemble one :class:`LumenApp` around an already-built server.
+
+    The latency recorder is built before the models so the brain can report
+    its token counts into the same recorder the conversation milestones land
+    in; otherwise every CSV row would carry zero tokens.
+    """
 
     from .brain.memory import SceneMemoryStore
     from .instrumentation import InteractionCSVLogger
-    from .runtime.app import LumenApp
+    from .runtime.app import LatencyRecorder, LumenApp
 
-    models = build_models(config)
+    profile = str(config.brain.profile)
+    recorder = LatencyRecorder(
+        InteractionCSVLogger(_env_path("LUMEN_LATENCY_CSV", DEFAULT_LATENCY_CSV)),
+        model=os.environ.get("OPENROUTER_MODEL") or FREE_PROFILE_MODEL,
+        profile=profile,
+    )
+    models = build_models(config, recorder.on_call_metrics)
     return LumenApp(
         protocol=server,  # type: ignore[arg-type]
         stt=models["stt"],  # type: ignore[arg-type]
@@ -154,9 +173,7 @@ def build_app(config: FrozenConfig, server: object):
         brain=models["brain"],  # type: ignore[arg-type]
         memory_store=SceneMemoryStore(_env_path("LUMEN_MEMORY_PATH", DEFAULT_MEMORY_PATH)),
         config=config,
-        latency_logger=InteractionCSVLogger(
-            _env_path("LUMEN_LATENCY_CSV", DEFAULT_LATENCY_CSV)
-        ),
+        latency_recorder=recorder,
         brain_model=str(models["model"]),
         brain_profile=str(models["profile"]),
     )
