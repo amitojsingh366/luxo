@@ -54,6 +54,36 @@ REPO_ROOT = Path(__file__).resolve().parent
 # side. A newer Python is as broken as an older one, so this is an equality.
 REQUIRED_PYTHON = (3, 12)
 
+# The doctor's own job is to explain a wrong interpreter, so it must survive
+# being run by one. Everything below this point uses syntax and arguments that
+# need 3.10+ (dataclass slots, PEP 604 unions), so on an older Python the
+# module would die with a traceback instead of the message the user needs.
+# Stock macOS still ships 3.9, which is the most likely wrong interpreter of
+# all. This guard is deliberately written to parse and run on very old
+# Pythons: no f-strings in the failure path beyond simple formatting, no
+# modern syntax, and it runs before the first construct that would break.
+# It is gated on __main__ so importing the module (as the checks do, on a
+# non-3.12 interpreter) never exits the process.
+if __name__ == "__main__" and sys.version_info[:2] != REQUIRED_PYTHON:
+    _found = "%d.%d" % sys.version_info[:2]
+    _want = "%d.%d" % REQUIRED_PYTHON
+    _newer = sys.version_info[:2] > REQUIRED_PYTHON
+    sys.stderr.write(
+        "doctor.py: this interpreter is Python %s, but Luxo is locked to %s exactly.\n"
+        % (_found, _want)
+    )
+    if _newer:
+        sys.stderr.write(
+            "  a newer Python is not an upgrade here: requirements.txt pins\n"
+            "  cp312-only wheels, so pip aborts with a hash error, not a version one\n"
+        )
+    sys.stderr.write(
+        "  sudo apt-get install -y python3.12 python3.12-venv   # Ubuntu 24.04\n"
+        "  rebuild the environment with it: python3.12 -m venv .venv\n"
+        "  then re-run: .venv/bin/python doctor.py\n"
+    )
+    raise SystemExit(1)
+
 # PRD 10 and 12.3: the service is loopback only. The doctor refuses to probe
 # any other bind address, so it can never open a LAN-reachable socket itself.
 LOOPBACK_HOST = "127.0.0.1"
