@@ -162,6 +162,38 @@ class BehaviorFSM:
                 gaze_off_since=self._gaze_off_since,
             )
 
+    def reset(self, now: float) -> None:
+        """Return to the warm DORMANT baseline in one lock hold.
+
+        Model and browser readiness deliberately survive a between-takes reset:
+        their one-shot readiness events will not be posted again. Pending events
+        are counted as dropped, while transition telemetry remains cumulative.
+        """
+
+        instant = _finite_time(now)
+        if instant < 0.0:
+            raise ValueError("now must be a finite nonnegative number")
+        with self._lock:
+            latest = max(
+                (
+                    value
+                    for value in (self._last_tick_at, self._state_entered_at)
+                    if value is not None
+                ),
+                default=-math.inf,
+            )
+            if instant < latest:
+                raise ValueError("now must not move backwards")
+            self._dropped_events += len(self._events)
+            self._events.clear()
+            self._state = BehaviorState.DORMANT
+            self._state_entered_at = instant
+            self._last_tick_at = instant
+            self._last_transition = None
+            self._gaze_on = False
+            self._gaze_on_since = None
+            self._gaze_off_since = None
+
     def post_event(self, event: BehaviorEvent) -> int:
         """Queue one closed event and return its increasing sequence id."""
 
