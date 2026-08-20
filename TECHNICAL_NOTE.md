@@ -24,23 +24,42 @@ macOS and Ubuntu, removes the AVFoundation/V4L2/PortAudio layer, provides echo
 cancellation, and puts face landmarking on the GPU instead of one of four scarce
 CPU cores.
 
-```
-┌─────────────── LAPTOP (localhost only) ─────────────────┐
-│ BODY — browser (Vite · TS · three.js · Tone.js)         │
-│  camera ─► MediaPipe ─► gaze @10Hz; JPEG ONLY on observe │
-│  mic ───► Silero VAD (ONNX Web) ─► 1 PCM per utterance  │
-│  URDF · PointLight · bloom · 8 SFX · music · TTS out    │
-│  client.ts validates EVERY core message before dispatch │
-└────────┬────────────────────────────────────────────────┘
-   up   gaze·vad·tts_done·0x01 PCM·0x02 JPEG
-   down body_state@60Hz·cue·capture_frame·0x03 PCM
-┌────────▼────────────────────────────────────────────────┐
-│ MIND — core (Python 3.12, one process)                  │
-│  BLACKBOARD gaze · utterance · scene_memory · plan       │
-│  10Hz   BehaviorFSM ─► conversation/observation ─► plans│
-│  workers whisper.cpp · Piper · OpenRouter ──────────────┼─► cloud
-│  120Hz  idle⊕gaze⊕gesture⊕light⊕bob ─► springs ─► clamps│
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+  subgraph laptop["Laptop: localhost only"]
+    direction TB
+
+    subgraph browser["Browser: Vite, TypeScript, three.js, Tone.js"]
+      direction LR
+      camera["Camera"] --> landmarks["MediaPipe<br/>gaze at 10 Hz"]
+      camera --> capture["JPEG capture<br/>only on observe"]
+      microphone["Microphone"] --> vad["Silero VAD<br/>one PCM utterance"]
+      landmarks --> client["Protocol client<br/>validates core messages"]
+      capture --> client
+      vad --> client
+      client --> render["URDF render<br/>lighting and bloom"]
+      client --> audio["Audio output<br/>SFX, music, TTS"]
+      client --> capture
+    end
+
+    subgraph core["Python 3.12 core: one process"]
+      direction TB
+      server["Protocol server"] --> blackboard["Blackboard<br/>gaze, utterance, scene memory, plan"]
+      blackboard --> fsm["BehaviorFSM at 10 Hz"]
+      fsm --> interaction["Conversation and observation"]
+      interaction --> workers["Workers<br/>whisper.cpp, Piper, OpenRouter client"]
+      workers -->|"results and plans"| blackboard
+      blackboard --> animation["Animation at 120 Hz<br/>idle + gaze + gesture + light + bob"]
+      animation --> output["Springs, velocity clamps,<br/>soft-limit clamps"]
+      output --> server
+      workers -->|"TTS PCM"| server
+    end
+
+    client -->|"gaze, VAD, tts_done, 0x01 PCM, 0x02 JPEG"| server
+    server -->|"body_state at 60 Hz, cue, capture_frame, 0x03 TTS PCM"| client
+  end
+
+  workers <-->|"converse, observe, resolve observation"| openrouter["OpenRouter"]
 ```
 
 The browser never chooses a gesture, light preset, or joint value, and gaze
@@ -183,18 +202,14 @@ check remains outstanding.
 
 Most of the development was AI-assisted. A Claude agent acted as the
 orchestrator, breaking the work into tasks and coordinating Codex agents running
-`gpt-5.6-sol`. Before implementation, I wrote a strict PRD and a detailed text
-specification. The agents were instructed to follow both closely.
+`gpt-5.6-sol`. I wrote a strict PRD and detailed technical specification, and
+the agents were instructed to follow both closely.
 
 When implementation exposed a new constraint or changed a requirement, I
 updated the orchestrator prompt and the relevant specification. The orchestrator
-then delegated the follow-up changes to the Codex agents. I ran the application
-continuously during development and fed bugs, behaviour problems, and integration
-failures from those live runs back into the next round of changes.
+then delegated the follow-up changes to the Codex agents.
 
-A lot of design work happened alongside the code. I worked out how the sound
-effects should behave and how the lamp should move as the application was being
-built. For motion, I used the
+A lot of design work happened alongside the code. For motion, I used the
 [Robots Fan viewer](https://viewer.robotsfan.com/) to load the URDF, adjust the
 joints, and develop the base animations. I created
 `robot/dormant_to_engaged.json` and `robot/engaged_to_inspecting.json` by hand in
@@ -231,7 +246,50 @@ integration tests for capture, reconnects, and audio sequencing.
 | Docker at runtime | Device passthrough is the dominant failure mode; costs RAM. |
 | C++/Rust core | ~200 flops/tick; heavy compute already in compiled kernels. |
 
-## 10. Known limitations
+## 9. Development timeline
+
+I spent roughly two hours planning before coding. That time went into writing
+the PRD, the detailed technical specification, and the initial orchestrator
+prompt.
+
+Coding took roughly seven hours and ran almost back-to-back, apart from short
+breaks to eat or step away. I iterated rapidly throughout those seven hours. As
+the agents generated code, I ran the application live, fixed bugs and behaviour
+problems as I found them, and worked on the sound effects and animations.
+
+## 10. Measurements
+
+`measurements/latency.csv` contains 72 completed spoken interactions. Each row
+measures the path from local VAD end to the first synthesized audio chunk. The
+figures below use linear-interpolated percentiles over all 72 rows.
+
+| Required evidence | Result |
+|---|---|
+| Engagement reliability | Not recorded. The CSV contains no engagement trials, detection outcomes, precision, or recall. |
+| Response latency | 3.401 s p50 and 8.512 s p95 end to end; 2.415 s minimum and 11.475 s maximum. |
+| CPU | Not recorded. There are no CPU samples in the measurements directory. |
+| Memory | Not recorded. There are no core or browser memory samples in the measurements directory. |
+
+| Latency stage | p50 (ms) | Mean (ms) | p95 (ms) |
+|---|---:|---:|---:|
+| VAD end → PCM received | 0.04 | 0.07 | 0.25 |
+| Transcription | 1,447.4 | 1,444.7 | 1,517.7 |
+| Transcript → request sent | 99.9 | 99.8 | 102.9 |
+| Model response | 811.7 | 1,111.5 | 1,744.9 |
+| Response → first audio | 326.4 | 2,241.4 | 5,931.7 |
+| End to end | 3,400.6 | 4,897.5 | 8,511.9 |
+
+The long tail occurs mainly after the model response: response-to-first-audio
+time rises from 326 ms at p50 to 5.932 s at p95, and 29 of 72 interactions took
+more than one second in that stage. Median model usage was 1,807 input tokens and
+40 output tokens.
+
+The requested test endpoint was `google/gemini-2.5-flash-lite:nitro`. The CSV
+records OpenRouter's returned model ID as `google/gemini-2.5-flash-lite`, without
+the routing suffix, and records the application profile as `free`. These runs
+were captured on macOS and do not establish performance on the Ubuntu target.
+
+## 11. Known limitations
 
 - The body has no roll DOF, so the classic sideways curious head-tilt is
   physically impossible. The shade cannot rotate about its optical axis, and

@@ -251,4 +251,4 @@ OpenRouter profile, are described in [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md)
 - No Linux smoke check has been run. The target is Ubuntu 24.04, but everything
   so far has been exercised on macOS.
 
-[`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md) §10 carries the full list.
+[`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md) §11 carries the full list.
