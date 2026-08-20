@@ -30,7 +30,11 @@ from core.fsm import BehaviorState, Transition
 
 
 NOTICE_FREEZE_S = 0.150
-FACE_EYE_LEVEL_RAISE_RAD = 0.10
+# The browser's face-centroid elevation still leaves the shade visually low at
+# the neutral camera position. Positive head pitch is down after the URDF's pi
+# flip, so this body-owned calibration must be subtracted from tracked targets.
+FACE_EYE_LEVEL_RAISE_RAD = 0.20
+HAND_TARGET_RAISE_RAD = FACE_EYE_LEVEL_RAISE_RAD
 THINKING_DIP_RAD = math.radians(2.0)
 SCAN_DEFAULT_ARC_RAD = 1.20
 SCAN_DEFAULT_SPEED_RAD_S = 0.80
@@ -341,16 +345,20 @@ class AnimationDirector:
         target: LookAtTarget,
         snapshot: BlackboardSnapshot,
     ) -> LookAtTarget:
-        """Aim faces at eye level while leaving hand measurements untouched."""
+        """Calibrate face and hand measurements without flattening their motion."""
 
         if target.target != "person":
             return target
         gaze = snapshot.gaze
         tracking_hand = gaze.hands_present and gaze.hand_conf >= 0.5
         elevation = target.elevation_rad
-        if not tracking_hand:
-            # Positive head pitch looks down after the URDF's pi frame flip.
-            elevation -= FACE_EYE_LEVEL_RAISE_RAD
+        # Positive head pitch looks down after the URDF's pi frame flip. Hands
+        # need the same camera-to-emitter bias as faces; subtracting a constant
+        # preserves their measured vertical movement instead of fixing a pose.
+        calibration = (
+            HAND_TARGET_RAISE_RAD if tracking_hand else FACE_EYE_LEVEL_RAISE_RAD
+        )
+        elevation -= calibration
         if self._thinking_dip:
             elevation += THINKING_DIP_RAD
         return LookAtTarget(target.target, target.azimuth_rad, elevation)
