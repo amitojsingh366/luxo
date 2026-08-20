@@ -14,7 +14,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TypeAlias
+from typing import Final, TypeAlias
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,6 +33,61 @@ OBSERVATION_MAX_VISIBLE = 10
 _SAFE_OBJECT_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _CANONICAL_SEPARATOR = re.compile(r"[\s_-]+")
 _CANONICAL_LABEL = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)*\Z")
+_NON_DURABLE_SCENE_CANONICALS: Final = frozenset(
+    {
+        # People and body facts belong to the local gaze pipeline, not durable
+        # object memory. Accessories remain eligible in their own right.
+        "adult",
+        "arm",
+        "arms",
+        "body",
+        "boy",
+        "child",
+        "eye",
+        "eyes",
+        "ear",
+        "ears",
+        "face",
+        "feet",
+        "finger",
+        "fingers",
+        "foot",
+        "girl",
+        "hand",
+        "hands",
+        "hair",
+        "head",
+        "human",
+        "individual",
+        "leg",
+        "legs",
+        "man",
+        "mouth",
+        "neck",
+        "nose",
+        "people",
+        "person",
+        "subject",
+        "shoulder",
+        "shoulders",
+        "thumb",
+        "thumbs",
+        "torso",
+        "user",
+        "woman",
+        # These names contain no recallable identity or attributes and otherwise
+        # consume the nearest-first memory budget on weak vision responses.
+        "generic object",
+        "item",
+        "miscellaneous object",
+        "object",
+        "something",
+        "thing",
+        "unidentified object",
+        "unknown",
+        "unknown object",
+    }
+)
 
 
 class ResponseSchemaError(ValueError):
@@ -216,6 +271,20 @@ def normalize_canonical_label(value: object) -> str:
     return normalized
 
 
+def is_durable_scene_canonical(value: object) -> bool:
+    """Return whether a cloud-authored fact is worth durable object memory.
+
+    The policy is deliberately limited to canonical object categories. It does
+    not affect browser-local face, gaze, or hand geometry used for attention.
+    """
+
+    try:
+        canonical = normalize_canonical_label(value)
+    except ValueError:
+        return False
+    return canonical not in _NON_DURABLE_SCENE_CANONICALS
+
+
 def parse_plan_response(payload: RawPayload) -> PlanResponse:
     """Validate a ``converse`` or observation-resolution response.
 
@@ -304,6 +373,14 @@ def _observed_objects(
             item = _parse_observed_object(raw_object)
         except (TypeError, ValueError) as error:
             LOGGER.warning("dropping invalid %s object at index %d: %s", field, index, error)
+            continue
+        if not is_durable_scene_canonical(item.canonical):
+            LOGGER.warning(
+                "dropping non-durable %s object at index %d: %s",
+                field,
+                index,
+                item.canonical,
+            )
             continue
         retained_indexes[index] = len(objects)
         objects.append(item)
@@ -563,6 +640,7 @@ __all__ = [
     "SAY_MAX_CHARACTERS",
     "SfxName",
     "WAIT_MAX_MS",
+    "is_durable_scene_canonical",
     "normalize_canonical_label",
     "parse_observation_response",
     "parse_plan_response",
