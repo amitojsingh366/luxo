@@ -1,18 +1,16 @@
-"""Local missing-object comparison and minimal narration boundary.
+"""Pure local missing-object comparison.
 
-The model performs perception and narration; this module alone performs the
-set comparison required by the PRD. It is synchronous and must be called from a
-worker thread because ``BrainClient.narrate`` may perform blocking network I/O.
+The vision model reports visible facts. This module alone performs the set
+comparison required by the PRD; cloud narration is owned by the generalized
+observation resolver.
 """
 
 from __future__ import annotations
 
-import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .client import BrainClient
-from .schema import ObservationResponse, PlanResponse, normalize_canonical_label
+from .schema import ObservationResponse, normalize_canonical_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,14 +20,6 @@ class MissingComparison:
     baseline: tuple[str, ...]
     present: tuple[str, ...]
     missing: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class MissingNarration:
-    """Validated narration paired with the local comparison that produced it."""
-
-    response: PlanResponse
-    comparison: MissingComparison
 
 
 def compute_missing(
@@ -75,48 +65,6 @@ def compute_observation_missing(
     return compute_missing(baseline, visible)
 
 
-class MissingObjectCoordinator:
-    """Serialize minimal narration calls without retaining observation data.
-
-    The coordinator is stateless apart from its lock and client reference. A
-    narration failure propagates unchanged and may be retried by invoking the
-    method again; no frame, observation record, or partial response is cached.
-    """
-
-    def __init__(self, brain: BrainClient) -> None:
-        if not callable(getattr(brain, "narrate", None)):
-            raise TypeError("brain must provide narrate(missing)")
-        self._brain = brain
-        self._lock = threading.Lock()
-
-    def compare_and_narrate(
-        self,
-        baseline: Sequence[str],
-        observation: ObservationResponse,
-    ) -> MissingNarration:
-        """Compute locally, then call ``narrate`` once with only missing labels."""
-
-        if not isinstance(observation, ObservationResponse):
-            raise TypeError("observation must be a validated ObservationResponse")
-        comparison = compute_observation_missing(baseline, observation)
-
-        return self.narrate_comparison(comparison)
-
-    def narrate_comparison(self, comparison: MissingComparison) -> MissingNarration:
-        """Narrate an already-computed, policy-filtered comparison once."""
-
-        if not isinstance(comparison, MissingComparison):
-            raise TypeError("comparison must be a MissingComparison")
-
-        # Brain clients need not be re-entrant. Serialization also makes the
-        # one-call boundary deterministic when worker tasks race.
-        with self._lock:
-            response = self._brain.narrate(comparison.missing)
-        if not isinstance(response, PlanResponse):
-            raise TypeError("brain.narrate must return a validated PlanResponse")
-        return MissingNarration(response=response, comparison=comparison)
-
-
 def _canonical_labels(values: Sequence[str], field: str) -> tuple[str, ...]:
     if isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Sequence):
         raise TypeError(f"{field} must be a sequence of canonical strings")
@@ -136,8 +84,6 @@ def _canonical_labels(values: Sequence[str], field: str) -> tuple[str, ...]:
 
 __all__ = [
     "MissingComparison",
-    "MissingNarration",
-    "MissingObjectCoordinator",
     "compute_observation_missing",
     "compute_missing",
 ]

@@ -60,7 +60,7 @@ class PromptBuilder(Protocol):
 
 
 class FixedPromptBuilder:
-    """Build the four model payloads without accepting unrelated state."""
+    """Build the three model payloads without accepting unrelated state."""
 
     @property
     def system_prompt(self) -> str:

@@ -16,7 +16,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
-from .client import BrainClient, ObservationEnvelope, ValidatedObservation
+from .client import BrainClient
 from .memory import SceneMemoryStore, SceneObject
 from .schema import (
     ObservationResponse,
@@ -54,7 +54,7 @@ class ObservationRequest:
 @dataclass(slots=True)
 class _PendingObservation:
     request: ObservationRequest
-    response: ValidatedObservation | None = None
+    response: ObservationResponse | None = None
     observed_at: float | None = None
     jpeg_digest: bytes | None = None
 
@@ -115,7 +115,7 @@ class ObservationCoordinator:
             self._pending = _PendingObservation(request=request)
             return request
 
-    def complete(self, request_id: str, jpeg: bytes) -> ValidatedObservation:
+    def complete(self, request_id: str, jpeg: bytes) -> ObservationResponse:
         """Validate one capture, update memory durably, and release the block.
 
         Brain and store failures leave the exact request pending. A validated
@@ -139,10 +139,9 @@ class ObservationCoordinator:
                     ),
                 )
                 response = self._brain.observe(frame, pending.request.prior_canonical)
-                if not isinstance(response, (ObservationResponse, ObservationEnvelope)):
+                if not isinstance(response, ObservationResponse):
                     raise TypeError("brain.observe must return validated observation facts")
-                facts = _observation_facts(response)
-                LOGGER.info("SCENE noticed=%s", _observation_log(facts))
+                LOGGER.info("SCENE noticed=%s", _observation_log(response))
                 observed_at = _timestamp(self._clock())
                 pending.response = response
                 pending.observed_at = observed_at
@@ -158,9 +157,7 @@ class ObservationCoordinator:
             if observed_at is None:
                 raise AssertionError("validated observation is missing its timestamp")
             existing = self._store.load()
-            candidates = _memory_candidates(
-                existing, _observation_facts(response), observed_at
-            )
+            candidates = _memory_candidates(existing, response, observed_at)
             published = tuple(self._store.update(candidates))
             LOGGER.info("SCENE memory saved=%s", _memory_log(published))
             self._pending = None
@@ -189,10 +186,6 @@ class ObservationCoordinator:
                 f"observation {request_id} does not match pending {expected}"
             )
         return self._pending
-
-
-def _observation_facts(response: ValidatedObservation) -> ObservationResponse:
-    return response.facts if isinstance(response, ObservationEnvelope) else response
 
 
 def _canonical_labels(values: Sequence[str]) -> tuple[str, ...]:

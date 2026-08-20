@@ -56,19 +56,6 @@ class ObservationOrigin:
         object.__setattr__(self, "text", " ".join(self.text.split()))
 
 
-@dataclass(frozen=True, slots=True)
-class ObservationEnvelope:
-    """Deprecated compatibility shape removed by the final cleanup packet.
-
-    New observation calls never create this value. It remains importable only
-    while the observation runtime migrates to the facts-only contract.
-    """
-
-    facts: ObservationResponse
-    quarantined_say: str
-
-
-ValidatedObservation = ObservationResponse | ObservationEnvelope
 T = TypeVar("T", PlanResponse, ObservationResponse)
 
 REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
@@ -199,17 +186,6 @@ class BrainClient(Protocol):
         recent: Sequence[RecentExchange],
     ) -> PlanResponse: ...
 
-    # Temporary compatibility surface; the runtime migration removes it.
-    def narrate(self, missing: Sequence[str]) -> PlanResponse: ...
-
-    def scene_comment(
-        self,
-        visual_intent: str,
-        observation: ValidatedObservation,
-        compact_memory: str,
-    ) -> PlanResponse: ...
-
-
 class StdlibOpenRouterTransport:
     """Stream OpenRouter SSE with no dependency beyond the standard library."""
 
@@ -331,11 +307,6 @@ class OpenRouterBrainClient:
         self._clock = clock
         self._warm_lock = threading.Lock()
         self._warmed = False
-        # Temporary bridge for the old scene_comment runtime. The public
-        # observation result remains facts-only, and the new resolver never
-        # consumes dialogue returned by perception. Remove with scene_comment.
-        self._legacy_scene_say: dict[int, str] = {}
-        self._legacy_scene_lock = threading.Lock()
         LOGGER.info("OpenRouter configured model=%s profile=%s", self.model, self.profile)
 
     def warm(self) -> None:
@@ -364,12 +335,11 @@ class OpenRouterBrainClient:
         self,
         transcript: str,
         compact_memory: str,
-        currently_visible: Sequence[CloudSceneObject] | Sequence[RecentExchange],
-        recent: Sequence[RecentExchange] | None = None,
+        currently_visible: Sequence[CloudSceneObject],
+        recent: Sequence[RecentExchange],
     ) -> PlanResponse:
-        visible, exchanges = _converse_context(currently_visible, recent)
         payload = self._prompts.converse_payload(
-            transcript, compact_memory, visible, exchanges
+            transcript, compact_memory, currently_visible, recent
         )
         return self._run(
             "converse", self._text_messages(payload), _parse_converse_response
@@ -384,12 +354,7 @@ class OpenRouterBrainClient:
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
 
-        legacy_say: str | None = None
-
         def parse_observation(raw: str) -> ObservationResponse:
-            nonlocal legacy_say
-            if legacy_say is None:
-                legacy_say = _legacy_dialogue(raw)
             response = parse_observation_response(raw, require_known=True)
             prior_set = frozenset(prior)
             if any(label not in prior_set for label in response.present):
@@ -408,10 +373,6 @@ class OpenRouterBrainClient:
                 raise ResponseSchemaError(
                     "observation new repeats an object from prior_canonical"
                 )
-            with self._legacy_scene_lock:
-                self._legacy_scene_say.clear()
-                if legacy_say is not None:
-                    self._legacy_scene_say[id(response)] = legacy_say
             return response
 
         return self._run("observe", self._messages(content), parse_observation)
@@ -425,8 +386,6 @@ class OpenRouterBrainClient:
         currently_visible: Sequence[CloudSceneObject],
         recent: Sequence[RecentExchange],
     ) -> PlanResponse:
-        with self._legacy_scene_lock:
-            self._legacy_scene_say.pop(id(observation), None)
         return self._resolve_observation(
             origin,
             observation,
@@ -435,40 +394,6 @@ class OpenRouterBrainClient:
             currently_visible,
             recent,
             strict=False,
-        )
-
-    def narrate(self, missing: Sequence[str]) -> PlanResponse:
-        """Deprecated compatibility delegate for the pre-migration runtime."""
-
-        return self.resolve_observation(
-            ObservationOrigin("scene_event", "missing_comparison"),
-            ObservationResponse((), ()),
-            missing,
-            "",
-            (),
-            (),
-        )
-
-    def scene_comment(
-        self,
-        visual_intent: str,
-        observation: ValidatedObservation,
-        compact_memory: str,
-    ) -> PlanResponse:
-        """Deprecated compatibility delegate for the pre-migration runtime."""
-
-        facts = observation.facts if isinstance(observation, ObservationEnvelope) else observation
-        with self._legacy_scene_lock:
-            legacy_say = self._legacy_scene_say.pop(id(facts), None)
-        if legacy_say is not None:
-            return PlanResponse(legacy_say, ())
-        return self.resolve_observation(
-            ObservationOrigin("scene_event", visual_intent),
-            facts,
-            (),
-            compact_memory,
-            (),
-            (),
         )
 
     def _resolve_observation(
@@ -624,37 +549,6 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-def _legacy_dialogue(raw: str) -> str | None:
-    """Syntactically retain one old-runtime line; the new resolver ignores it."""
-
-    try:
-        response = parse_plan_response(raw)
-    except (ResponseSchemaError, TypeError, ValueError):
-        return None
-    return response.say or None
-
-
-def _converse_context(
-    currently_visible: Sequence[CloudSceneObject] | Sequence[RecentExchange],
-    recent: Sequence[RecentExchange] | None,
-) -> tuple[tuple[CloudSceneObject, ...], tuple[RecentExchange, ...]]:
-    """Accept the new four-argument call plus the temporary legacy call."""
-
-    supplied = tuple(currently_visible)
-    if recent is None:
-        if all(isinstance(item, RecentExchange) for item in supplied):
-            return (), tuple(item for item in supplied if isinstance(item, RecentExchange))
-        if all(isinstance(item, CloudSceneObject) for item in supplied):
-            return tuple(item for item in supplied if isinstance(item, CloudSceneObject)), ()
-        raise TypeError("legacy recent context must contain RecentExchange values")
-    if not all(isinstance(item, CloudSceneObject) for item in supplied):
-        raise TypeError("currently_visible must contain CloudSceneObject values")
-    exchanges = tuple(recent)
-    if not all(isinstance(item, RecentExchange) for item in exchanges):
-        raise TypeError("recent must contain RecentExchange values")
-    return tuple(item for item in supplied if isinstance(item, CloudSceneObject)), exchanges
-
-
 def _parse_converse_response(raw: str) -> PlanResponse:
     """Keep arbitrary model wording while bounding observation work."""
 
@@ -746,7 +640,6 @@ __all__ = [
     "OPENROUTER_URL",
     "OpenRouterBrainClient",
     "OpenRouterTransportError",
-    "ObservationEnvelope",
     "ObservationOrigin",
     "ObservationUnavailableError",
     "PRIVATE_PROVIDER",
