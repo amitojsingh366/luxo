@@ -275,7 +275,10 @@ class AnimationRuntime:
             velocities=output.velocities,
             light=summed.light,
             clamps=output.clamps,
-            active_motion=self._gestures.active or self._inspection.active,
+            # INSPECTING is a held physical overlay and is the state cue the
+            # telemetry must expose even while a prior posture is still
+            # settling underneath it.
+            active_motion=self._inspection.active or self._gestures.active,
             look_target=look_target,
             requested_posture=requested_posture,
             speaking=self._speaking,
