@@ -31,7 +31,7 @@ LOGGER = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RESPONSE_BYTES = 8 * 1024
 PRIVATE_PROVIDER = {"zdr": True, "data_collection": "deny", "allow_fallbacks": False}
-CallType = Literal["converse", "observe", "narrate"]
+CallType = Literal["converse", "observe", "narrate", "scene_comment"]
 T = TypeVar("T", PlanResponse, ObservationResponse)
 
 REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
@@ -40,8 +40,10 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
         "the top-level keys say and plan. Every plan item needs an op from gesture, "
         "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
         "perk_up belongs in name with op set to gesture; it is never itself an op. Do not "
-        "copy the current transcript into say. Answer it from memory when the requested "
-        "object fact is present; otherwise say that you do not know."
+        "copy the current transcript into say. For a current visual-detail question, say only "
+        "a brief looking or checking acknowledgement and return exactly one observe action, "
+        "with no scan. For an explicitly historical question, answer it from memory when the "
+        "requested object fact is present; otherwise say that you do not know."
     ),
     "narrate": (
         "Your narration response was invalid. Return one bare JSON object with exactly "
@@ -51,14 +53,22 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     ),
     "observe": (
         "Your observation response was invalid. Inspect the supplied image and return one "
-        "bare JSON object with exactly the top-level keys present and new. present must be "
+        "bare JSON object with exactly the top-level keys present, known, and new. present must be "
         "an array containing only supplied prior_canonical labels that remain visible. new "
         "must describe every salient visible object not in prior_canonical using label, "
-        "canonical, attributes, and bbox_norm. If prior_canonical is empty, present must be "
-        "empty and visible objects must go in new. bbox_norm must contain decimal x, y, width, "
+        "canonical, attributes, and bbox_norm. known must describe every present object with "
+        "the same fields and current visible details. If prior_canonical is empty, present and "
+        "known must be empty and visible objects must go in new. bbox_norm must contain "
+        "decimal x, y, width, "
         "and height values between 0 and 1, not pixel or corner coordinates. Always include "
-        "both arrays. Do not return "
+        "all three arrays. Do not return "
         "say, plan, dialogue, or prose."
+    ),
+    "scene_comment": (
+        "Your scene comment was invalid. Return one bare JSON object with exactly say and "
+        "plan. Ground say in a named fresh object. For spontaneous_hand, ask one concise, "
+        "specific question about that object's purpose, feature, or use. Never ask what the "
+        "person is working on, doing, holding, or what is in their hand. Do not observe again."
     ),
 }
 
@@ -153,6 +163,13 @@ class BrainClient(Protocol):
 
     def narrate(self, missing: Sequence[str]) -> PlanResponse: ...
 
+    def scene_comment(
+        self,
+        visual_intent: str,
+        observation: ObservationResponse,
+        compact_memory: str,
+    ) -> PlanResponse: ...
+
 
 class StdlibOpenRouterTransport:
     """Stream OpenRouter SSE with no dependency beyond the standard library."""
@@ -241,7 +258,7 @@ class StdlibOpenRouterTransport:
 
 
 class OpenRouterBrainClient:
-    """Validated implementation of the three and only three model call types."""
+    """Validated implementation of the four narrow model call types."""
 
     def __init__(
         self,
@@ -303,21 +320,116 @@ class OpenRouterBrainClient:
             response = parse_plan_response(raw)
             if response.say.strip().casefold() == transcript.strip().casefold():
                 raise ResponseSchemaError("conversation response echoed current transcript")
+            if _requires_fresh_visual(transcript):
+                if tuple(action.op.value for action in response.plan) != ("observe",):
+                    raise ResponseSchemaError(
+                        "current visual question requires exactly one observe action"
+                    )
+                acknowledgement = response.say.casefold()
+                if not any(
+                    phrase in acknowledgement
+                    for phrase in ("look", "check", "let me see", "take a peek", "one moment")
+                ):
+                    raise ResponseSchemaError(
+                        "current visual question requires a looking acknowledgement"
+                    )
             return response
 
         return self._run("converse", self._text_messages(payload), parse_conversation)
 
     def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ObservationResponse:
         payload = self._prompts.observe_payload(jpeg, prior_canonical)
-        labels = {"prior_canonical": payload["prior_canonical"]}
+        prior = payload["prior_canonical"]
+        labels = {"prior_canonical": prior}
         content = [
             {"type": "text", "text": _compact_json(labels)},
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
-        return self._run("observe", self._messages(content), parse_observation_response)
+
+        def parse_observation(raw: str) -> ObservationResponse:
+            response = parse_observation_response(raw, require_known=True)
+            prior_set = frozenset(prior)
+            if any(label not in prior_set for label in response.present):
+                raise ResponseSchemaError(
+                    "observation present contains a label outside prior_canonical"
+                )
+            if any(item.canonical not in prior_set for item in response.known):
+                raise ResponseSchemaError(
+                    "observation known contains an object outside prior_canonical"
+                )
+            if {item.canonical for item in response.known} != set(response.present):
+                raise ResponseSchemaError(
+                    "observation known must describe exactly the present objects"
+                )
+            if any(item.canonical in prior_set for item in response.new):
+                raise ResponseSchemaError(
+                    "observation new repeats an object from prior_canonical"
+                )
+            return response
+
+        return self._run("observe", self._messages(content), parse_observation)
 
     def narrate(self, missing: Sequence[str]) -> PlanResponse:
         return self._narrate(missing, strict=False)
+
+    def scene_comment(
+        self,
+        visual_intent: str,
+        observation: ObservationResponse,
+        compact_memory: str,
+    ) -> PlanResponse:
+        payload = self._prompts.scene_comment_payload(
+            visual_intent,
+            observation,
+            compact_memory,
+        )
+        fresh_objects = payload["fresh_objects"]
+        assert isinstance(fresh_objects, list)
+        object_terms = tuple(
+            str(item[key]).casefold()
+            for item in fresh_objects
+            if isinstance(item, Mapping)
+            for key in ("canonical", "label")
+            if isinstance(item.get(key), str)
+        )
+        attribute_terms = tuple(
+            str(attribute).casefold()
+            for item in fresh_objects
+            if isinstance(item, Mapping) and isinstance(item.get("attributes"), list)
+            for attribute in item["attributes"]
+            if isinstance(attribute, str)
+        )
+        spontaneous = visual_intent == "spontaneous_hand"
+
+        def parse_comment(raw: str) -> PlanResponse:
+            response = parse_plan_response(raw)
+            normalized = " ".join(response.say.casefold().replace("’", "'").split())
+            generic = (
+                "what are you working on",
+                "what are you doing",
+                "what are you holding",
+                "what is in your hand",
+                "what's in your hand",
+                "anything in your hand",
+            )
+            if any(phrase in normalized for phrase in generic):
+                raise ResponseSchemaError("scene comment used a forbidden generic question")
+            if spontaneous and "?" not in response.say:
+                raise ResponseSchemaError("spontaneous hand comment must ask a question")
+            uncertainty = ("not sure", "can't tell", "cannot tell", "don't know")
+            grounding_terms = object_terms if spontaneous else object_terms + attribute_terms
+            grounded = any(term in normalized for term in grounding_terms)
+            if grounding_terms and not grounded and not any(
+                phrase in normalized for phrase in uncertainty
+            ):
+                raise ResponseSchemaError("scene comment is not grounded in a fresh object")
+            if len(response.plan) > 3:
+                raise ResponseSchemaError("scene comment plan must stay small")
+            if any(action.op.value == "observe" for action in response.plan):
+                raise ResponseSchemaError("scene comment must not request another observation")
+            return response
+
+        return self._run("scene_comment", self._text_messages(payload), parse_comment)
 
     def _narrate(self, missing: Sequence[str], *, strict: bool) -> PlanResponse:
         payload = self._prompts.narrate_payload(missing)
@@ -452,6 +564,48 @@ class OpenRouterBrainClient:
 
 def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _requires_fresh_visual(transcript: str) -> bool:
+    """Identify present visual questions without capturing historical recall."""
+
+    normalized = " ".join(transcript.casefold().replace("’", "'").split())
+    historical = (
+        "remember",
+        "yesterday",
+        "earlier",
+        "before",
+        "last time",
+        "did you see",
+        "did it look",
+        "what color was",
+        "what colour was",
+    )
+    if any(phrase in normalized for phrase in historical):
+        return False
+    current_scene = (
+        "what do you see",
+        "what can you see",
+        "what is in my hand",
+        "what's in my hand",
+        "what am i holding",
+        "what is this",
+        "what's this",
+        "what is that",
+        "what's that",
+    )
+    if any(phrase in normalized for phrase in current_scene):
+        return True
+    visual_detail = (
+        "what color",
+        "what colour",
+        "which color",
+        "which colour",
+        "what material",
+        "what is it made of",
+        "what does it look like",
+    )
+    return any(phrase in normalized for phrase in visual_detail)
 
 
 def _retry_after_seconds(value: object) -> float | None:

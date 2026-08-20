@@ -67,7 +67,11 @@ def compute_observation_missing(
 
     if not isinstance(observation, ObservationResponse):
         raise TypeError("observation must be a validated ObservationResponse")
-    visible = observation.present + tuple(item.canonical for item in observation.new)
+    visible = (
+        observation.present
+        + tuple(item.canonical for item in observation.known)
+        + tuple(item.canonical for item in observation.new)
+    )
     return compute_missing(baseline, visible)
 
 
