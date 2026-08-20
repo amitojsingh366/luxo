@@ -16,12 +16,12 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
-from .client import BrainClient
+from .client import BrainClient, ObservationOrigin
 from .memory import SceneMemoryStore, SceneObject
 from .schema import (
+    ObservationPrior,
     ObservationResponse,
     ObservedObject,
-    normalize_canonical_label,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -45,10 +45,11 @@ class ObservationImageError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ObservationRequest:
-    """The minimal capture request: an id and canonical labels only."""
+    """The exact origin and stable identities bound to one capture."""
 
     request_id: str
-    prior_canonical: tuple[str, ...]
+    prior: tuple[ObservationPrior, ...]
+    origin: ObservationOrigin
 
 
 @dataclass(slots=True)
@@ -100,12 +101,15 @@ class ObservationCoordinator:
     def begin(
         self,
         request_id: str,
-        prior_canonical: Sequence[str],
+        prior: Sequence[ObservationPrior],
+        origin: ObservationOrigin,
     ) -> ObservationRequest:
         """Adopt the plan blocker's exact id without invoking the model."""
 
         identifier = _request_id(request_id)
-        labels = _canonical_labels(prior_canonical)
+        prior_objects = _prior_objects(prior)
+        if not isinstance(origin, ObservationOrigin):
+            raise TypeError("origin must be an ObservationOrigin")
         with self._lock:
             if self._pending is not None:
                 raise ObservationBusyError(
@@ -113,7 +117,8 @@ class ObservationCoordinator:
                 )
             request = ObservationRequest(
                 request_id=identifier,
-                prior_canonical=labels,
+                prior=prior_objects,
+                origin=origin,
             )
             self._pending = _PendingObservation(request=request)
             return request
@@ -136,12 +141,19 @@ class ObservationCoordinator:
                 LOGGER.info(
                     "SCENE observe prior=%s",
                     json.dumps(
-                        pending.request.prior_canonical,
+                        [
+                            {"id": item.id, "canonical": item.canonical}
+                            for item in pending.request.prior
+                        ],
                         ensure_ascii=False,
                         separators=(",", ":"),
                     ),
                 )
-                response = self._brain.observe(frame, pending.request.prior_canonical)
+                response = self._brain.observe(
+                    frame,
+                    pending.request.prior,
+                    pending.request.origin,
+                )
                 if not isinstance(response, ObservationResponse):
                     raise TypeError("brain.observe must return validated observation facts")
                 LOGGER.info("SCENE noticed=%s", _observation_log(response))
@@ -160,9 +172,23 @@ class ObservationCoordinator:
             if observed_at is None:
                 raise AssertionError("validated observation is missing its timestamp")
             existing = self._store.load()
-            candidates = _memory_candidates(existing, response, observed_at)
+            candidates = _memory_candidates(
+                existing,
+                pending.request.prior,
+                response,
+                observed_at,
+            )
             published = tuple(self._store.update(candidates))
             LOGGER.info("SCENE memory saved=%s", _memory_log(published))
+            response = ObservationResponse(
+                visible=tuple(
+                    replace(item, match=published[index].id)
+                    for index, item in enumerate(response.visible)
+                ),
+                focus=response.focus,
+                present_prior_ids=response.present_prior_ids,
+                raw_saturated=response.raw_saturated,
+            )
             self._pending = None
 
         if self._publish is not None:
@@ -204,10 +230,19 @@ def _request_id(value: object) -> str:
     return value
 
 
-def _canonical_labels(values: Sequence[str]) -> tuple[str, ...]:
+def _prior_objects(values: Sequence[ObservationPrior]) -> tuple[ObservationPrior, ...]:
     if isinstance(values, (str, bytes)):
-        raise ValueError("prior canonical labels must be a sequence of strings")
-    return tuple(dict.fromkeys(normalize_canonical_label(value) for value in values))
+        raise ValueError("prior must be a sequence of ObservationPrior values")
+    result: list[ObservationPrior] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, ObservationPrior):
+            raise TypeError("prior must contain ObservationPrior values")
+        if value.id in seen:
+            continue
+        seen.add(value.id)
+        result.append(value)
+    return tuple(result)
 
 
 def _complete_jpeg(value: object) -> bytes:
@@ -234,31 +269,51 @@ def _timestamp(value: object) -> float:
 
 def _memory_candidates(
     existing: tuple[SceneObject, ...],
+    request_prior: tuple[ObservationPrior, ...],
     response: ObservationResponse,
     observed_at: float,
 ) -> tuple[SceneObject, ...]:
     """Convert model facts to store candidates without model-owned metadata."""
 
-    prior = {record.canonical: record for record in existing}
+    request_ids = {item.id for item in request_prior}
+    prior_by_id = {
+        record.id: record for record in existing if record.id in request_ids
+    }
+    prior_by_canonical: dict[str, list[SceneObject]] = {}
+    for record in prior_by_id.values():
+        prior_by_canonical.setdefault(record.canonical, []).append(record)
+    unmatched_counts: dict[str, int] = {}
+    for item in response.visible:
+        if item.match is None and not item.match_provided:
+            unmatched_counts[item.canonical] = unmatched_counts.get(item.canonical, 0) + 1
     candidates: list[SceneObject] = []
     claimed: set[str] = set()
     for index, item in enumerate(response.visible):
         if not isinstance(item, ObservedObject):
             raise TypeError("observation visible entries must be validated ObservedObject values")
-        if item.canonical in claimed:
-            continue
-        claimed.add(item.canonical)
-        candidates.append(_new_candidate(item, index, observed_at, prior))
-
-    # Transitional in-process callers can still report an exact prior label
-    # without fresh geometry. The cloud response never uses this path.
-    for canonical in response.present:
-        if canonical in claimed or canonical not in prior:
-            continue
-        claimed.add(canonical)
-        candidates.append(
-            replace(prior[canonical], last_seen=observed_at, present=True)
-        )
+        previous = None
+        if (
+            item.match is not None
+            and item.match in request_ids
+            and item.match not in claimed
+        ):
+            previous = prior_by_id.get(item.match)
+        if (
+            previous is None
+            and item.match is None
+            and not item.match_provided
+            and unmatched_counts[item.canonical] == 1
+        ):
+            available = [
+                record
+                for record in prior_by_canonical.get(item.canonical, ())
+                if record.id not in claimed
+            ]
+            if len(available) == 1:
+                previous = available[0]
+        if previous is not None:
+            claimed.add(previous.id)
+        candidates.append(_new_candidate(item, index, observed_at, previous))
     return tuple(candidates)
 
 
@@ -267,13 +322,16 @@ def _observation_log(response: ObservationResponse) -> str:
         {
             "visible": [
                 {
+                    "match": item.match,
                     "label": item.label,
                     "canonical": item.canonical,
                     "attributes": list(item.attributes),
-                    "bbox_norm": list(item.bbox_norm),
+                    "bbox_norm": None if item.bbox_norm is None else list(item.bbox_norm),
                 }
                 for item in response.visible
             ],
+            "focus": response.focus,
+            "present_prior_ids": response.present_prior_ids,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -288,7 +346,7 @@ def _memory_log(records: tuple[SceneObject, ...]) -> str:
                 "label": record.label,
                 "canonical": record.canonical,
                 "attributes": list(record.attributes),
-                "bbox_norm": list(record.bbox_norm),
+                "bbox_norm": None if record.bbox_norm is None else list(record.bbox_norm),
                 "first_seen": record.first_seen,
                 "last_seen": record.last_seen,
                 "present": record.present,
@@ -304,9 +362,8 @@ def _new_candidate(
     item: ObservedObject,
     index: int,
     observed_at: float,
-    prior: dict[str, SceneObject],
+    previous: SceneObject | None,
 ) -> SceneObject:
-    previous = prior.get(item.canonical)
     return SceneObject(
         id=previous.id if previous is not None else f"candidate_{index:03d}",
         label=item.label,

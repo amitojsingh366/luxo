@@ -240,9 +240,9 @@ from ..brain.client import (
     ObservationOrigin,
     RecentExchange,
 )
-from ..brain.memory import SceneMemoryStore
+from ..brain.memory import SceneMemoryStore, cloud_safe_attributes
 from ..brain.observe import ObservationCoordinator
-from ..brain.schema import Action, ActionOp, PlanResponse
+from ..brain.schema import Action, ActionOp, ObservationPrior, PlanResponse
 from ..config import FrozenConfig, load_config
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState, Transition
 from ..instrumentation import InteractionCSVLogger, InteractionTimeline, Milestone, TimelineError
@@ -652,7 +652,7 @@ class LuxoApp:
             fsm=self._fsm,
             plan_executor=self._plans,
             observations=self._observation_coordinator,
-            baseline_labels=self._baseline_labels,
+            baseline_objects=self._baseline_objects,
             # The single owner of outbound capture_frame.
             capture_callback=self._send_capture_frame,
             resolver=lambda origin, observation, missing, recent: brain.resolve_observation(
@@ -1105,7 +1105,7 @@ class LuxoApp:
 
         self._plans.submit((action,))
 
-    def _baseline_labels(self) -> tuple[str, ...]:
+    def _baseline_objects(self) -> tuple[ObservationPrior, ...]:
         """Return objects visible on the prior frame, never stale history.
 
         Missing-object resolution compares one scene snapshot with the next.
@@ -1115,7 +1115,11 @@ class LuxoApp:
         """
 
         return tuple(
-            record.canonical
+            ObservationPrior(
+                record.id,
+                record.canonical,
+                cloud_safe_attributes(record.attributes),
+            )
             for record in self._blackboard.snapshot().scene_memory
             if record.present
         )
@@ -1158,6 +1162,21 @@ class LuxoApp:
         for record in snapshot.scene_memory:
             if record.id != object_id:
                 continue
+            if record.bbox_norm is None:
+                gaze = snapshot.gaze
+                if gaze.hands_present and gaze.hand_conf >= 0.5:
+                    return LookAtTarget(
+                        name,
+                        VIEWER_AZIMUTH_RAD + float(gaze.hand_az),
+                        float(gaze.hand_el),
+                    )
+                if gaze.present:
+                    return LookAtTarget(
+                        name,
+                        VIEWER_AZIMUTH_RAD + float(gaze.az),
+                        float(gaze.el),
+                    )
+                return None
             x, y, width, height = record.bbox_norm
             with self._lock:
                 camera = self._camera

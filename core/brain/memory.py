@@ -21,6 +21,8 @@ from .schema import normalize_canonical_label
 
 MAX_SCENE_OBJECTS: Final = 10
 _LEGACY_MAX_OBJECTS: Final = 19
+_FORMAT_VERSION: Final = 2
+_ENVELOPE_FIELDS: Final = frozenset({"version", "next_id", "objects"})
 _FIELDS: Final = frozenset(
     {
         "id",
@@ -130,7 +132,7 @@ class SceneObject:
     label: str
     canonical: str
     attributes: tuple[str, ...]
-    bbox_norm: tuple[float, float, float, float]
+    bbox_norm: tuple[float, float, float, float] | None
     first_seen: float
     last_seen: float
     present: bool
@@ -156,25 +158,28 @@ class SceneObject:
         except TypeError as exc:
             raise SceneMemoryError("attributes must be a sequence of strings") from exc
 
-        if isinstance(self.bbox_norm, (str, bytes)):
-            raise SceneMemoryError("bbox_norm must contain exactly four numbers")
-        try:
-            bbox_values = tuple(self.bbox_norm)
-        except TypeError as exc:
-            raise SceneMemoryError("bbox_norm must contain exactly four numbers") from exc
-        if len(bbox_values) != 4:
-            raise SceneMemoryError("bbox_norm must contain exactly four numbers")
-        bbox = tuple(
-            _number(value, f"bbox_norm[{index}]")
-            for index, value in enumerate(bbox_values)
-        )
-        x, y, width, height = bbox
-        if not all(0.0 <= value <= 1.0 for value in bbox):
-            raise SceneMemoryError("bbox_norm values must be within [0, 1]")
-        if width <= 0.0 or height <= 0.0:
-            raise SceneMemoryError("bbox_norm width and height must be positive")
-        if x + width > 1.0 or y + height > 1.0:
-            raise SceneMemoryError("bbox_norm must not extend beyond the frame")
+        if self.bbox_norm is None:
+            bbox = None
+        else:
+            if isinstance(self.bbox_norm, (str, bytes)):
+                raise SceneMemoryError("bbox_norm must contain exactly four numbers")
+            try:
+                bbox_values = tuple(self.bbox_norm)
+            except TypeError as exc:
+                raise SceneMemoryError("bbox_norm must contain exactly four numbers") from exc
+            if len(bbox_values) != 4:
+                raise SceneMemoryError("bbox_norm must contain exactly four numbers")
+            bbox = tuple(
+                _number(value, f"bbox_norm[{index}]")
+                for index, value in enumerate(bbox_values)
+            )
+            x, y, width, height = bbox
+            if not all(0.0 <= value <= 1.0 for value in bbox):
+                raise SceneMemoryError("bbox_norm values must be within [0, 1]")
+            if width <= 0.0 or height <= 0.0:
+                raise SceneMemoryError("bbox_norm width and height must be positive")
+            if x + width > 1.0 or y + height > 1.0:
+                raise SceneMemoryError("bbox_norm must not extend beyond the frame")
 
         first_seen = _number(self.first_seen, "first_seen")
         last_seen = _number(self.last_seen, "last_seen")
@@ -210,11 +215,8 @@ def _validate_collection(
     if any(not isinstance(record, SceneObject) for record in records):
         raise SceneMemoryError("scene memory entries must be SceneObject records")
     ids = [record.id for record in records]
-    canonicals = [record.canonical for record in records]
     if len(ids) != len(set(ids)):
         raise SceneMemoryError("scene memory contains duplicate ids")
-    if len(canonicals) != len(set(canonicals)):
-        raise SceneMemoryError("scene memory contains duplicate canonical labels")
     return records
 
 
@@ -241,15 +243,30 @@ def _record_dict(record: SceneObject) -> dict[str, Any]:
         "label": record.label,
         "canonical": record.canonical,
         "attributes": list(record.attributes),
-        "bbox_norm": list(record.bbox_norm),
+        "bbox_norm": None if record.bbox_norm is None else list(record.bbox_norm),
         "first_seen": record.first_seen,
         "last_seen": record.last_seen,
         "present": record.present,
     }
 
 
+def _next_id_from_strings(values: Iterable[str]) -> int:
+    return max(
+        (
+            int(match.group(1))
+            for value in values
+            if (match := _OBJECT_ID.fullmatch(value))
+        ),
+        default=0,
+    ) + 1
+
+
+def _next_numeric_id(records: Iterable[SceneObject]) -> int:
+    return _next_id_from_strings(record.id for record in records)
+
+
 class SceneMemoryStore:
-    """Persist a bounded, flat list of scene facts as deterministic JSON."""
+    """Persist bounded facts and allocator state in a versioned JSON envelope."""
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self._path = Path(path)
@@ -267,10 +284,33 @@ class SceneMemoryStore:
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise SceneMemoryError(f"cannot load scene memory {self._path}: {exc}") from exc
 
-        if not isinstance(payload, list):
-            raise SceneMemoryError(f"invalid scene memory {self._path}: root must be a JSON list")
+        legacy = isinstance(payload, list)
+        if legacy:
+            raw_records = payload
+            next_id = None
+        elif isinstance(payload, dict) and frozenset(payload) == _ENVELOPE_FIELDS:
+            if payload["version"] != _FORMAT_VERSION:
+                raise SceneMemoryError(
+                    f"invalid scene memory {self._path}: unsupported version"
+                )
+            next_id = payload["next_id"]
+            raw_records = payload["objects"]
+            if (
+                isinstance(next_id, bool)
+                or not isinstance(next_id, int)
+                or next_id < 1
+                or not isinstance(raw_records, list)
+            ):
+                raise SceneMemoryError(
+                    f"invalid scene memory {self._path}: invalid allocator envelope"
+                )
+        else:
+            raise SceneMemoryError(
+                f"invalid scene memory {self._path}: root must be a legacy list "
+                "or versioned envelope"
+            )
         records: list[SceneObject] = []
-        for index, value in enumerate(payload):
+        for index, value in enumerate(raw_records):
             if not isinstance(value, dict):
                 raise SceneMemoryError(
                     f"invalid scene memory {self._path}: entry {index} must be an object"
@@ -291,12 +331,17 @@ class SceneMemoryStore:
                 ) from exc
         try:
             validated = _validate_collection(records, maximum=_LEGACY_MAX_OBJECTS)
+            minimum_next_id = _next_numeric_id(validated)
+            if next_id is None:
+                next_id = minimum_next_id
+            elif next_id < minimum_next_id:
+                raise SceneMemoryError("next_id is below an existing object id")
             selected = _legacy_selection(validated)
         except SceneMemoryError as exc:
             raise SceneMemoryError(f"invalid scene memory {self._path}: {exc}") from exc
-        if len(selected) != len(validated):
+        if legacy or len(selected) != len(validated):
             try:
-                self.save(selected)
+                self._save(selected, next_id)
             except OSError as exc:
                 raise SceneMemoryError(
                     f"cannot migrate scene memory {self._path}: {exc}"
@@ -305,6 +350,10 @@ class SceneMemoryStore:
 
     def save(self, objects: tuple[SceneObject, ...]) -> None:
         records = _validate_collection(objects)
+        next_id = max(_next_numeric_id(records), self._stored_next_id())
+        self._save(records, next_id)
+
+    def _save(self, records: tuple[SceneObject, ...], next_id: int) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         descriptor, temporary_name = tempfile.mkstemp(
             dir=self._path.parent,
@@ -314,7 +363,11 @@ class SceneMemoryStore:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 json.dump(
-                    [_record_dict(record) for record in records],
+                    {
+                        "version": _FORMAT_VERSION,
+                        "next_id": next_id,
+                        "objects": [_record_dict(record) for record in records],
+                    },
                     stream,
                     ensure_ascii=False,
                     allow_nan=False,
@@ -332,22 +385,34 @@ class SceneMemoryStore:
                 pass
             raise
 
+    def _stored_next_id(self) -> int:
+        """Best-effort allocator floor used when explicitly replacing facts."""
+
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+            return 1
+        if isinstance(payload, dict):
+            value = payload.get("next_id")
+            return value if isinstance(value, int) and not isinstance(value, bool) else 1
+        if isinstance(payload, list):
+            identifiers = tuple(
+                value.get("id")
+                for value in payload
+                if isinstance(value, dict) and isinstance(value.get("id"), str)
+            )
+            return _next_id_from_strings(identifiers)
+        return 1
+
     def update(self, objects: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
         observed = _validate_collection(objects)
         existing = self.load()
-        by_canonical = {record.canonical: record for record in existing}
-        next_id = max(
-            (
-                int(match.group(1))
-                for record in existing
-                if (match := _OBJECT_ID.fullmatch(record.id))
-            ),
-            default=0,
-        ) + 1
+        by_id = {record.id: record for record in existing}
+        next_id = max(_next_numeric_id(existing), self._stored_next_id())
 
         visible: list[SceneObject] = []
         for record in observed:
-            prior = by_canonical.get(record.canonical)
+            prior = by_id.get(record.id)
             if prior is None:
                 new_id = f"obj_{next_id:03d}"
                 next_id += 1
@@ -361,18 +426,18 @@ class SceneMemoryStore:
                 )
             )
 
-        visible_names = {record.canonical for record in visible}
+        visible_ids = {record.id for record in visible}
         historical = sorted(
             (
                 replace(record, present=False)
                 for record in existing
-                if record.canonical not in visible_names
+                if record.id not in visible_ids
             ),
             key=lambda record: (-record.last_seen, _id_key(record)),
         )
         remaining = MAX_SCENE_OBJECTS - len(visible)
         result = _validate_collection((*visible, *historical[:remaining]))
-        self.save(result)
+        self._save(result, next_id)
         return result
 
     def compact_line(self) -> str:

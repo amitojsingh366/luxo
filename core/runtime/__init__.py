@@ -23,7 +23,7 @@ from .interactions import (
 from .observations import (
     DEFAULT_WORKERS,
     MAX_CAPTURE_ATTEMPTS,
-    BaselineLabels,
+    BaselineObjects,
     FrameRejection,
     ObservationResolver,
     ObservationRuntime,
@@ -34,7 +34,7 @@ from .observations import (
 
 __all__ = [
     "ActionRouter",
-    "BaselineLabels",
+    "BaselineObjects",
     "CANCELLING_STATES",
     "CUED_SFX",
     "CaptureCallback",

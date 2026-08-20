@@ -137,69 +137,68 @@ class ObservedObject:
     label: str
     canonical: str
     attributes: tuple[str, ...]
-    bbox_norm: tuple[float, float, float, float]
+    bbox_norm: tuple[float, float, float, float] | None = None
+    match: str | None = None
+    match_provided: bool = field(default=False, repr=False, compare=False)
 
 
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True)
+class ObservationPrior:
+    """Stable local identity exposed to one observation call."""
+
+    id: str
+    canonical: str
+    attributes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or _SAFE_OBJECT_ID.fullmatch(self.id) is None:
+            raise ValueError("observation prior id must be a safe object id")
+        if isinstance(self.attributes, (str, bytes)):
+            raise TypeError("observation prior attributes must be a tuple of strings")
+        try:
+            attributes = tuple(
+                dict.fromkeys(_plain_text(value, "attribute") for value in self.attributes)
+            )
+        except TypeError as error:
+            raise TypeError(
+                "observation prior attributes must be a tuple of strings"
+            ) from error
+        object.__setattr__(self, "canonical", normalize_canonical_label(self.canonical))
+        object.__setattr__(self, "attributes", attributes)
+
+
+@dataclass(frozen=True, slots=True)
 class ObservationResponse:
-    """Nearest-first facts from one frame.
-
-    The cloud contract has only ``visible``. The compatibility fields are kept
-    solely so in-process callers created against the earlier contract can be
-    drained without putting its present/known/new choreography back on the
-    wire.
-    """
+    """Nearest-first facts and the model-selected subject from one frame."""
 
     visible: tuple[ObservedObject, ...]
-    _legacy_present: tuple[str, ...] = field(repr=False, compare=False)
-    _legacy_new: tuple[ObservedObject, ...] = field(repr=False, compare=False)
-    _legacy_known: tuple[ObservedObject, ...] = field(repr=False, compare=False)
+    focus: int | None = None
+    present_prior_ids: tuple[str, ...] | None = None
+    raw_saturated: bool = field(default=False, repr=False, compare=False)
 
-    def __init__(
-        self,
-        present: tuple[str, ...] = (),
-        new: tuple[ObservedObject, ...] = (),
-        known: tuple[ObservedObject, ...] = (),
-        *,
-        visible: tuple[ObservedObject, ...] | None = None,
-    ) -> None:
-        if visible is not None:
-            if present or new or known:
-                raise ValueError("visible cannot be combined with legacy observation fields")
-            facts = _validated_observed_tuple(visible, "visible")
-            legacy_present: tuple[str, ...] = ()
-            legacy_new: tuple[ObservedObject, ...] = ()
-            legacy_known: tuple[ObservedObject, ...] = ()
-        else:
-            legacy_present = tuple(
-                dict.fromkeys(normalize_canonical_label(value) for value in present)
-            )
-            legacy_new = _validated_observed_tuple(new, "new")
-            legacy_known = _validated_observed_tuple(known, "known")
-            facts = tuple(
-                {
-                    item.canonical: item
-                    for item in (*legacy_known, *legacy_new)
-                }.values()
-            )
-        object.__setattr__(self, "visible", facts[:OBSERVATION_MAX_VISIBLE])
-        object.__setattr__(self, "_legacy_present", legacy_present)
-        object.__setattr__(self, "_legacy_new", legacy_new)
-        object.__setattr__(self, "_legacy_known", legacy_known)
-
-    @property
-    def present(self) -> tuple[str, ...]:
-        return tuple(dict.fromkeys(
-            (*self._legacy_present, *(item.canonical for item in self.visible))
-        ))
-
-    @property
-    def new(self) -> tuple[ObservedObject, ...]:
-        return self._legacy_new if self._legacy_present or self._legacy_known else self.visible
-
-    @property
-    def known(self) -> tuple[ObservedObject, ...]:
-        return self._legacy_known
+    def __post_init__(self) -> None:
+        if not isinstance(self.visible, tuple) or not all(
+            isinstance(item, ObservedObject) for item in self.visible
+        ):
+            raise TypeError("visible must be a tuple of ObservedObject values")
+        if len(self.visible) > OBSERVATION_MAX_VISIBLE:
+            raise ValueError(f"visible supports at most {OBSERVATION_MAX_VISIBLE} objects")
+        if self.focus is not None and (
+            isinstance(self.focus, bool)
+            or not isinstance(self.focus, int)
+            or not 0 <= self.focus < len(self.visible)
+        ):
+            raise ValueError("focus must be null or an index into visible")
+        if self.present_prior_ids is not None:
+            if not isinstance(self.present_prior_ids, tuple) or any(
+                not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
+                for value in self.present_prior_ids
+            ):
+                raise TypeError("present_prior_ids must be null or a tuple of safe ids")
+            if len(self.present_prior_ids) != len(set(self.present_prior_ids)):
+                raise ValueError("present_prior_ids must not contain duplicates")
+        if type(self.raw_saturated) is not bool:
+            raise TypeError("raw_saturated must be a boolean")
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -255,42 +254,62 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
     raw_visible = root["visible"]
     if not isinstance(raw_visible, list):
         raise ResponseSchemaError("observation 'visible' must be an array")
+    parsed, retained_indexes = _observed_objects(
+        raw_visible, "visible", OBSERVATION_MAX_VISIBLE
+    )
+    visible = tuple(parsed)
+    raw_focus = root.get("focus")
+    if raw_focus is None:
+        focus = None
+    elif (
+        isinstance(raw_focus, bool)
+        or not isinstance(raw_focus, int)
+        or not 0 <= raw_focus < len(raw_visible)
+    ):
+        LOGGER.warning("dropping invalid observation focus %r", raw_focus)
+        focus = None
+    else:
+        focus = retained_indexes.get(raw_focus)
+        if focus is None:
+            LOGGER.warning(
+                "dropping observation focus %d because its object was not retained",
+                raw_focus,
+            )
+    raw_presence = root.get("present_prior_ids")
+    if raw_presence is None:
+        presence = None
+    elif not isinstance(raw_presence, list) or any(
+        not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
+        for value in raw_presence
+    ):
+        LOGGER.warning("dropping invalid present_prior_ids evidence")
+        presence = None
+    else:
+        presence = tuple(dict.fromkeys(raw_presence))
     return ObservationResponse(
-        visible=tuple(_observed_objects(raw_visible, "visible", OBSERVATION_MAX_VISIBLE))
+        visible=visible,
+        focus=focus,
+        present_prior_ids=presence,
+        raw_saturated=len(raw_visible) >= OBSERVATION_MAX_VISIBLE,
     )
 
 
 def _observed_objects(
     values: list[object], field: str, limit: int | None = None
-) -> list[ObservedObject]:
+) -> tuple[list[ObservedObject], dict[int, int]]:
     objects: list[ObservedObject] = []
-    seen: set[str] = set()
+    retained_indexes: dict[int, int] = {}
     for index, raw_object in enumerate(values):
         try:
             item = _parse_observed_object(raw_object)
         except (TypeError, ValueError) as error:
             LOGGER.warning("dropping invalid %s object at index %d: %s", field, index, error)
             continue
-        if item.canonical not in seen:
-            seen.add(item.canonical)
-            objects.append(item)
-            if limit is not None and len(objects) == limit:
-                break
-    return objects
-
-
-def _validated_observed_tuple(
-    values: object, field: str
-) -> tuple[ObservedObject, ...]:
-    if isinstance(values, (str, bytes)):
-        raise TypeError(f"{field} must be a sequence of ObservedObject values")
-    try:
-        result = tuple(values)  # type: ignore[arg-type]
-    except TypeError as error:
-        raise TypeError(f"{field} must be a sequence of ObservedObject values") from error
-    if not all(isinstance(value, ObservedObject) for value in result):
-        raise TypeError(f"{field} must contain ObservedObject values")
-    return result
+        retained_indexes[index] = len(objects)
+        objects.append(item)
+        if limit is not None and len(objects) == limit:
+            break
+    return objects, retained_indexes
 
 
 def _payload_object(payload: RawPayload, kind: str) -> JsonObject:
@@ -447,26 +466,43 @@ def _wait_ms(value: object) -> int:
 
 def _parse_observed_object(value: object) -> ObservedObject:
     if not isinstance(value, Mapping):
-        raise TypeError("new object must be an object")
-    required = {"label", "canonical", "attributes", "bbox_norm"}
+        raise TypeError("visible object must be an object")
+    required = {"label", "canonical"}
     missing = required - value.keys()
     if missing:
-        raise ValueError(f"new object is missing {sorted(missing)!r}")
+        raise ValueError(f"visible object is missing {sorted(missing)!r}")
 
+    match_provided = "match" in value
+    match = value.get("match")
+    if match is not None and (
+        not isinstance(match, str) or _SAFE_OBJECT_ID.fullmatch(match) is None
+    ):
+        LOGGER.warning("dropping invalid observation match %r", match)
+        match = None
     label = _plain_text(value["label"], "label")
     canonical = normalize_canonical_label(value["canonical"])
-    attributes = value["attributes"]
+    attributes = value.get("attributes", [])
     if not isinstance(attributes, list):
         raise ValueError("attributes must be an array")
     normalized_attributes = tuple(
         dict.fromkeys(_plain_text(attribute, "attribute") for attribute in attributes)
     )
-    bbox = _bbox(value["bbox_norm"])
+    raw_bbox = value.get("bbox_norm")
+    if raw_bbox is None:
+        bbox = None
+    else:
+        try:
+            bbox = _bbox(raw_bbox)
+        except ValueError as error:
+            LOGGER.warning("dropping invalid observation bbox: %s", error)
+            bbox = None
     return ObservedObject(
+        match=match,
         label=label,
         canonical=canonical,
         attributes=normalized_attributes,
         bbox_norm=bbox,
+        match_provided=match_provided,
     )
 
 
@@ -519,6 +555,7 @@ __all__ = [
     "LightPreset",
     "ObservedObject",
     "OBSERVATION_MAX_VISIBLE",
+    "ObservationPrior",
     "ObservationResponse",
     "PlanResponse",
     "PostureName",
