@@ -14,7 +14,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final, Iterable
+from typing import Any, Final, Iterable, Sequence
 
 from .schema import is_durable_scene_canonical, normalize_canonical_label
 
@@ -23,7 +23,7 @@ MAX_SCENE_OBJECTS: Final = 10
 _LEGACY_MAX_OBJECTS: Final = 19
 _FORMAT_VERSION: Final = 2
 _ENVELOPE_FIELDS: Final = frozenset({"version", "next_id", "objects"})
-_FIELDS: Final = frozenset(
+_LEGACY_FIELDS: Final = frozenset(
     {
         "id",
         "label",
@@ -35,6 +35,8 @@ _FIELDS: Final = frozenset(
         "present",
     }
 )
+_FIELDS: Final = _LEGACY_FIELDS | {"priority", "requested_at"}
+_MEMORY_PRIORITIES: Final = frozenset({"incidental", "requested"})
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
 _OBJECT_ID = re.compile(r"obj_(\d+)\Z")
 _COMPACT_DELIMITERS: Final = frozenset(":;(),")
@@ -136,6 +138,8 @@ class SceneObject:
     first_seen: float
     last_seen: float
     present: bool
+    priority: str = "incidental"
+    requested_at: float | None = None
 
     def __post_init__(self) -> None:
         object_id = _text(self.id, "id", compact_safe=True)
@@ -189,6 +193,16 @@ class SceneObject:
             raise SceneMemoryError("first_seen must not exceed last_seen")
         if type(self.present) is not bool:
             raise SceneMemoryError("present must be a boolean")
+        if not isinstance(self.priority, str) or self.priority not in _MEMORY_PRIORITIES:
+            raise SceneMemoryError("priority must be incidental or requested")
+        if self.requested_at is None:
+            requested_at = None
+        else:
+            requested_at = _number(self.requested_at, "requested_at")
+            if requested_at < 0.0:
+                raise SceneMemoryError("requested_at must be nonnegative")
+        if (self.priority == "requested") != (requested_at is not None):
+            raise SceneMemoryError("requested priority requires requested_at")
 
         object.__setattr__(self, "id", object_id)
         object.__setattr__(self, "label", label)
@@ -197,6 +211,7 @@ class SceneObject:
         object.__setattr__(self, "bbox_norm", bbox)
         object.__setattr__(self, "first_seen", first_seen)
         object.__setattr__(self, "last_seen", last_seen)
+        object.__setattr__(self, "requested_at", requested_at)
 
 
 def _id_key(item: SceneObject) -> tuple[int, int | str, str]:
@@ -232,15 +247,27 @@ def _durable_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, .
     eligible = _eligible_records(records)
     if len(eligible) <= MAX_SCENE_OBJECTS:
         return eligible
+    return _ranked_selection(eligible)
+
+
+def _ranked_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
     return tuple(
         sorted(
-            eligible,
-            key=lambda record: (
-                not record.present,
-                -record.last_seen,
-                _id_key(record),
-            ),
+            records,
+            key=_retention_key,
         )[:MAX_SCENE_OBJECTS]
+    )
+
+
+def _retention_key(record: SceneObject) -> tuple[bool, float, bool, float, object]:
+    """Rank requested facts ahead of incidental visual background."""
+
+    return (
+        record.priority != "requested",
+        -(record.requested_at or 0.0),
+        not record.present,
+        -record.last_seen,
+        _id_key(record),
     )
 
 
@@ -254,6 +281,8 @@ def _record_dict(record: SceneObject) -> dict[str, Any]:
         "first_seen": record.first_seen,
         "last_seen": record.last_seen,
         "present": record.present,
+        "priority": record.priority,
+        "requested_at": record.requested_at,
     }
 
 
@@ -317,12 +346,17 @@ class SceneMemoryStore:
                 "or versioned envelope"
             )
         records: list[SceneObject] = []
+        migrated_record = False
         for index, value in enumerate(raw_records):
             if not isinstance(value, dict):
                 raise SceneMemoryError(
                     f"invalid scene memory {self._path}: entry {index} must be an object"
                 )
             keys = frozenset(value)
+            if keys == _LEGACY_FIELDS:
+                value = {**value, "priority": "incidental", "requested_at": None}
+                keys = _FIELDS
+                migrated_record = True
             if keys != _FIELDS:
                 missing = sorted(_FIELDS - keys)
                 unknown = sorted(keys - _FIELDS)
@@ -346,7 +380,7 @@ class SceneMemoryStore:
             selected = _durable_selection(validated)
         except SceneMemoryError as exc:
             raise SceneMemoryError(f"invalid scene memory {self._path}: {exc}") from exc
-        if legacy or len(selected) != len(validated):
+        if legacy or migrated_record or len(selected) != len(validated):
             try:
                 self._save(selected, next_id)
             except OSError as exc:
@@ -436,17 +470,83 @@ class SceneMemoryStore:
             )
 
         visible_ids = {record.id for record in visible}
-        historical = sorted(
-            (
-                replace(record, present=False)
-                for record in existing
-                if record.id not in visible_ids
-            ),
-            key=lambda record: (-record.last_seen, _id_key(record)),
+        historical = [
+            replace(record, present=False)
+            for record in existing
+            if record.id not in visible_ids
+        ]
+        pool = (*visible, *historical)
+        order = {record.id: index for index, record in enumerate(pool)}
+        result = _validate_collection(
+            tuple(
+                sorted(
+                    pool,
+                    key=lambda record: (
+                        record.priority != "requested",
+                        -(record.requested_at or 0.0),
+                        not record.present,
+                        -record.last_seen,
+                        order[record.id],
+                        _id_key(record),
+                    ),
+                )[:MAX_SCENE_OBJECTS]
+            )
         )
-        remaining = MAX_SCENE_OBJECTS - len(visible)
-        result = _validate_collection((*visible, *historical[:remaining]))
         self._save(result, next_id)
+        return result
+
+    def touch_requested(
+        self,
+        object_ids: Sequence[str],
+        requested_at: float,
+    ) -> tuple[SceneObject, ...]:
+        """Promote direct historical references without changing scene facts.
+
+        The cloud may refer only to ids already supplied in its memory context.
+        Touching those ids records user interest for retention, but deliberately
+        does not claim that an absent object became visible or alter its saved
+        visual attributes.
+        """
+
+        if isinstance(object_ids, (str, bytes)):
+            raise SceneMemoryError("object_ids must be a sequence of strings")
+        timestamp = _number(requested_at, "requested_at")
+        if timestamp < 0.0:
+            raise SceneMemoryError("requested_at must be nonnegative")
+        identifiers: list[str] = []
+        seen: set[str] = set()
+        try:
+            values = tuple(object_ids)
+        except TypeError as exc:
+            raise SceneMemoryError("object_ids must be a sequence of strings") from exc
+        for value in values:
+            identifier = _text(value, "object id", compact_safe=True)
+            if _SAFE_ID.fullmatch(identifier) is None:
+                raise SceneMemoryError(
+                    "object id must contain only letters, digits, '.', '_', or '-'"
+                )
+            if identifier not in seen:
+                seen.add(identifier)
+                identifiers.append(identifier)
+
+        existing = self.load()
+        if not identifiers:
+            return existing
+        selected = frozenset(identifiers)
+        touched = tuple(
+            replace(
+                record,
+                priority="requested",
+                requested_at=max(record.requested_at or 0.0, timestamp),
+            )
+            if record.id in selected
+            else record
+            for record in existing
+        )
+        if touched == existing:
+            return existing
+        result = _ranked_selection(touched)
+        self._save(result, self._stored_next_id())
         return result
 
     def compact_line(self) -> str:

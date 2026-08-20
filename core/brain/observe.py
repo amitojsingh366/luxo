@@ -15,9 +15,10 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum
 
 from .client import BrainClient, ObservationOrigin
-from .memory import SceneMemoryStore, SceneObject
+from .memory import MAX_SCENE_OBJECTS, SceneMemoryStore, SceneObject
 from .schema import (
     ObservationPrior,
     ObservationResponse,
@@ -26,6 +27,7 @@ from .schema import (
 )
 
 LOGGER = logging.getLogger(__name__)
+_SCENE_FOCUS_CANONICALS = frozenset({"desk", "table", "tabletop", "workbench"})
 
 
 class ObservationError(RuntimeError):
@@ -44,6 +46,14 @@ class ObservationImageError(ValueError):
     """A capture is not exactly one complete JPEG image."""
 
 
+class ObservationMemoryIntent(str, Enum):
+    """Local authority for the durable side effect of a fresh observation."""
+
+    TRANSIENT = "transient"
+    FOCUS = "focus"
+    SCENE = "scene"
+
+
 @dataclass(frozen=True, slots=True)
 class ObservationRequest:
     """The exact origin and stable identities bound to one capture."""
@@ -51,6 +61,14 @@ class ObservationRequest:
     request_id: str
     prior: tuple[ObservationPrior, ...]
     origin: ObservationOrigin
+    memory_intent: ObservationMemoryIntent
+
+
+@dataclass(frozen=True, slots=True)
+class _MemoryCandidate:
+    visible_index: int | None
+    record: SceneObject
+    assigns_identity: bool = False
 
 
 @dataclass(slots=True)
@@ -104,6 +122,7 @@ class ObservationCoordinator:
         request_id: str,
         prior: Sequence[ObservationPrior],
         origin: ObservationOrigin,
+        memory_intent: ObservationMemoryIntent = ObservationMemoryIntent.TRANSIENT,
     ) -> ObservationRequest:
         """Adopt the plan blocker's exact id without invoking the model."""
 
@@ -111,6 +130,8 @@ class ObservationCoordinator:
         prior_objects = _prior_objects(prior)
         if not isinstance(origin, ObservationOrigin):
             raise TypeError("origin must be an ObservationOrigin")
+        if not isinstance(memory_intent, ObservationMemoryIntent):
+            raise TypeError("memory_intent must be an ObservationMemoryIntent")
         with self._lock:
             if self._pending is not None:
                 raise ObservationBusyError(
@@ -120,6 +141,7 @@ class ObservationCoordinator:
                 request_id=identifier,
                 prior=prior_objects,
                 origin=origin,
+                memory_intent=memory_intent,
             )
             self._pending = _PendingObservation(request=request)
             return request
@@ -179,12 +201,23 @@ class ObservationCoordinator:
                 pending.request.prior,
                 response,
                 observed_at,
+                pending.request.memory_intent,
             )
-            published = tuple(self._store.update(candidates))
+            published = tuple(
+                self._store.update(tuple(candidate.record for candidate in candidates))
+            )
             LOGGER.info("SCENE memory saved=%s", _memory_log(published))
+            identity_candidates = tuple(
+                candidate for candidate in candidates if candidate.assigns_identity
+            )
+            assigned_ids = {
+                candidate.visible_index: published[index].id
+                for index, candidate in enumerate(identity_candidates)
+                if candidate.visible_index is not None
+            }
             response = ObservationResponse(
                 visible=tuple(
-                    replace(item, match=published[index].id)
+                    replace(item, match=assigned_ids.get(index, item.match))
                     for index, item in enumerate(response.visible)
                 ),
                 focus=response.focus,
@@ -277,7 +310,8 @@ def _memory_candidates(
     request_prior: tuple[ObservationPrior, ...],
     response: ObservationResponse,
     observed_at: float,
-) -> tuple[SceneObject, ...]:
+    memory_intent: ObservationMemoryIntent,
+) -> tuple[_MemoryCandidate, ...]:
     """Convert model facts to store candidates without model-owned metadata."""
 
     request_ids = {item.id for item in request_prior}
@@ -291,7 +325,20 @@ def _memory_candidates(
     for item in response.visible:
         if item.match is None and not item.match_provided:
             unmatched_counts[item.canonical] = unmatched_counts.get(item.canonical, 0) + 1
-    candidates: list[SceneObject] = []
+    selected_indexes: frozenset[int]
+    if memory_intent is ObservationMemoryIntent.SCENE:
+        selected_indexes = frozenset(range(len(response.visible)))
+    elif memory_intent is ObservationMemoryIntent.FOCUS and response.focus is not None:
+        focused = response.visible[response.focus]
+        selected_indexes = (
+            frozenset(range(len(response.visible)))
+            if focused.canonical in _SCENE_FOCUS_CANONICALS
+            else frozenset({response.focus})
+        )
+    else:
+        selected_indexes = frozenset()
+    requested_candidates: list[_MemoryCandidate] = []
+    refresh_candidates: list[_MemoryCandidate] = []
     claimed: set[str] = set()
     for index, item in enumerate(response.visible):
         if not isinstance(item, ObservedObject):
@@ -320,8 +367,35 @@ def _memory_candidates(
                 previous = available[0]
         if previous is not None:
             claimed.add(previous.id)
-        candidates.append(_new_candidate(item, index, observed_at, previous))
-    return tuple(candidates)
+        if index in selected_indexes:
+            requested_candidates.append(
+                _MemoryCandidate(
+                    index,
+                    _new_candidate(item, index, observed_at, previous),
+                    True,
+                )
+            )
+        elif previous is not None:
+            refresh_candidates.append(
+                _MemoryCandidate(
+                    index,
+                    _refresh_candidate(item, previous, observed_at),
+                )
+            )
+    presence = response.present_prior_ids or ()
+    for object_id in presence:
+        previous = prior_by_id.get(object_id)
+        if previous is None or previous.id in claimed:
+            continue
+        claimed.add(previous.id)
+        refresh_candidates.append(
+            _MemoryCandidate(
+                None,
+                replace(previous, last_seen=observed_at, present=True),
+            )
+        )
+    candidates = (*requested_candidates, *refresh_candidates)
+    return tuple(candidates[:MAX_SCENE_OBJECTS])
 
 
 def _durable_response(
@@ -389,6 +463,8 @@ def _memory_log(records: tuple[SceneObject, ...]) -> str:
                 "first_seen": record.first_seen,
                 "last_seen": record.last_seen,
                 "present": record.present,
+                "priority": record.priority,
+                "requested_at": record.requested_at,
             }
             for record in records
         ],
@@ -407,9 +483,30 @@ def _new_candidate(
         id=previous.id if previous is not None else f"candidate_{index:03d}",
         label=item.label,
         canonical=item.canonical,
-        attributes=item.attributes,
+        attributes=tuple(
+            dict.fromkeys(
+                (*(previous.attributes if previous is not None else ()), *item.attributes)
+            )
+        ),
         bbox_norm=item.bbox_norm,
         first_seen=previous.first_seen if previous is not None else observed_at,
+        last_seen=observed_at,
+        present=True,
+        priority="requested",
+        requested_at=observed_at,
+    )
+
+
+def _refresh_candidate(
+    item: ObservedObject,
+    previous: SceneObject,
+    observed_at: float,
+) -> SceneObject:
+    """Refresh presence/geometry without changing durable descriptive facts."""
+
+    return replace(
+        previous,
+        bbox_norm=item.bbox_norm if item.bbox_norm is not None else previous.bbox_norm,
         last_seen=observed_at,
         present=True,
     )
@@ -421,6 +518,7 @@ __all__ = [
     "ObservationCoordinator",
     "ObservationError",
     "ObservationImageError",
+    "ObservationMemoryIntent",
     "ObservationRequest",
     "ObservationRequestError",
 ]

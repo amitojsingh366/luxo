@@ -62,6 +62,7 @@ from ..brain.missing import compute_observation_missing
 from ..brain.observe import (
     ObservationBusyError,
     ObservationCoordinator,
+    ObservationMemoryIntent,
     ObservationRequestError,
 )
 from ..brain.schema import ObservationPrior, ObservationResponse, PlanResponse
@@ -444,10 +445,17 @@ class ObservationRuntime:
             return
 
         try:
+            memory_intent = (
+                ObservationMemoryIntent.FOCUS
+                if self._pending_origin.kind == "dialogue"
+                and self._pending_presentation is ObservationPresentation.INSPECTING
+                else ObservationMemoryIntent.TRANSIENT
+            )
             request = self._observations.begin(
                 pending_id,
                 baseline,
                 self._pending_origin,
+                memory_intent,
             )
         except ObservationBusyError:
             existing = self._observations.pending
