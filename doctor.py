@@ -47,8 +47,12 @@ from typing import Any, Protocol
 
 REPO_ROOT = Path(__file__).resolve().parent
 
-# PRD 2: the core language is locked to Python 3.12.
-PYTHON_FLOOR = (3, 12)
+# PRD 2: the core language is locked to Python 3.12 exactly -- not a floor.
+# requirements.txt pins onnxruntime 1.20.1, which publishes no sdist and no
+# pure-Python wheel, so pip must take an ABI-tagged binary wheel and only the
+# cp312 ones are hashed. numpy 2.5.2 requires >= 3.12, which sets the other
+# side. A newer Python is as broken as an older one, so this is an equality.
+REQUIRED_PYTHON = (3, 12)
 
 # PRD 10 and 12.3: the service is loopback only. The doctor refuses to probe
 # any other bind address, so it can never open a LAN-reachable socket itself.
@@ -758,21 +762,42 @@ def load_manifest_document(
 # --------------------------------------------------------------------------
 
 
+# Both failure branches share the install steps; only the leading sentence
+# differs, because "your Python is too new" is the counter-intuitive half.
+_PYTHON_INSTALL_HELP = (
+    "sudo apt-get install -y python3.12 python3.12-venv   # Ubuntu 24.04",
+    "rebuild the environment with it: python3.12 -m venv .venv",
+)
+
+
 def check_python_version(
     interpreter: InterpreterInfo,
     *,
-    floor: tuple[int, ...] = PYTHON_FLOOR,
+    required: tuple[int, ...] = REQUIRED_PYTHON,
 ) -> CheckResult:
     actual = ".".join(str(part) for part in interpreter.version)
-    wanted = ".".join(str(part) for part in floor)
-    if tuple(interpreter.version[: len(floor)]) >= tuple(floor):
-        return _passed("python", f"Python {actual} meets the {wanted} floor")
+    wanted = ".".join(str(part) for part in required)
+    found = tuple(interpreter.version[: len(required)])
+    if found == tuple(required):
+        return _passed("python", f"Python {actual} matches the locked {wanted}")
+    if found > tuple(required):
+        return _failed(
+            "python",
+            f"Python {actual} is newer than the locked {wanted}",
+            (
+                f"the project is locked to {wanted} exactly, so a newer Python is not an upgrade",
+                "requirements.txt pins cp312-only wheels, so pip picks one for this ABI instead,",
+                "matches none of the pinned hashes, and aborts with a hash error, not a version error",
+                *_PYTHON_INSTALL_HELP,
+            ),
+        )
     return _failed(
         "python",
-        f"Python {actual} is below the locked {wanted} floor",
+        f"Python {actual} is older than the locked {wanted}",
         (
-            "sudo apt-get install -y python3.12 python3.12-venv   # Ubuntu 24.04",
-            "rebuild the environment with it: python3.12 -m venv .venv",
+            f"the project is locked to {wanted} exactly, and this interpreter is below it",
+            "requirements.txt pins cp312-only wheels and numpy 2.5.2 needs 3.12+, so pip cannot install",
+            *_PYTHON_INSTALL_HELP,
         ),
     )
 
