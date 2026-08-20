@@ -40,14 +40,16 @@ The browser never chooses a gesture, light preset, or joint value, and gaze
 socket. A worker completion callback only enqueues a generation-tagged result;
 publication happens on the serialized tick, so animation never blocks on I/O.
 
-Cloud reasoning has three typed boundaries. `converse` receives the transcript,
-up to three recent exchanges, compact historical memory, and the latest
-privacy-filtered `currently_visible` facts. The model decides relevance,
-wording, and whether the semantic plan should observe. `observe` alone carries
-one JPEG and returns object facts, never dialogue. After Python commits those
-facts and computes the deterministic missing set, `resolve_observation` receives
-the exact typed origin, fresh facts, missing labels, current visible facts,
-compact memory, and recent dialogue; it owns the final line and semantic plan.
+Cloud reasoning has three typed boundaries. A visual dialogue turn makes
+exactly one successful call at each boundary, with no fourth semantic call.
+`converse` receives the transcript, up to three recent exchanges, compact
+historical memory, and the latest privacy-filtered `currently_visible` facts;
+it decides whether the plan ends in `observe`. `observe` alone carries one JPEG
+and returns perception facts, never dialogue. After Python commits those facts
+and computes the deterministic missing set, `resolve_observation` receives the
+typed origin, fresh facts, privacy-safe missing objects with stable IDs and
+canonical names, current visible facts, compact memory, and recent dialogue;
+it owns the final line and semantic plan.
 
 ## 2. Protocol
 
@@ -83,7 +85,7 @@ and limit check lives in the animation layer, unreachable by the model.
 - Physical safety is *structural*, not prompted. No prompt asks the model to
   respect joint limits, because it is never in a position to violate one.
 
-## 4. The missing-object comparison
+## 4. Scene memory and the missing-object comparison
 
 VLMs invent differences when asked to compare two scenes, so absence detection is
 not theirs to perform:
@@ -91,17 +93,28 @@ not theirs to perform:
 > **The model performs perception and response. Python performs the
 > comparison.**
 
-An `observe` prompt includes the prior canonical list and asks which known
-objects remain present and which objects are new, stabilising names across
-frames. **Python computes `missing = L₀ − present`** as a deterministic set
-difference against the snapshot taken before capture. A label absent from the
-baseline can never become a missing item.
+An `observe` prompt supplies stable prior IDs with canonical names and safe
+attributes. The response is one `visible` list of at most 10 meaningful objects
+ordered nearest-to-camera first. Each fact may match a prior stable ID;
+`focus` identifies the fact that best answers the typed origin, while
+`present_prior_ids` preserves presence evidence for prior objects that remain
+visible but fall outside the nearest-first detail budget.
+
+Python stores at most 10 objects. Current visible facts retain the model's
+nearest-first order, then any spare slots are filled with the most recently
+seen historical facts. Explicit prior matches preserve identity across label
+drift. **Python computes missing objects by stable ID** against the snapshot
+taken before capture, combining retained matches with valid presence evidence.
+When a saturated response lacks trustworthy presence evidence, Python avoids
+claiming that omitted lower-priority objects disappeared.
 
 Python then gives `resolve_observation` the complete result, including an empty
 missing set, rather than deciding locally whether the result is relevant or
 whether Luxo should stay silent. The cloud resolves the exact dialogue turn or
 scene event that caused the observation and returns the final `say` and semantic
-plan. Memory remains a flat bounded list: no embeddings or vector search.
+plan. The local file is a versioned v2 envelope containing `objects` and a
+monotonic `next_id`; legacy flat-list files migrate on load without reusing IDs
+discarded by the 10-object bound. There are no embeddings or vector search.
 
 ## 5. Privacy
 
@@ -117,10 +130,11 @@ OpenRouter text calls receive transcript text, at most three recent exchanges,
 compact memory, and present-only scene projections containing stable IDs,
 canonical labels, and filtered attributes. `resolve_observation` additionally
 receives the typed origin, filtered fresh facts, and Python-computed missing
-labels. Raw labels, bounding boxes, timestamps, local presence metadata, gaze,
-joint angles, FSM state, telemetry, clamps, and audio are excluded. The default
-free profile may permit provider retention or training; use the implemented
-private profile when zero-data-retention guarantees are required.
+objects as stable IDs with canonical names. Raw labels, bounding boxes,
+timestamps, local presence metadata, gaze, joint angles, FSM state, telemetry,
+clamps, and audio are excluded. The default free profile may permit provider
+retention or training; use the implemented private profile when
+zero-data-retention guarantees are required.
 
 ## 6. Physical reasoning and simulation
 
