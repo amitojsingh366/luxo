@@ -10,7 +10,7 @@ body; everything else in this repository is the character built around it.
 
 ## Status: not demo-ready
 
-Every claim in this README was checked against commit `d61cdfd`.
+Every claim in this README was checked against commit `aa9ba0a`.
 
 The subsystems are built and unit-tested in isolation. They are **not assembled
 into a running character yet**, and this repository will not produce a
@@ -20,9 +20,10 @@ demonstration today.
   and serves the WebSocket protocol stream. It does not construct the behavior
   FSM, the animation loop, the blackboard, the brain wiring, or scene memory.
   Starting the core gives you a protocol server, not a character.
-- **`setup.sh` does not exist in this repository yet.** The quickstart below is
-  the intended flow, and its first step is currently missing. Until it lands,
-  the virtualenv, npm install, model download, and whisper.cpp build are manual.
+- **`setup.sh` exists but has never been run end to end.** It was written and
+  its logic exercised offline, but no `apt` transaction, model download, or
+  whisper.cpp build has actually executed. A clean Ubuntu 24.04 box is the only
+  place that can settle whether it works.
 - **No model assets have been downloaded.** `python3 doctor.py` reports all
   seven entries in `config/models.yaml` as missing.
 - **Four of those seven entries carry `sha256: UNVERIFIED`.** That is a
@@ -71,11 +72,11 @@ gap in `.gitignore` coverage.
 
 ## Quickstart
 
-This is the intended sequence. Step 1 is not yet available — see
-[Status](#status-not-demo-ready).
+This is the intended sequence. It has not yet been run end to end on a clean
+machine — see [Status](#status-not-demo-ready).
 
 ```sh
-./setup.sh                      # NOT PRESENT YET: venv, npm ci, models, whisper.cpp
+./setup.sh                      # venv, pip, npm ci, models, whisper.cpp, espeak-ng
 export OPENROUTER_API_KEY=...   # run.sh does not read .env; export it yourself
 python3 doctor.py               # core-side preflight; non-zero exit means stop
 ./run.sh                        # starts the Python core and the Vite dev server
