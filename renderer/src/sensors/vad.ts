@@ -43,6 +43,27 @@ function requireLocal(path: string, name: string): string {
   return path;
 }
 
+/**
+ * onnxruntime-web reaches its emscripten glue through `await import(url)` with a *variable*
+ * specifier. Vite's import analysis rewrites every such dynamic import to
+ * `__vite__injectQuery(url, 'import')`; the `@vite-ignore` comment ORT ships only suppresses the
+ * warning, never the rewrite. A root-relative prefix therefore arrives at the dev server as
+ * `/onnxruntime/wasm/ort-wasm-simd-threaded.mjs?import`, and that query is exactly what makes
+ * Vite's public-file middleware stand aside so the transform pipeline can reject the file for
+ * living in `/public`.
+ *
+ * `__vite__injectQuery` returns any specifier starting with neither `.` nor `/` untouched, so
+ * resolving the staged prefix against the document origin hands ORT a URL Vite leaves alone. The
+ * assets stay exactly where `setup.sh` stages them and `doctor.py` verifies them; only the
+ * spelling of the prefix changes, and it stays same-origin so ORT still imports the glue directly
+ * instead of falling back to its cross-origin blob preload. Without a document base (Node) there
+ * is nothing to resolve against, so the path passes through unchanged.
+ */
+function resolveAgainstDocument(path: string): string {
+  const base = globalThis.location?.href;
+  return base ? new URL(path, base).href : path;
+}
+
 /** Thin stateful adapter for the 16 kHz Silero ONNX input contract. */
 export class SileroVadScorer implements VadScorer {
   private readonly state = new Float32Array(SILERO_STATE_SAMPLES);
@@ -60,10 +81,13 @@ export class SileroVadScorer implements VadScorer {
     const modelPath = requireLocal(options.modelPath ?? DEFAULT_SILERO_MODEL_PATH, 'modelPath');
     const wasmPath = requireLocal(options.wasmPath ?? DEFAULT_ORT_WASM_PATH, 'wasmPath');
     const ort = await (options.loadRuntime?.() ?? import('onnxruntime-web/wasm'));
-    ort.env.wasm.wasmPaths = wasmPath;
+    ort.env.wasm.wasmPaths = resolveAgainstDocument(wasmPath);
     ort.env.wasm.numThreads = 1;
     ort.env.wasm.proxy = false;
-    const session = await ort.InferenceSession.create(modelPath, SILERO_SESSION_OPTIONS);
+    // ORT hands the session options to `appendDefaultOptions`, which writes `extra.session` onto
+    // them, and it only wraps the object in a `get` proxy, so the write lands on our frozen
+    // constant and throws. Give it a mutable shallow copy and keep the exported contract frozen.
+    const session = await ort.InferenceSession.create(modelPath, { ...SILERO_SESSION_OPTIONS });
     return new SileroVadScorer(ort, session);
   }
 
