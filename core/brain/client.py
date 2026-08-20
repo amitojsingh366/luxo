@@ -67,15 +67,10 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     ),
     "observe": (
         "Your observation response was invalid. Inspect the supplied image and return one "
-        "bare JSON object with exactly the top-level keys present, known, and new. present must be "
-        "an array containing only supplied prior_canonical labels that remain visible. new "
-        "must describe every salient visible object not in prior_canonical using label, "
-        "canonical, attributes, and bbox_norm. known may describe any present prior object with "
-        "the same fields and fresh visible details. If prior_canonical is empty, present and "
-        "known must be empty and visible objects must go in new. bbox_norm must contain "
-        "decimal x, y, width, "
-        "and height values between 0 and 1, not pixel or corner coordinates. Always include "
-        "all three arrays. Do not return "
+        "bare JSON object with exactly one top-level key, visible. visible must be an array "
+        "of at most 10 objects ordered nearest-to-camera first. Each object needs label, "
+        "canonical, attributes, and bbox_norm. bbox_norm must contain decimal x, y, width, "
+        "and height values between 0 and 1, not pixel or corner coordinates. Do not return "
         "say, plan, dialogue, or prose."
     ),
     "resolve_observation": (
@@ -346,7 +341,7 @@ class OpenRouterBrainClient:
                 return
             self._resolve_observation(
                 ObservationOrigin("scene_event", "startup_warm"),
-                ObservationResponse((), ()),
+                ObservationResponse(visible=()),
                 (),
                 "",
                 (),
@@ -377,27 +372,17 @@ class OpenRouterBrainClient:
             {"type": "text", "text": _compact_json(labels)},
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
+        parse_attempt = 0
 
         def parse_observation(raw: str) -> ObservationResponse:
-            response = parse_observation_response(raw)
-            prior_set = frozenset(prior)
-            if any(label not in prior_set for label in response.present):
-                raise ResponseSchemaError(
-                    "observation present contains a label outside prior_canonical"
-                )
-            if any(item.canonical not in prior_set for item in response.known):
-                raise ResponseSchemaError(
-                    "observation known contains an object outside prior_canonical"
-                )
-            if not {item.canonical for item in response.known} <= set(response.present):
-                raise ResponseSchemaError(
-                    "observation known must describe only present objects"
-                )
-            if any(item.canonical in prior_set for item in response.new):
-                raise ResponseSchemaError(
-                    "observation new repeats an object from prior_canonical"
-                )
-            return response
+            nonlocal parse_attempt
+            parse_attempt += 1
+            try:
+                return parse_observation_response(raw)
+            except ResponseSchemaError:
+                if parse_attempt < 2:
+                    raise
+                return _parse_legacy_observation_repair(raw)
 
         return self._run("observe", self._messages(content), parse_observation)
 
@@ -602,6 +587,24 @@ def _parse_resolved_response(raw: str) -> PlanResponse:
         response.say,
         tuple(action for action in response.plan if action.op is not ActionOp.OBSERVE),
     )
+
+
+def _parse_legacy_observation_repair(raw: str) -> ObservationResponse:
+    """Drain a repaired old-shape result without restoring it as a first try."""
+
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ResponseSchemaError("observation response requires 'visible'") from error
+    if not isinstance(decoded, dict) or not {"present", "known", "new"} <= decoded.keys():
+        raise ResponseSchemaError("observation response requires 'visible'")
+    if any(key in decoded for key in ("say", "plan", "dialogue")):
+        raise ResponseSchemaError("observation response must not contain dialogue")
+    known = decoded["known"]
+    new = decoded["new"]
+    if not isinstance(known, list) or not isinstance(new, list):
+        raise ResponseSchemaError("legacy observation facts must be arrays")
+    return parse_observation_response({"visible": [*known, *new]})
 
 
 def _retry_after_seconds(value: object) -> float | None:

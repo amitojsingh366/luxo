@@ -240,50 +240,39 @@ def _memory_candidates(
     """Convert model facts to store candidates without model-owned metadata."""
 
     prior = {record.canonical: record for record in existing}
-    present = frozenset(response.present)
-    refreshed = {item.canonical: item for item in response.known}
     candidates: list[SceneObject] = []
-    for record in existing:
-        if record.canonical not in present:
-            continue
-        current = refreshed.get(record.canonical)
-        if current is None:
-            candidates.append(replace(record, last_seen=observed_at, present=True))
-        else:
-            candidates.append(_new_candidate(current, 0, observed_at, prior))
-    claimed = {record.canonical for record in candidates}
-
-    for index, item in enumerate(response.new):
+    claimed: set[str] = set()
+    for index, item in enumerate(response.visible):
         if not isinstance(item, ObservedObject):
-            raise TypeError("observation new entries must be validated ObservedObject values")
+            raise TypeError("observation visible entries must be validated ObservedObject values")
         if item.canonical in claimed:
             continue
         claimed.add(item.canonical)
         candidates.append(_new_candidate(item, index, observed_at, prior))
+
+    # Transitional in-process callers can still report an exact prior label
+    # without fresh geometry. The cloud response never uses this path.
+    for canonical in response.present:
+        if canonical in claimed or canonical not in prior:
+            continue
+        claimed.add(canonical)
+        candidates.append(
+            replace(prior[canonical], last_seen=observed_at, present=True)
+        )
     return tuple(candidates)
 
 
 def _observation_log(response: ObservationResponse) -> str:
     return json.dumps(
         {
-            "present": list(response.present),
-            "known": [
+            "visible": [
                 {
                     "label": item.label,
                     "canonical": item.canonical,
                     "attributes": list(item.attributes),
                     "bbox_norm": list(item.bbox_norm),
                 }
-                for item in response.known
-            ],
-            "new": [
-                {
-                    "label": item.label,
-                    "canonical": item.canonical,
-                    "attributes": list(item.attributes),
-                    "bbox_norm": list(item.bbox_norm),
-                }
-                for item in response.new
+                for item in response.visible
             ],
         },
         ensure_ascii=False,

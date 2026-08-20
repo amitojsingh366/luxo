@@ -19,7 +19,8 @@ from typing import Any, Final, Iterable
 from .schema import normalize_canonical_label
 
 
-_MAX_OBJECTS: Final = 19
+MAX_SCENE_OBJECTS: Final = 10
+_LEGACY_MAX_OBJECTS: Final = 19
 _FIELDS: Final = frozenset(
     {
         "id",
@@ -200,10 +201,12 @@ def _id_key(item: SceneObject) -> tuple[int, int | str, str]:
     return (0, int(match.group(1)), item.canonical)
 
 
-def _validate_collection(objects: Iterable[SceneObject]) -> tuple[SceneObject, ...]:
+def _validate_collection(
+    objects: Iterable[SceneObject], *, maximum: int | None = MAX_SCENE_OBJECTS
+) -> tuple[SceneObject, ...]:
     records = tuple(objects)
-    if len(records) > _MAX_OBJECTS:
-        raise SceneMemoryError(f"scene memory supports at most {_MAX_OBJECTS} objects")
+    if maximum is not None and len(records) > maximum:
+        raise SceneMemoryError(f"scene memory supports at most {maximum} objects")
     if any(not isinstance(record, SceneObject) for record in records):
         raise SceneMemoryError("scene memory entries must be SceneObject records")
     ids = [record.id for record in records]
@@ -212,7 +215,24 @@ def _validate_collection(objects: Iterable[SceneObject]) -> tuple[SceneObject, .
         raise SceneMemoryError("scene memory contains duplicate ids")
     if len(canonicals) != len(set(canonicals)):
         raise SceneMemoryError("scene memory contains duplicate canonical labels")
-    return tuple(sorted(records, key=_id_key))
+    return records
+
+
+def _legacy_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
+    """Select the ten strongest records while migrating an old 19-record file."""
+
+    if len(records) <= MAX_SCENE_OBJECTS:
+        return records
+    return tuple(
+        sorted(
+            records,
+            key=lambda record: (
+                not record.present,
+                -record.last_seen,
+                _id_key(record),
+            ),
+        )[:MAX_SCENE_OBJECTS]
+    )
 
 
 def _record_dict(record: SceneObject) -> dict[str, Any]:
@@ -270,9 +290,18 @@ class SceneMemoryStore:
                     f"invalid scene memory {self._path}: entry {index}: {exc}"
                 ) from exc
         try:
-            return _validate_collection(records)
+            validated = _validate_collection(records, maximum=_LEGACY_MAX_OBJECTS)
+            selected = _legacy_selection(validated)
         except SceneMemoryError as exc:
             raise SceneMemoryError(f"invalid scene memory {self._path}: {exc}") from exc
+        if len(selected) != len(validated):
+            try:
+                self.save(selected)
+            except OSError as exc:
+                raise SceneMemoryError(
+                    f"cannot migrate scene memory {self._path}: {exc}"
+                ) from exc
+        return selected
 
     def save(self, objects: tuple[SceneObject, ...]) -> None:
         records = _validate_collection(objects)
@@ -307,8 +336,6 @@ class SceneMemoryStore:
         observed = _validate_collection(objects)
         existing = self.load()
         by_canonical = {record.canonical: record for record in existing}
-        merged = [replace(record, present=False) for record in existing]
-        positions = {record.canonical: index for index, record in enumerate(merged)}
         next_id = max(
             (
                 int(match.group(1))
@@ -318,20 +345,33 @@ class SceneMemoryStore:
             default=0,
         ) + 1
 
+        visible: list[SceneObject] = []
         for record in observed:
             prior = by_canonical.get(record.canonical)
             if prior is None:
                 new_id = f"obj_{next_id:03d}"
                 next_id += 1
-                merged.append(replace(record, id=new_id))
+                visible.append(replace(record, id=new_id))
                 continue
-            merged[positions[record.canonical]] = replace(
-                record,
-                id=prior.id,
-                first_seen=min(prior.first_seen, record.first_seen),
+            visible.append(
+                replace(
+                    record,
+                    id=prior.id,
+                    first_seen=min(prior.first_seen, record.first_seen),
+                )
             )
 
-        result = _validate_collection(merged)
+        visible_names = {record.canonical for record in visible}
+        historical = sorted(
+            (
+                replace(record, present=False)
+                for record in existing
+                if record.canonical not in visible_names
+            ),
+            key=lambda record: (-record.last_seen, _id_key(record)),
+        )
+        remaining = MAX_SCENE_OBJECTS - len(visible)
+        result = _validate_collection((*visible, *historical[:remaining]))
         self.save(result)
         return result
 
@@ -373,6 +413,7 @@ def cloud_safe_attributes(attributes: Iterable[str]) -> tuple[str, ...]:
 
 __all__ = [
     "CloudSceneObject",
+    "MAX_SCENE_OBJECTS",
     "SceneMemoryError",
     "SceneMemoryStore",
     "SceneObject",
