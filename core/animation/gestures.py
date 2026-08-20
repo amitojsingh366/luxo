@@ -26,6 +26,35 @@ CANCEL_SECONDS: Final = 0.180
 ANTICIPATION_SCALE: Final = 0.16
 MASS_ORDER: Final = JOINT_NAMES
 
+# Owner-authored URDF-editor anchors, adapted into a gaze-relative inspection
+# layer.  The editor's base endpoint was the hard limit (+2.6 rad) and its
+# neck/head values aimed at one fixed camera, so those absolute angles do not
+# belong in live animation.  Shoulder and elbow define the silhouette exactly.
+# A quarter of the editor's base turn gives the body a readable twist without
+# consuming the live solver's yaw range; neck cancels it so emitter azimuth is
+# unchanged.  Head pitch cancels the arm-pitch delta for the same reason.
+_REFERENCE_ENGAGED_SHOULDER: Final = 0.654
+_REFERENCE_ENGAGED_ELBOW: Final = -1.265
+_REFERENCE_ENGAGED_BASE: Final = 2.600
+_REFERENCE_INSPECTING_BASE: Final = 1.7836
+_REFERENCE_INSPECTING_SHOULDER: Final = -0.1686
+_REFERENCE_INSPECTING_ELBOW: Final = -0.57425
+_INSPECTION_TWIST_SCALE: Final = 0.25
+
+_INSPECTION_BASE_OFFSET: Final = (
+    _REFERENCE_INSPECTING_BASE - _REFERENCE_ENGAGED_BASE
+) * _INSPECTION_TWIST_SCALE
+_INSPECTION_SHOULDER_OFFSET: Final = (
+    _REFERENCE_INSPECTING_SHOULDER - _REFERENCE_ENGAGED_SHOULDER
+)
+_INSPECTION_ELBOW_OFFSET: Final = (
+    _REFERENCE_INSPECTING_ELBOW - _REFERENCE_ENGAGED_ELBOW
+)
+_INSPECTION_NECK_OFFSET: Final = -_INSPECTION_BASE_OFFSET
+_INSPECTION_HEAD_OFFSET: Final = -(
+    _INSPECTION_SHOULDER_OFFSET + _INSPECTION_ELBOW_OFFSET
+)
+
 
 @dataclass(frozen=True, slots=True)
 class GestureKeyframe:
@@ -75,11 +104,19 @@ GESTURE_DEFINITIONS: Final[Mapping[GestureName, GestureDefinition]] = (
                 (_frame(-0.035, 0.16, -0.20, -0.055, 0.13, STRONG_HOLD_SECONDS),)
             ),
             GestureName.LEAN_IN: GestureDefinition(
-                # Reach the arm toward world -x without disturbing emitter
-                # aim: yaw offsets sum to zero and the three pitch offsets do
-                # too.  The live gaze layer therefore keeps controlling the
-                # shade while the shoulder and elbow extend the body.
-                (_frame(0.02, -0.55, 0.35, -0.02, 0.20, STRONG_HOLD_SECONDS),)
+                # Reach toward the owner's inspecting silhouette without
+                # disturbing emitter aim. The live gaze layer keeps owning the
+                # shade while these offsets are held for the observation.
+                (
+                    _frame(
+                        _INSPECTION_BASE_OFFSET,
+                        _INSPECTION_SHOULDER_OFFSET,
+                        _INSPECTION_ELBOW_OFFSET,
+                        _INSPECTION_NECK_OFFSET,
+                        _INSPECTION_HEAD_OFFSET,
+                        STRONG_HOLD_SECONDS,
+                    ),
+                )
             ),
             GestureName.BOUNCE: GestureDefinition(
                 (
