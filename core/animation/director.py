@@ -34,7 +34,11 @@ NOTICE_FREEZE_S = 0.150
 # the neutral camera position. Positive head pitch is down after the URDF's pi
 # flip, so this body-owned calibration must be subtracted from tracked targets.
 FACE_EYE_LEVEL_RAISE_RAD = 0.20
-HAND_TARGET_RAISE_RAD = FACE_EYE_LEVEL_RAISE_RAD
+# Hand landmarks sit visually below the object being presented once the
+# browser camera ray is mapped onto the emitter.  Keep the live hand centroid
+# as the target and raise only that path by a further 25 percent; face aim is
+# already calibrated correctly.
+HAND_TARGET_RAISE_RAD = FACE_EYE_LEVEL_RAISE_RAD * 1.25
 THINKING_DIP_RAD = math.radians(2.0)
 SCAN_DEFAULT_ARC_RAD = 1.20
 SCAN_DEFAULT_SPEED_RAD_S = 0.80
@@ -110,6 +114,7 @@ class AnimationDirector:
         self._notice_due: float | None = None
         self._droop_due: float | None = None
         self._thinking_dip = False
+        self._inspecting_reach = False
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore: tuple[LightPreset, LightPattern] | None = None
         self._blink_started_at: float | None = None
@@ -170,6 +175,9 @@ class AnimationDirector:
         self._last_transition = transition
         state = transition.current
         self._thinking_dip = state is BehaviorState.THINKING
+        if self._inspecting_reach and state is not BehaviorState.INSPECTING:
+            self._runtime.set_inspection_reach(False)
+            self._inspecting_reach = False
 
         if state is BehaviorState.DORMANT:
             self._notice_due = None
@@ -209,7 +217,13 @@ class AnimationDirector:
             self._desired_target = "person"
             self._set_light(LightPreset.WARM_BRIGHT)
         elif state is BehaviorState.INSPECTING:
-            self._runtime.start_gesture(GestureName.LEAN_IN)
+            # Hold a whole-body reach for the entire camera/model round trip.
+            # Keep any explicit target selected by the plan; a direct observe
+            # defaults to the live person/hand ray rather than a fixed pose.
+            if self._desired_target is None:
+                self._desired_target = "person"
+            self._runtime.set_inspection_reach(True)
+            self._inspecting_reach = True
             self._set_light(LightPreset.CURIOUS_FOCUS)
         elif state is BehaviorState.DISENGAGING:
             self._notice_due = None
@@ -252,6 +266,7 @@ class AnimationDirector:
         self._notice_due = None
         self._droop_due = None
         self._thinking_dip = False
+        self._inspecting_reach = False
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore = None
         self._blink_started_at = None
@@ -353,8 +368,9 @@ class AnimationDirector:
         tracking_hand = gaze.hands_present and gaze.hand_conf >= 0.5
         elevation = target.elevation_rad
         # Positive head pitch looks down after the URDF's pi frame flip. Hands
-        # need the same camera-to-emitter bias as faces; subtracting a constant
-        # preserves their measured vertical movement instead of fixing a pose.
+        # need a slightly stronger camera-to-emitter bias than faces;
+        # subtracting a constant preserves their measured vertical movement
+        # instead of replacing the centroid with a fixed low pose.
         calibration = (
             HAND_TARGET_RAISE_RAD if tracking_hand else FACE_EYE_LEVEL_RAISE_RAD
         )

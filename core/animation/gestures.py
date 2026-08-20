@@ -75,7 +75,11 @@ GESTURE_DEFINITIONS: Final[Mapping[GestureName, GestureDefinition]] = (
                 (_frame(-0.035, 0.16, -0.20, -0.055, 0.13, STRONG_HOLD_SECONDS),)
             ),
             GestureName.LEAN_IN: GestureDefinition(
-                (_frame(0.050, -0.17, 0.14, -0.025, 0.055, STRONG_HOLD_SECONDS),)
+                # Reach the arm toward world -x without disturbing emitter
+                # aim: yaw offsets sum to zero and the three pitch offsets do
+                # too.  The live gaze layer therefore keeps controlling the
+                # shade while the shoulder and elbow extend the body.
+                (_frame(0.02, -0.55, 0.35, -0.02, 0.20, STRONG_HOLD_SECONDS),)
             ),
             GestureName.BOUNCE: GestureDefinition(
                 (
@@ -163,6 +167,7 @@ class GestureController:
     __slots__ = (
         "_active",
         "_cancel_target",
+        "_hold_terminal",
         "_poses",
         "_settled",
         "_started_at",
@@ -178,6 +183,7 @@ class GestureController:
         self._timeline: _Timeline | None = None
         self._started_at = 0.0
         self._cancel_target = JointVector()
+        self._hold_terminal = False
 
     @property
     def active(self) -> GestureName | PostureName | None:
@@ -187,12 +193,22 @@ class GestureController:
     def timing(self) -> MotionTiming | None:
         return self._timeline.timing if self._timeline is not None else None
 
-    def start(self, name: GestureName | PostureName | str, now: float) -> None:
+    def start(
+        self,
+        name: GestureName | PostureName | str,
+        now: float,
+        *,
+        hold: bool = False,
+    ) -> None:
         """Start a closed-vocabulary motion without discontinuity."""
 
         checked_now = _time(now)
+        if not isinstance(hold, bool):
+            raise TypeError("hold must be a boolean")
         current = self._capture(checked_now)
         motion = _motion_name(name)
+        if hold and not isinstance(motion, GestureName):
+            raise ValueError("only gestures can request an indefinite hold")
         previous_anchor = self._settled
         if self._active is not None:
             previous_anchor = current
@@ -204,13 +220,21 @@ class GestureController:
                 GestureKeyframe(_add(current, key.offsets), key.hold_seconds)
                 for key in definition.keyframes
             )
-            self._timeline = _compile(current, frames, current)
+            terminal = frames[-1].offsets if hold else current
+            self._timeline = _compile(
+                current,
+                frames,
+                terminal,
+                release=not hold,
+            )
             self._cancel_target = current
+            self._hold_terminal = hold
         else:
             target = _subtract(self._poses.pose(motion.value), self._poses.home)
             frames = (GestureKeyframe(target, STRONG_HOLD_SECONDS),)
             self._timeline = _compile(current, frames, target, release=False)
             self._cancel_target = previous_anchor
+            self._hold_terminal = False
 
         self._active = motion
         self._started_at = checked_now
@@ -226,6 +250,7 @@ class GestureController:
             return
         self._timeline = _release(current, self._cancel_target)
         self._started_at = checked_now
+        self._hold_terminal = False
 
     def sample(self, now: float) -> GestureSample:
         checked_now = _time(now)
@@ -238,6 +263,8 @@ class GestureController:
         elapsed = max(0.0, now - self._started_at)
         if elapsed + 1e-12 < self._timeline.timing.duration:
             return self._timeline.at(elapsed)
+        if self._hold_terminal:
+            return self._timeline.terminal
         self._settled = self._timeline.terminal
         self._active = None
         self._timeline = None
