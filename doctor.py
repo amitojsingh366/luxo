@@ -73,6 +73,7 @@ ESPEAK_BINARY = "espeak-ng"
 DEFAULT_MANIFEST_PATH = REPO_ROOT / "config" / "models.yaml"
 
 _HEX64 = re.compile(r"[0-9a-f]{64}")
+_HEX32 = re.compile(r"[0-9a-f]{32}")
 _COMMAND_TIMEOUT_S = 10.0
 _HASH_CHUNK_BYTES = 1 << 16
 
@@ -179,15 +180,29 @@ class ReachabilityOutcome:
 
 
 class Filesystem(Protocol):
-    """Read-only filesystem access, injected so checks need no real files."""
+    """Read-only filesystem access, injected so checks need no real files.
+
+    This is one shared probe contract: an implementation provides every member,
+    because any check may reach for any of them. ``is_dir`` and ``list_dir``
+    exist for directory assets, whose destination is a staged directory of
+    required files rather than a single downloaded file. ``md5`` exists only to
+    cross-check an asset whose publisher ships no SHA-256; it is never a
+    supply-chain pin.
+    """
 
     def expand(self, path: str) -> str: ...
 
     def is_file(self, path: str) -> bool: ...
 
+    def is_dir(self, path: str) -> bool: ...
+
+    def list_dir(self, path: str) -> tuple[str, ...]: ...
+
     def size_bytes(self, path: str) -> int: ...
 
     def sha256(self, path: str) -> str: ...
+
+    def md5(self, path: str) -> str: ...
 
     def read_text(self, path: str) -> str: ...
 
@@ -203,11 +218,40 @@ class RealFilesystem:
     def is_file(self, path: str) -> bool:
         return Path(path).is_file()
 
+    def is_dir(self, path: str) -> bool:
+        return Path(path).is_dir()
+
+    def list_dir(self, path: str) -> tuple[str, ...]:
+        """Immediate child names, sorted. An unreadable directory lists empty.
+
+        Only used to name files a directory holds but the manifest does not
+        require, which is reported and never fails a check, so a listing that
+        cannot be read degrades to saying nothing rather than to an error.
+        """
+
+        try:
+            with os.scandir(path) as entries:
+                return tuple(sorted(entry.name for entry in entries))
+        except OSError:
+            return ()
+
     def size_bytes(self, path: str) -> int:
         return Path(path).stat().st_size
 
     def sha256(self, path: str) -> str:
-        digest = hashlib.sha256()
+        return self._digest(path, hashlib.sha256)
+
+    def md5(self, path: str) -> str:
+        # usedforsecurity=False states the intent and keeps this available on a
+        # FIPS build: md5 here is a corruption cross-check, never a pin.
+        return self._digest(path, lambda: hashlib.md5(usedforsecurity=False))
+
+    def read_text(self, path: str) -> str:
+        return Path(path).read_text(encoding="utf-8")
+
+    @staticmethod
+    def _digest(path: str, factory: Callable[[], Any]) -> str:
+        digest = factory()
         with open(path, "rb") as handle:
             while True:
                 chunk = handle.read(_HASH_CHUNK_BYTES)
@@ -215,9 +259,6 @@ class RealFilesystem:
                     break
                 digest.update(chunk)
         return digest.hexdigest()
-
-    def read_text(self, path: str) -> str:
-        return Path(path).read_text(encoding="utf-8")
 
 
 def run_command(command: Sequence[str], *, timeout_s: float = _COMMAND_TIMEOUT_S) -> CommandOutput:
@@ -426,11 +467,41 @@ MANIFEST_SIZE_KEYS = ("size_bytes", "bytes", "size")
 MANIFEST_NESTED_PATH_KEY = "path"
 MANIFEST_VERIFY_KEY = "verify_command"
 
+# An asset is a single file unless it declares otherwise. A directory asset has
+# no single digest, so it carries a required_files table instead: one record per
+# file, each path relative to that entry's own destination directory. That
+# rooting is stated in the manifest's about block and enforced by
+# the validation tooling
+MANIFEST_KIND_KEYS = ("kind", "type")
+MANIFEST_REQUIRED_FILES_KEY = "required_files"
+FILE_KIND = "file"
+DIRECTORY_KIND = "directory"
+DIRECTORY_KINDS = (DIRECTORY_KIND, "dir")
+
+# A publisher digest in an algorithm that is not the pin. It is read only to
+# catch a corrupted download of an asset whose sha256 cannot be pinned, and the
+# report says so wherever it appears.
+MANIFEST_ADDITIONAL_DIGESTS_KEY = "additional_digests"
+MANIFEST_MD5_KEY = "md5"
+
 # The manifest may record a literal marker in place of a digest for an asset
 # whose publisher ships no SHA-256. It declares the marker itself; this is only
 # the fallback for a manifest that uses one without naming it.
 MANIFEST_MARKER_KEY = "unverified_marker"
 DEFAULT_UNVERIFIED_MARKER = "UNVERIFIED"
+
+
+@dataclass(frozen=True, slots=True)
+class RequiredFile:
+    """One file a directory asset must contain.
+
+    ``path`` is relative to the owning asset's own destination directory, never
+    to the upstream package root: joining the two gives the staged file.
+    """
+
+    path: str
+    sha256: str
+    size_bytes: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +511,13 @@ class AssetEntry:
     sha256: str
     size_bytes: int | None = None
     verify_command: str | None = None
+    kind: str = FILE_KIND
+    required_files: tuple[RequiredFile, ...] = ()
+    md5: str | None = None
+
+    @property
+    def is_directory(self) -> bool:
+        return self.kind.strip().casefold() in DIRECTORY_KINDS
 
 
 class ManifestShapeError(ValueError):
@@ -528,6 +606,74 @@ def _first_size(entry: Mapping[str, Any], keys: Sequence[str]) -> int | None:
     return None
 
 
+def _required_files(label: str, entry: Mapping[str, Any]) -> tuple[RequiredFile, ...]:
+    """Read the per-file table a directory asset is verified through.
+
+    Each record is read with the same helpers as a top-level asset, so a
+    required file and a whole asset are described in the same vocabulary.
+    """
+
+    raw = entry.get(MANIFEST_REQUIRED_FILES_KEY)
+    if raw is None:
+        return ()
+    if not _is_entry_sequence(raw):
+        raise ManifestShapeError(
+            f"asset '{label}' has a '{MANIFEST_REQUIRED_FILES_KEY}' that is not a list"
+        )
+    files: list[RequiredFile] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ManifestShapeError(
+                f"asset '{label}' has a required file that is not a mapping"
+            )
+        path = _entry_path(item)
+        if path is None:
+            raise ManifestShapeError(
+                f"asset '{label}' has a required file with no path "
+                f"(any of {list(MANIFEST_PATH_KEYS)})"
+            )
+        digest = _first_string(item, MANIFEST_HASH_KEYS)
+        if digest is None:
+            raise ManifestShapeError(
+                f"asset '{label}' has a required file '{path}' with no sha256 "
+                f"(any of {list(MANIFEST_HASH_KEYS)})"
+            )
+        files.append(
+            RequiredFile(
+                path=path,
+                sha256=digest,
+                size_bytes=_first_size(item, MANIFEST_SIZE_KEYS),
+            )
+        )
+    return tuple(files)
+
+
+def _declared_kind(entry: Mapping[str, Any]) -> str | None:
+    for key in MANIFEST_KIND_KEYS:
+        declared = _optional_string(entry, key)
+        if declared is not None:
+            return declared
+    return None
+
+
+def _additional_md5(entry: Mapping[str, Any]) -> str | None:
+    """Read the optional publisher md5. Unusable values are simply dropped.
+
+    md5 is not collision-resistant and is never the pin. It is recorded by a
+    publisher that ships no SHA-256, and reading it lets the doctor still catch
+    a corrupted download of that asset.
+    """
+
+    extra = entry.get(MANIFEST_ADDITIONAL_DIGESTS_KEY)
+    if not isinstance(extra, Mapping):
+        return None
+    value = extra.get(MANIFEST_MD5_KEY)
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().lower()
+    return candidate if _HEX32.fullmatch(candidate) else None
+
+
 def _asset_entry(name_hint: str | None, raw: Any) -> AssetEntry:
     label = name_hint or "<unnamed>"
     if isinstance(raw, str):
@@ -548,12 +694,19 @@ def _asset_entry(name_hint: str | None, raw: Any) -> AssetEntry:
             f"asset '{label}' has no sha256 field (any of {list(MANIFEST_HASH_KEYS)})"
         )
     name = _first_string(raw, MANIFEST_NAME_KEYS) or name_hint or path
+    required = _required_files(label, raw)
+    # An entry that names required files is a directory even if it forgot to
+    # say so; anything else is a single file unless it declares a kind.
+    kind = _declared_kind(raw) or (DIRECTORY_KIND if required else FILE_KIND)
     return AssetEntry(
         name=name,
         path=path,
         sha256=digest,
         size_bytes=_first_size(raw, MANIFEST_SIZE_KEYS),
         verify_command=_optional_string(raw, MANIFEST_VERIFY_KEY),
+        kind=kind,
+        required_files=required,
+        md5=_additional_md5(raw),
     )
 
 
@@ -646,6 +799,175 @@ def _resolve_asset_path(path: str, filesystem: Filesystem, base_dir: Path) -> st
     return os.path.normpath(os.path.join(str(base_dir), expanded))
 
 
+# One file's verdict against one manifest record. Both a single-file asset and
+# every member of a directory asset are decided here, so their outcomes cannot
+# drift apart.
+VERDICT_OK = "ok"
+VERDICT_MISSING = "missing"
+VERDICT_UNREADABLE = "unreadable"
+VERDICT_SIZE = "size"
+VERDICT_MISMATCH = "mismatch"
+VERDICT_MD5_MISMATCH = "md5_mismatch"
+VERDICT_UNVERIFIED = "unverified"
+VERDICT_MALFORMED = "malformed"
+
+_MISSING_FILE_HELP = (
+    "./setup.sh downloads model assets and verifies their sha256",
+    "weights live under ~/.cache/lumen and are never committed",
+)
+_MISSING_DIRECTORY_HELP = (
+    "./setup.sh stages this directory and verifies every file the manifest requires",
+    "browser assets are staged under renderer/public and are never committed",
+)
+_REDOWNLOAD_HELP = ("delete the file and re-run ./setup.sh to download it again",)
+
+
+@dataclass(frozen=True, slots=True)
+class _FileVerdict:
+    outcome: str
+    detail: str
+    size_bytes: int | None = None
+    md5_confirmed: bool = False
+
+
+def _digest_is_unusable(digest: str, marker: str) -> bool:
+    """True when a manifest digest is neither hex nor the declared marker."""
+
+    return not _is_unverified(digest, marker) and not _HEX64.fullmatch(digest.strip().lower())
+
+
+def _cross_check_md5(resolved: str, expected_md5: str | None, filesystem: Filesystem) -> str | None:
+    """Hash md5 only to catch a corrupted download of an unpinnable asset.
+
+    Returns None when there is nothing to compare or the probe cannot answer,
+    so this can add a failure but can never invent one.
+    """
+
+    if not expected_md5:
+        return None
+    try:
+        return filesystem.md5(resolved).strip().lower()
+    except (OSError, ValueError):
+        return None
+
+
+def _verify_file(
+    resolved: str,
+    expected_sha256: str,
+    expected_size: int | None,
+    filesystem: Filesystem,
+    *,
+    unverified_marker: str,
+    expected_md5: str | None = None,
+) -> _FileVerdict:
+    """Check one concrete file against one manifest record.
+
+    The caller turns a verdict into a CheckResult, because the wording of a
+    whole asset and of one file inside a directory differ; the decision does
+    not.
+    """
+
+    expected = expected_sha256.strip().lower()
+    unverified = _is_unverified(expected_sha256, unverified_marker)
+    if _digest_is_unusable(expected_sha256, unverified_marker):
+        return _FileVerdict(
+            VERDICT_MALFORMED, "the manifest sha256 is not 64 hexadecimal characters"
+        )
+    if not filesystem.is_file(resolved):
+        return _FileVerdict(VERDICT_MISSING, f"missing: {resolved}")
+
+    try:
+        actual_size = filesystem.size_bytes(resolved)
+        # An unverified entry has no digest to compare against, so the file is
+        # deliberately not hashed here.
+        actual = None if unverified else filesystem.sha256(resolved).lower()
+    except OSError as exc:
+        return _FileVerdict(
+            VERDICT_UNREADABLE, f"cannot read {resolved}: {exc.strerror or 'unreadable'}"
+        )
+
+    if expected_size is not None and actual_size != expected_size:
+        return _FileVerdict(
+            VERDICT_SIZE,
+            f"size mismatch at {resolved}: expected {expected_size} bytes, found {actual_size}",
+            actual_size,
+        )
+    if unverified:
+        published = _cross_check_md5(resolved, expected_md5, filesystem)
+        if published is not None and expected_md5 is not None and published != expected_md5:
+            return _FileVerdict(
+                VERDICT_MD5_MISMATCH,
+                (
+                    f"md5 mismatch at {resolved}: the publisher records "
+                    f"{expected_md5[:16]}..., these bytes are {published[:16]}..."
+                ),
+                actual_size,
+            )
+        return _FileVerdict(
+            VERDICT_UNVERIFIED,
+            f"present at {resolved} ({actual_size} bytes)",
+            actual_size,
+            md5_confirmed=published is not None,
+        )
+    if actual != expected:
+        return _FileVerdict(
+            VERDICT_MISMATCH,
+            (
+                f"sha256 mismatch at {resolved}: expected {expected[:16]}..., "
+                f"found {actual[:16]}..."
+            ),
+            actual_size,
+        )
+    return _FileVerdict(
+        VERDICT_OK,
+        f"{resolved} matches sha256 {expected[:16]}... ({actual_size} bytes)",
+        actual_size,
+    )
+
+
+def _resolve_member_path(directory: str, relative: str) -> str | None:
+    """Join a required_files path onto its own destination directory.
+
+    None means the manifest path would land outside the destination, which
+    breaks the rooting rule config/models.yaml states: a required_files path is
+    relative to destination.path, never absolute and never with a '..' segment.
+    """
+
+    candidate = os.path.normpath(os.path.join(directory, relative))
+    prefix = directory.rstrip(os.sep) + os.sep
+    if candidate == directory or not candidate.startswith(prefix):
+        return None
+    return candidate
+
+
+def _join_names(names: Sequence[str], limit: int = 6) -> str:
+    shown = list(names[:limit])
+    remaining = len(names) - len(shown)
+    if remaining > 0:
+        shown.append(f"+{remaining} more")
+    return ", ".join(shown)
+
+
+def _unrequired_names(
+    resolved: str,
+    required_files: Sequence[RequiredFile],
+    filesystem: Filesystem,
+) -> tuple[str, ...]:
+    """Name what the directory holds that no required_files record claims.
+
+    Reported, never failed: the manifest says setup.sh may copy a whole upstream
+    directory, and records that both wasm bundles ship files the renderer never
+    fetches, so an unclaimed file is information rather than an error.
+    """
+
+    claimed = {
+        required.path.replace(os.sep, "/").split("/", 1)[0]
+        for required in required_files
+        if required.path
+    }
+    return tuple(name for name in filesystem.list_dir(resolved) if name not in claimed)
+
+
 def check_asset(
     entry: AssetEntry,
     filesystem: Filesystem,
@@ -660,12 +982,19 @@ def check_asset(
     supply-chain signal and must stay loud. A file that is present but whose
     manifest entry carries the UNVERIFIED marker instead of a digest is a
     recorded, deliberate gap: it warns, and it does not fail preflight.
+
+    A ``kind: directory`` asset is verified through the files the manifest
+    requires inside it, by exactly those rules, one file at a time. Its own
+    sha256 is UNVERIFIED by construction -- a directory has no single digest --
+    so that marker is not what decides the outcome there; the per-file digests
+    are, and a directory whose required files are all present and matching
+    passes.
     """
 
     name = f"asset {entry.name}"
-    expected = entry.sha256.strip().lower()
-    unverified = _is_unverified(entry.sha256, unverified_marker)
-    if not unverified and not _HEX64.fullmatch(expected):
+    # Checked before anything is resolved or read, so a manifest typo is
+    # reported without touching the disk at all.
+    if _digest_is_unusable(entry.sha256, unverified_marker):
         return _failed(
             name,
             "the manifest sha256 is not 64 hexadecimal characters",
@@ -675,65 +1004,198 @@ def check_asset(
                 f"{unverified_marker or DEFAULT_UNVERIFIED_MARKER}",
             ),
         )
+    if entry.is_directory:
+        return _check_directory_asset(
+            entry, filesystem, base_dir=base_dir, unverified_marker=unverified_marker
+        )
+    return _check_file_asset(
+        entry, filesystem, base_dir=base_dir, unverified_marker=unverified_marker
+    )
 
+
+def _check_file_asset(
+    entry: AssetEntry,
+    filesystem: Filesystem,
+    *,
+    base_dir: Path,
+    unverified_marker: str,
+) -> CheckResult:
+    name = f"asset {entry.name}"
     resolved = _resolve_asset_path(entry.path, filesystem, base_dir)
-    if not filesystem.is_file(resolved):
+    verdict = _verify_file(
+        resolved,
+        entry.sha256,
+        entry.size_bytes,
+        filesystem,
+        unverified_marker=unverified_marker,
+        expected_md5=entry.md5,
+    )
+
+    if verdict.outcome == VERDICT_MISSING:
+        return _failed(name, verdict.detail, _MISSING_FILE_HELP)
+    if verdict.outcome == VERDICT_UNREADABLE:
+        return _failed(name, verdict.detail, ("check file permissions, then re-run ./setup.sh",))
+    if verdict.outcome == VERDICT_SIZE:
+        return _failed(name, verdict.detail, _REDOWNLOAD_HELP)
+    if verdict.outcome == VERDICT_MD5_MISMATCH:
         return _failed(
             name,
-            f"missing: {resolved}",
+            verdict.detail,
             (
-                "./setup.sh downloads model assets and verifies their sha256",
-                "weights live under ~/.cache/lumen and are never committed",
+                "the publisher's own md5 disagrees with these bytes, so the download "
+                "is corrupt or is not the file the manifest names",
+                *_REDOWNLOAD_HELP,
             ),
         )
-
-    try:
-        actual_size = filesystem.size_bytes(resolved)
-        # An unverified entry has no digest to compare against, so the file is
-        # deliberately not hashed here.
-        actual = None if unverified else filesystem.sha256(resolved).lower()
-    except OSError as exc:
-        return _failed(
-            name,
-            f"cannot read {resolved}: {exc.strerror or 'unreadable'}",
-            ("check file permissions, then re-run ./setup.sh",),
+    if verdict.outcome == VERDICT_UNVERIFIED:
+        detail = (
+            f"present at {resolved} ({verdict.size_bytes} bytes) but the manifest records "
+            f"sha256 {unverified_marker}, so these bytes cannot be hash-checked"
         )
-
-    if entry.size_bytes is not None and actual_size != entry.size_bytes:
-        return _failed(
-            name,
-            f"size mismatch at {resolved}: expected {entry.size_bytes} bytes, found {actual_size}",
-            ("delete the file and re-run ./setup.sh to download it again",),
-        )
-    if unverified:
+        if verdict.md5_confirmed:
+            detail += (
+                "; the publisher's md5 does match, which rules out a corrupted download "
+                "but is not a supply-chain pin"
+            )
         verify_hint = entry.verify_command or (
             f"hash it yourself, then paste the digest over {unverified_marker} in the manifest"
         )
         return _warned(
             name,
-            (
-                f"present at {resolved} ({actual_size} bytes) but the manifest records "
-                f"sha256 {unverified_marker}, so these bytes cannot be hash-checked"
-            ),
+            detail,
             (
                 f"verify it by hand: {verify_hint}",
                 "the publisher ships no sha256 for this asset; the manifest records "
                 "why, and this is a known gap rather than a corrupt download",
             ),
         )
-    if actual != expected:
+    if verdict.outcome == VERDICT_MISMATCH:
+        return _failed(
+            name,
+            verdict.detail,
+            (
+                "the download is truncated, corrupt, or the wrong revision",
+                *_REDOWNLOAD_HELP,
+            ),
+        )
+    return _passed(name, verdict.detail)
+
+
+def _check_directory_asset(
+    entry: AssetEntry,
+    filesystem: Filesystem,
+    *,
+    base_dir: Path,
+    unverified_marker: str,
+) -> CheckResult:
+    """Verify a directory asset file by file, naming whichever files are wrong."""
+
+    name = f"asset {entry.name}"
+    resolved = _resolve_asset_path(entry.path, filesystem, base_dir)
+    if not filesystem.is_dir(resolved):
+        if filesystem.is_file(resolved):
+            return _failed(
+                name,
+                f"expected a directory at {resolved}, found a file",
+                (
+                    "this asset is a staged directory of files, not one download",
+                    "delete it, then re-run ./setup.sh to stage the directory",
+                ),
+            )
+        return _failed(name, f"missing directory: {resolved}", _MISSING_DIRECTORY_HELP)
+    if not entry.required_files:
+        return _warned(
+            name,
+            (
+                f"present at {resolved} but the manifest names no required_files, "
+                "so nothing inside it can be checked"
+            ),
+            (
+                "list the files this directory must contain under required_files, "
+                "each with its own path, size_bytes and sha256",
+                "a directory has no single sha256, so required_files is the only "
+                "thing that can verify one",
+            ),
+        )
+
+    failures: list[tuple[str, str]] = []
+    unpinned: list[str] = []
+    matched = 0
+    matched_bytes = 0
+    for required in entry.required_files:
+        member = _resolve_member_path(resolved, required.path)
+        if member is None:
+            failures.append(
+                (
+                    required.path,
+                    f"{required.path!r} lands outside {resolved}; a required_files path "
+                    "is relative to the destination directory",
+                )
+            )
+            continue
+        verdict = _verify_file(
+            member,
+            required.sha256,
+            required.size_bytes,
+            filesystem,
+            unverified_marker=unverified_marker,
+        )
+        if verdict.outcome == VERDICT_OK:
+            matched += 1
+            matched_bytes += verdict.size_bytes or 0
+        elif verdict.outcome == VERDICT_UNVERIFIED:
+            unpinned.append(required.path)
+        elif verdict.outcome == VERDICT_MALFORMED:
+            # The only verdict whose wording is about the manifest rather than
+            # about a path, so it needs the file named onto it.
+            failures.append((required.path, f"{required.path}: {verdict.detail}"))
+        else:
+            failures.append((required.path, verdict.detail))
+
+    total = len(entry.required_files)
+    unrequired = _unrequired_names(resolved, entry.required_files, filesystem)
+    extra_note = (
+        f"; also present, not required: {_join_names(unrequired)}" if unrequired else ""
+    )
+    verify_hint = entry.verify_command or (
+        "hash each required file and compare it against required_files in the manifest"
+    )
+
+    if failures:
         return _failed(
             name,
             (
-                f"sha256 mismatch at {resolved}: expected {expected[:16]}..., "
-                f"found {actual[:16]}..."
+                f"{resolved}: {len(failures)} of {total} required files did not verify "
+                f"({_join_names([path for path, _ in failures])}){extra_note}"
             ),
             (
-                "the download is truncated, corrupt, or the wrong revision",
-                "delete the file and re-run ./setup.sh to download it again",
+                *(detail for _, detail in failures),
+                "re-run ./setup.sh to stage this directory again; it copies exactly the "
+                "files the manifest requires",
+                f"check by hand: {verify_hint}",
             ),
         )
-    return _passed(name, f"{resolved} matches sha256 {expected[:16]}... ({actual_size} bytes)")
+    if unpinned:
+        return _warned(
+            name,
+            (
+                f"{resolved}: {matched} of {total} required files match their recorded "
+                f"sha256, {len(unpinned)} cannot be hash-checked "
+                f"({_join_names(unpinned)}){extra_note}"
+            ),
+            (
+                f"verify those by hand: {verify_hint}",
+                f"their manifest records sha256 {unverified_marker} rather than a digest; "
+                "that is a known gap, not a corrupt download",
+            ),
+        )
+    return _passed(
+        name,
+        (
+            f"{resolved}: all {total} required files match their recorded sha256 "
+            f"({matched_bytes} bytes){extra_note}"
+        ),
+    )
 
 
 def check_assets(
@@ -846,9 +1308,10 @@ def check_api_key(
         "api key",
         f"{variable} is not set in this environment",
         (
-            f"export {variable} in the shell that launches the core",
-            "the root .env holds it and run.sh loads it; the doctor never opens that file",
-            "the doctor never prints, logs, or transmits the value",
+            f"export {variable} in the shell that launches the core, before ./run.sh",
+            "nothing loads it for you today: run.sh does not read the root .env, so a "
+            "key that lives only in that file will not reach the core",
+            "the doctor never opens .env, and never prints, logs, or transmits the value",
         ),
     )
 
