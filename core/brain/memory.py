@@ -16,6 +16,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Iterable
 
+from .schema import normalize_canonical_label
+
 
 _MAX_OBJECTS: Final = 19
 _FIELDS: Final = frozenset(
@@ -57,6 +59,46 @@ _SENSITIVE_ATTRIBUTE_TERMS: Final = frozenset(
 
 class SceneMemoryError(ValueError):
     """A scene-memory file or record is malformed."""
+
+
+@dataclass(frozen=True, slots=True)
+class CloudSceneObject:
+    """Privacy-limited scene fact safe for OpenRouter text payloads.
+
+    Stable identity lets the model select ``look_at`` targets. Canonical names
+    and filtered attributes provide the visible facts it needs to reason. Raw
+    labels, bounding boxes, timestamps, and local presence metadata never have
+    a representation in this projection.
+    """
+
+    id: str
+    canonical: str
+    attributes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object_id = _text(self.id, "id", compact_safe=True)
+        if _SAFE_ID.fullmatch(object_id) is None:
+            raise SceneMemoryError("id must contain only letters, digits, '.', '_', or '-'")
+        try:
+            canonical = normalize_canonical_label(self.canonical)
+        except ValueError as exc:
+            raise SceneMemoryError("canonical must be a safe canonical label") from exc
+        if isinstance(self.attributes, (str, bytes)):
+            raise SceneMemoryError("attributes must be a sequence of strings")
+        try:
+            attributes = tuple(
+                sorted(
+                    {
+                        _text(attribute, "attribute", compact_safe=True).casefold()
+                        for attribute in self.attributes
+                    }
+                )
+            )
+        except TypeError as exc:
+            raise SceneMemoryError("attributes must be a sequence of strings") from exc
+        object.__setattr__(self, "id", object_id)
+        object.__setattr__(self, "canonical", canonical)
+        object.__setattr__(self, "attributes", cloud_safe_attributes(attributes))
 
 
 def _text(value: object, field: str, *, compact_safe: bool = False) -> str:
@@ -296,18 +338,43 @@ class SceneMemoryStore:
     def compact_line(self) -> str:
         parts: list[str] = []
         for record in self.load():
-            attributes = tuple(
-                attribute
-                for attribute in record.attributes
-                if not (_attribute_terms(attribute) & _SENSITIVE_ATTRIBUTE_TERMS)
-            )
+            attributes = cloud_safe_attributes(record.attributes)
             suffix = f"({','.join(attributes)})" if attributes else ""
             parts.append(f"{record.id}:{record.canonical}{suffix}")
         return "; ".join(parts)
+
+    def currently_visible(self) -> tuple[CloudSceneObject, ...]:
+        """Return the bounded present-only scene projection for text calls."""
+
+        return tuple(
+            CloudSceneObject(
+                id=record.id,
+                canonical=record.canonical,
+                attributes=cloud_safe_attributes(record.attributes),
+            )
+            for record in self.load()
+            if record.present
+        )
 
 
 def _attribute_terms(attribute: str) -> frozenset[str]:
     return frozenset(re.findall(r"[\w]+", attribute.casefold()))
 
 
-__all__ = ["SceneMemoryError", "SceneMemoryStore", "SceneObject"]
+def cloud_safe_attributes(attributes: Iterable[str]) -> tuple[str, ...]:
+    """Remove sensitive extracted attributes from every text-cloud payload."""
+
+    return tuple(
+        attribute
+        for attribute in attributes
+        if not (_attribute_terms(attribute) & _SENSITIVE_ATTRIBUTE_TERMS)
+    )
+
+
+__all__ = [
+    "CloudSceneObject",
+    "SceneMemoryError",
+    "SceneMemoryStore",
+    "SceneObject",
+    "cloud_safe_attributes",
+]

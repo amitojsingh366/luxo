@@ -10,7 +10,6 @@ import json
 import logging
 import math
 import os
-import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -20,13 +19,12 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .prompts import FixedPromptBuilder, PromptBuilder
+from .memory import CloudSceneObject
 from .schema import (
     ActionOp,
     ObservationResponse,
-    ObservedObject,
     PlanResponse,
     ResponseSchemaError,
-    extract_json_object,
     parse_observation_response,
     parse_plan_response,
 )
@@ -35,16 +33,35 @@ LOGGER = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RESPONSE_BYTES = 8 * 1024
 PRIVATE_PROVIDER = {"zdr": True, "data_collection": "deny", "allow_fallbacks": False}
-CallType = Literal["converse", "observe", "narrate", "scene_comment"]
+CallType = Literal["converse", "observe", "resolve_observation"]
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationOrigin:
+    """The exact dialogue turn or typed scene event that caused a capture."""
+
+    kind: Literal["dialogue", "scene_event"]
+    text: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("dialogue", "scene_event"):
+            raise ValueError("origin kind must be dialogue or scene_event")
+        if (
+            not isinstance(self.text, str)
+            or not self.text.strip()
+            or "\n" in self.text
+            or "\r" in self.text
+        ):
+            raise ValueError("origin text must be non-empty single-line text")
+        object.__setattr__(self, "text", " ".join(self.text.split()))
 
 
 @dataclass(frozen=True, slots=True)
 class ObservationEnvelope:
-    """Validated facts plus quarantined dialogue from the same JPEG request.
+    """Deprecated compatibility shape removed by the final cleanup packet.
 
-    PRD §8.1.1 normally permits facts only from ``observe``. The owner-approved
-    exception preserves a bounded accidental ``say`` only across that call's
-    repair attempt. It is never part of the fact schema and carries no plan.
+    New observation calls never create this value. It remains importable only
+    while the observation runtime migrates to the facts-only contract.
     """
 
     facts: ObservationResponse
@@ -52,21 +69,11 @@ class ObservationEnvelope:
 
 
 ValidatedObservation = ObservationResponse | ObservationEnvelope
-T = TypeVar("T", PlanResponse, ObservationResponse, ObservationEnvelope)
+T = TypeVar("T", PlanResponse, ObservationResponse)
 
 REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     "converse": (
         "Your conversation response was invalid. Return one bare JSON object with exactly "
-        "the top-level keys say and plan. Every plan item needs an op from gesture, "
-        "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
-        "perk_up belongs in name with op set to gesture; it is never itself an op. Do not "
-        "copy the current transcript into say. For a current visual-detail question, say only "
-        "a brief looking or checking acknowledgement and return exactly one observe action, "
-        "with no scan. For an explicitly historical question, answer it from memory when the "
-        "requested object fact is present; otherwise say that you do not know."
-    ),
-    "narrate": (
-        "Your narration response was invalid. Return one bare JSON object with exactly "
         "the top-level keys say and plan. Every plan item needs an op from gesture, "
         "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
         "perk_up belongs in name with op set to gesture; it is never itself an op."
@@ -76,19 +83,19 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
         "bare JSON object with exactly the top-level keys present, known, and new. present must be "
         "an array containing only supplied prior_canonical labels that remain visible. new "
         "must describe every salient visible object not in prior_canonical using label, "
-        "canonical, attributes, and bbox_norm. known must describe every present object with "
-        "the same fields and current visible details. If prior_canonical is empty, present and "
+        "canonical, attributes, and bbox_norm. known may describe any present prior object with "
+        "the same fields and fresh visible details. If prior_canonical is empty, present and "
         "known must be empty and visible objects must go in new. bbox_norm must contain "
         "decimal x, y, width, "
         "and height values between 0 and 1, not pixel or corner coordinates. Always include "
         "all three arrays. Do not return "
         "say, plan, dialogue, or prose."
     ),
-    "scene_comment": (
-        "Your scene comment was invalid. Return one bare JSON object with exactly say and "
-        "plan. Ground say in a named fresh object. For spontaneous_hand, ask one concise, "
-        "specific question about that object's purpose, feature, or use. Never ask what the "
-        "person is working on, doing, holding, or what is in their hand. Do not observe again."
+    "resolve_observation": (
+        "Your observation resolution was invalid. Return one bare JSON object with exactly "
+        "the top-level keys say and plan. Every plan item needs an op from gesture, "
+        "look_at, light, sfx, scan, posture, or wait. Do not include observe because the "
+        "fresh observation is already complete."
     ),
 }
 
@@ -172,6 +179,7 @@ class BrainClient(Protocol):
         self,
         transcript: str,
         compact_memory: str,
+        currently_visible: Sequence[CloudSceneObject],
         recent: Sequence[RecentExchange],
     ) -> PlanResponse: ...
 
@@ -179,8 +187,19 @@ class BrainClient(Protocol):
         self,
         jpeg: bytes,
         prior_canonical: Sequence[str],
-    ) -> ValidatedObservation: ...
+    ) -> ObservationResponse: ...
 
+    def resolve_observation(
+        self,
+        origin: ObservationOrigin,
+        observation: ObservationResponse,
+        missing: Sequence[str],
+        compact_memory: str,
+        currently_visible: Sequence[CloudSceneObject],
+        recent: Sequence[RecentExchange],
+    ) -> PlanResponse: ...
+
+    # Temporary compatibility surface; the runtime migration removes it.
     def narrate(self, missing: Sequence[str]) -> PlanResponse: ...
 
     def scene_comment(
@@ -278,7 +297,7 @@ class StdlibOpenRouterTransport:
 
 
 class OpenRouterBrainClient:
-    """Validated implementation of the four narrow model call types."""
+    """Validated implementation of the unified three-call cloud contract."""
 
     def __init__(
         self,
@@ -312,10 +331,15 @@ class OpenRouterBrainClient:
         self._clock = clock
         self._warm_lock = threading.Lock()
         self._warmed = False
+        # Temporary bridge for the old scene_comment runtime. The public
+        # observation result remains facts-only, and the new resolver never
+        # consumes dialogue returned by perception. Remove with scene_comment.
+        self._legacy_scene_say: dict[int, str] = {}
+        self._legacy_scene_lock = threading.Lock()
         LOGGER.info("OpenRouter configured model=%s profile=%s", self.model, self.profile)
 
     def warm(self) -> None:
-        """Warm once through the existing narrate call from a startup worker."""
+        """Warm once through the observation resolver from a startup worker."""
 
         with self._warm_lock:
             if self._warmed:
@@ -325,53 +349,47 @@ class OpenRouterBrainClient:
                 # model warm-up. Readiness is exercised by the first real turn.
                 self._warmed = True
                 return
-            self._narrate((), strict=True)
+            self._resolve_observation(
+                ObservationOrigin("scene_event", "startup_warm"),
+                ObservationResponse((), ()),
+                (),
+                "",
+                (),
+                (),
+                strict=True,
+            )
             self._warmed = True
 
     def converse(
         self,
         transcript: str,
         compact_memory: str,
-        recent: Sequence[RecentExchange],
+        currently_visible: Sequence[CloudSceneObject] | Sequence[RecentExchange],
+        recent: Sequence[RecentExchange] | None = None,
     ) -> PlanResponse:
-        payload = self._prompts.converse_payload(transcript, compact_memory, recent)
+        visible, exchanges = _converse_context(currently_visible, recent)
+        payload = self._prompts.converse_payload(
+            transcript, compact_memory, visible, exchanges
+        )
+        return self._run(
+            "converse", self._text_messages(payload), _parse_converse_response
+        )
 
-        def parse_conversation(raw: str) -> PlanResponse:
-            response = parse_plan_response(raw)
-            if response.say.strip().casefold() == transcript.strip().casefold():
-                raise ResponseSchemaError("conversation response echoed current transcript")
-            if _requires_fresh_visual(transcript):
-                if tuple(action.op.value for action in response.plan) != ("observe",):
-                    raise ResponseSchemaError(
-                        "current visual question requires exactly one observe action"
-                    )
-                acknowledgement = response.say.casefold()
-                if not any(
-                    phrase in acknowledgement
-                    for phrase in ("look", "check", "let me see", "take a peek", "one moment")
-                ):
-                    raise ResponseSchemaError(
-                        "current visual question requires a looking acknowledgement"
-                    )
-            return response
-
-        return self._run("converse", self._text_messages(payload), parse_conversation)
-
-    def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ValidatedObservation:
+    def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ObservationResponse:
         payload = self._prompts.observe_payload(jpeg, prior_canonical)
         prior = payload["prior_canonical"]
-        labels = {"prior_canonical": prior}
+        labels = {"call": "observe", "prior_canonical": prior}
         content = [
             {"type": "text", "text": _compact_json(labels)},
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
 
-        quarantined_say: str | None = None
+        legacy_say: str | None = None
 
-        def parse_observation(raw: str) -> ValidatedObservation:
-            nonlocal quarantined_say
-            if quarantined_say is None:
-                quarantined_say = _dialogue_candidate(raw)
+        def parse_observation(raw: str) -> ObservationResponse:
+            nonlocal legacy_say
+            if legacy_say is None:
+                legacy_say = _legacy_dialogue(raw)
             response = parse_observation_response(raw, require_known=True)
             prior_set = frozenset(prior)
             if any(label not in prior_set for label in response.present):
@@ -390,18 +408,46 @@ class OpenRouterBrainClient:
                 raise ResponseSchemaError(
                     "observation new repeats an object from prior_canonical"
                 )
-            if quarantined_say is not None and _grounded_scene_say(
-                quarantined_say,
-                response,
-                allow_uncertainty=False,
-            ):
-                return ObservationEnvelope(response, quarantined_say)
+            with self._legacy_scene_lock:
+                self._legacy_scene_say.clear()
+                if legacy_say is not None:
+                    self._legacy_scene_say[id(response)] = legacy_say
             return response
 
         return self._run("observe", self._messages(content), parse_observation)
 
+    def resolve_observation(
+        self,
+        origin: ObservationOrigin,
+        observation: ObservationResponse,
+        missing: Sequence[str],
+        compact_memory: str,
+        currently_visible: Sequence[CloudSceneObject],
+        recent: Sequence[RecentExchange],
+    ) -> PlanResponse:
+        with self._legacy_scene_lock:
+            self._legacy_scene_say.pop(id(observation), None)
+        return self._resolve_observation(
+            origin,
+            observation,
+            missing,
+            compact_memory,
+            currently_visible,
+            recent,
+            strict=False,
+        )
+
     def narrate(self, missing: Sequence[str]) -> PlanResponse:
-        return self._narrate(missing, strict=False)
+        """Deprecated compatibility delegate for the pre-migration runtime."""
+
+        return self.resolve_observation(
+            ObservationOrigin("scene_event", "missing_comparison"),
+            ObservationResponse((), ()),
+            missing,
+            "",
+            (),
+            (),
+        )
 
     def scene_comment(
         self,
@@ -409,76 +455,46 @@ class OpenRouterBrainClient:
         observation: ValidatedObservation,
         compact_memory: str,
     ) -> PlanResponse:
-        facts = _observation_facts(observation)
-        payload = self._prompts.scene_comment_payload(
-            visual_intent,
+        """Deprecated compatibility delegate for the pre-migration runtime."""
+
+        facts = observation.facts if isinstance(observation, ObservationEnvelope) else observation
+        with self._legacy_scene_lock:
+            legacy_say = self._legacy_scene_say.pop(id(facts), None)
+        if legacy_say is not None:
+            return PlanResponse(legacy_say, ())
+        return self.resolve_observation(
+            ObservationOrigin("scene_event", visual_intent),
             facts,
+            (),
             compact_memory,
+            (),
+            (),
         )
-        fresh_objects = payload["fresh_objects"]
-        assert isinstance(fresh_objects, list)
-        object_terms = tuple(
-            str(item[key]).casefold()
-            for item in fresh_objects
-            if isinstance(item, Mapping)
-            for key in ("canonical", "label")
-            if isinstance(item.get(key), str)
+
+    def _resolve_observation(
+        self,
+        origin: ObservationOrigin,
+        observation: ObservationResponse,
+        missing: Sequence[str],
+        compact_memory: str,
+        currently_visible: Sequence[CloudSceneObject],
+        recent: Sequence[RecentExchange],
+        *,
+        strict: bool,
+    ) -> PlanResponse:
+        payload = self._prompts.resolve_observation_payload(
+            origin,
+            observation,
+            missing,
+            compact_memory,
+            currently_visible,
+            recent,
         )
-        attribute_terms = tuple(
-            str(attribute).casefold()
-            for item in fresh_objects
-            if isinstance(item, Mapping) and isinstance(item.get("attributes"), list)
-            for attribute in item["attributes"]
-            if isinstance(attribute, str)
-        )
-        spontaneous = visual_intent == "spontaneous_hand"
-
-        candidate = (
-            observation.quarantined_say
-            if isinstance(observation, ObservationEnvelope)
-            else None
-        )
-        if candidate is not None and _grounded_scene_say(
-            candidate, facts, allow_uncertainty=False
-        ) and _candidate_matches_visual_intent(candidate, facts, visual_intent):
-            # Perception dialogue is never trusted on its own. At this point a
-            # separate repair has produced validated facts, memory has been
-            # committed, and the candidate names one of those fresh objects.
-            # Its model-authored plan is deliberately unavailable here.
-            return PlanResponse(candidate, ())
-
-        def parse_comment(raw: str) -> PlanResponse:
-            response = parse_plan_response(raw)
-            normalized = " ".join(response.say.casefold().replace("’", "'").split())
-            if any(phrase in normalized for phrase in _GENERIC_SCENE_PHRASES):
-                raise ResponseSchemaError("scene comment used a forbidden generic question")
-            uncertainty = ("not sure", "can't tell", "cannot tell", "don't know")
-            grounding_terms = object_terms if spontaneous else object_terms + attribute_terms
-            grounded = any(term in normalized for term in grounding_terms)
-            if grounding_terms and not grounded and not any(
-                phrase in normalized for phrase in uncertainty
-            ):
-                raise ResponseSchemaError("scene comment is not grounded in a fresh object")
-            if len(response.plan) > 3:
-                raise ResponseSchemaError("scene comment plan must stay small")
-            # The line is already grounded in the fresh, committed frame. A
-            # lightweight model often appends another scan/observe out of habit;
-            # those actions are redundant here and would create a visual loop.
-            # Keep the useful line and locally remove only those forbidden ops
-            # instead of paying a repair call that may rewrite it.
-            safe_plan = tuple(
-                action
-                for action in response.plan
-                if action.op not in (ActionOp.SCAN, ActionOp.OBSERVE)
-            )
-            return PlanResponse(response.say, safe_plan)
-
-        return self._run("scene_comment", self._text_messages(payload), parse_comment)
-
-    def _narrate(self, missing: Sequence[str], *, strict: bool) -> PlanResponse:
-        payload = self._prompts.narrate_payload(missing)
         return self._run(
-            "narrate", self._text_messages(payload), parse_plan_response, strict=strict
+            "resolve_observation",
+            self._text_messages(payload),
+            _parse_resolved_response,
+            strict=strict,
         )
 
     def _text_messages(self, payload: Mapping[str, object]) -> list[dict[str, object]]:
@@ -546,8 +562,6 @@ class OpenRouterBrainClient:
                 "OpenRouter observation failed after its repair attempt"
             )
         if rate_limit is not None:
-            if call_type == "narrate":
-                return PlanResponse("", ())  # type: ignore[return-value]
             wait = rate_limit.retry_after_s
             if wait is not None:
                 seconds = max(1, int(math.ceil(wait)))
@@ -610,196 +624,58 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-_GENERIC_SCENE_PHRASES = (
-    "what are you working on",
-    "what are you doing",
-    "what are you holding",
-    "what is in your hand",
-    "what's in your hand",
-    "anything in your hand",
-)
-_HUMAN_CANONICALS = frozenset(("person", "human", "man", "woman", "boy", "girl"))
-_COLOR_WORDS = frozenset(
-    (
-        "black",
-        "blue",
-        "brown",
-        "cyan",
-        "gold",
-        "gray",
-        "green",
-        "grey",
-        "magenta",
-        "orange",
-        "pink",
-        "purple",
-        "red",
-        "silver",
-        "teal",
-        "white",
-        "yellow",
-    )
-)
-
-
-def _dialogue_candidate(raw: str) -> str | None:
-    """Extract only bounded dialogue from a dialogue-shaped observe failure."""
+def _legacy_dialogue(raw: str) -> str | None:
+    """Syntactically retain one old-runtime line; the new resolver ignores it."""
 
     try:
-        root = extract_json_object(raw)
-        if "say" not in root or "plan" not in root:
-            return None
-        return parse_plan_response(root).say or None
+        response = parse_plan_response(raw)
     except (ResponseSchemaError, TypeError, ValueError):
         return None
+    return response.say or None
 
 
-def _grounded_scene_say(
-    say: str,
-    observation: ObservationResponse,
-    *,
-    allow_uncertainty: bool,
-) -> bool:
-    """Approve a scene line only when fresh validated facts support it."""
+def _converse_context(
+    currently_visible: Sequence[CloudSceneObject] | Sequence[RecentExchange],
+    recent: Sequence[RecentExchange] | None,
+) -> tuple[tuple[CloudSceneObject, ...], tuple[RecentExchange, ...]]:
+    """Accept the new four-argument call plus the temporary legacy call."""
 
-    normalized = " ".join(say.casefold().replace("’", "'").split())
-    if not normalized or any(
-        phrase in normalized for phrase in _GENERIC_SCENE_PHRASES
-    ):
-        return False
-    objects = (*observation.known, *observation.new)
-    object_terms = tuple(
-        term
-        for item in objects
-        for term in (item.canonical.casefold(), item.label.casefold())
-        if term
+    supplied = tuple(currently_visible)
+    if recent is None:
+        if all(isinstance(item, RecentExchange) for item in supplied):
+            return (), tuple(item for item in supplied if isinstance(item, RecentExchange))
+        if all(isinstance(item, CloudSceneObject) for item in supplied):
+            return tuple(item for item in supplied if isinstance(item, CloudSceneObject)), ()
+        raise TypeError("legacy recent context must contain RecentExchange values")
+    if not all(isinstance(item, CloudSceneObject) for item in supplied):
+        raise TypeError("currently_visible must contain CloudSceneObject values")
+    exchanges = tuple(recent)
+    if not all(isinstance(item, RecentExchange) for item in exchanges):
+        raise TypeError("recent must contain RecentExchange values")
+    return tuple(item for item in supplied if isinstance(item, CloudSceneObject)), exchanges
+
+
+def _parse_converse_response(raw: str) -> PlanResponse:
+    """Keep arbitrary model wording while bounding observation work."""
+
+    response = parse_plan_response(raw)
+    terminal_observe = bool(
+        response.plan and response.plan[-1].op is ActionOp.OBSERVE
     )
-    if any(term in normalized for term in object_terms):
-        return True
-    return allow_uncertainty and any(
-        phrase in normalized
-        for phrase in ("not sure", "can't tell", "cannot tell", "don't know")
+    plan = tuple(action for action in response.plan if action.op is not ActionOp.OBSERVE)
+    if terminal_observe:
+        plan += (response.plan[-1],)
+    return PlanResponse(response.say, plan)
+
+
+def _parse_resolved_response(raw: str) -> PlanResponse:
+    """A completed observation cannot recursively request another image."""
+
+    response = parse_plan_response(raw)
+    return PlanResponse(
+        response.say,
+        tuple(action for action in response.plan if action.op is not ActionOp.OBSERVE),
     )
-
-
-def _candidate_matches_visual_intent(
-    say: str,
-    observation: ObservationResponse,
-    visual_intent: str,
-) -> bool:
-    """Require the quarantined line to identify the intent's supported object."""
-
-    objects = (*observation.known, *observation.new)
-    if _is_hand_intent(visual_intent):
-        held = tuple(item for item in objects if _is_explicitly_held(item.attributes))
-        if held:
-            focused = held
-        else:
-            non_person = tuple(
-                item for item in objects if item.canonical not in _HUMAN_CANONICALS
-            )
-            if len(non_person) != 1:
-                return False
-            focused = non_person
-    else:
-        focused = objects
-
-    normalized = " ".join(say.casefold().replace("’", "'").split())
-    named = tuple(
-        item
-        for item in focused
-        if any(
-            term and term in normalized
-            for term in (item.canonical.casefold(), item.label.casefold())
-        )
-    )
-    if len(named) != 1:
-        return False
-    return not _contradicts_visible_colors(say, named[0])
-
-
-def _is_hand_intent(visual_intent: str) -> bool:
-    normalized = " ".join(visual_intent.casefold().replace("_", " ").split())
-    return normalized == "spontaneous hand" or "holding" in normalized or "hand" in normalized
-
-
-def _is_explicitly_held(attributes: Sequence[str]) -> bool:
-    for attribute in attributes:
-        normalized = " ".join(attribute.casefold().replace("_", " ").split())
-        if "held" in normalized and "hand" in normalized:
-            return True
-        if normalized in ("held", "holding", "in hand", "in hands"):
-            return True
-    return False
-
-
-def _contradicts_visible_colors(say: str, item: ObservedObject) -> bool:
-    claimed = _colors_in(say)
-    if not claimed:
-        return False
-    supported = _colors_in(" ".join((item.label, *item.attributes)))
-    return not claimed <= supported
-
-
-def _colors_in(value: str) -> frozenset[str]:
-    colors = {word for word in re.findall(r"[a-z]+", value.casefold()) if word in _COLOR_WORDS}
-    if "grey" in colors:
-        colors.remove("grey")
-        colors.add("gray")
-    return frozenset(colors)
-
-
-def _observation_facts(observation: ValidatedObservation) -> ObservationResponse:
-    if isinstance(observation, ObservationEnvelope):
-        return observation.facts
-    if isinstance(observation, ObservationResponse):
-        return observation
-    raise TypeError("observation must contain validated facts")
-
-
-def _requires_fresh_visual(transcript: str) -> bool:
-    """Identify present visual questions without capturing historical recall."""
-
-    normalized = " ".join(transcript.casefold().replace("’", "'").split())
-    historical = (
-        "remember",
-        "yesterday",
-        "earlier",
-        "before",
-        "last time",
-        "did you see",
-        "did it look",
-        "what color was",
-        "what colour was",
-    )
-    if any(phrase in normalized for phrase in historical):
-        return False
-    current_scene = (
-        "look at this",
-        "look at that",
-        "take a look",
-        "what do you see",
-        "what can you see",
-        "what is in my hand",
-        "what's in my hand",
-        "what am i holding",
-        "what is this",
-        "what's this",
-        "what is that",
-        "what's that",
-    )
-    if any(phrase in normalized for phrase in current_scene):
-        return True
-    visual_detail = (
-        "what color",
-        "what colour",
-        "which color",
-        "which colour",
-        "what material",
-        "what is it made of",
-        "what does it look like",
-    )
-    return any(phrase in normalized for phrase in visual_detail)
 
 
 def _retry_after_seconds(value: object) -> float | None:
@@ -870,6 +746,8 @@ __all__ = [
     "OPENROUTER_URL",
     "OpenRouterBrainClient",
     "OpenRouterTransportError",
+    "ObservationEnvelope",
+    "ObservationOrigin",
     "ObservationUnavailableError",
     "PRIVATE_PROVIDER",
     "RecentExchange",
