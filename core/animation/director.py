@@ -156,7 +156,7 @@ class AnimationDirector:
         elif action.op is ActionOp.LIGHT:
             self._set_light(action.preset, action.pattern)  # type: ignore[arg-type]
         elif action.op is ActionOp.SFX:
-            self._effects.append(SfxCue(action.name))  # type: ignore[arg-type]
+            self._queue_sfx(action.name)  # type: ignore[arg-type]
         elif action.op is ActionOp.LOOK_AT:
             self._desired_target = action.target
         elif action.op is ActionOp.SCAN:
@@ -219,7 +219,7 @@ class AnimationDirector:
                 self._droop_due = None
                 self._runtime.start_gesture(GestureName.PERK_UP)
                 self._set_light(LightPreset.EXCITED_FLASH)
-                self._effects.append(SfxCue(SfxName.BOING))
+                self._queue_sfx(SfxName.BOING)
             else:
                 self._set_light(LightPreset.WARM_BRIGHT)
         elif state is BehaviorState.LISTENING:
@@ -230,7 +230,7 @@ class AnimationDirector:
             # away: Luxo keeps eye contact and shows thought mainly in light.
             self._desired_target = "person"
             self._set_light(LightPreset.THINKING_PULSE)
-            self._effects.append(SfxCue(SfxName.HMM))
+            self._queue_sfx(SfxName.HMM)
         elif state is BehaviorState.SPEAKING:
             self._desired_target = "person"
             self._set_light(LightPreset.WARM_BRIGHT)
@@ -244,6 +244,7 @@ class AnimationDirector:
             self._pending_inspection_motion = None
             self._runtime.set_inspection_motion(selected)
             self._inspection_motion = selected
+            self._queue_inspection_sfx(selected)
             self._set_light(LightPreset.CURIOUS_FOCUS)
         elif state is BehaviorState.DISENGAGING:
             self._notice_due = None
@@ -279,6 +280,7 @@ class AnimationDirector:
             return True
         self._runtime.set_inspection_motion(motion)
         self._inspection_motion = motion
+        self._queue_inspection_sfx(motion)
         return True
 
     def tick(self, snapshot: BlackboardSnapshot, now: float) -> AnimationSample:
@@ -339,6 +341,21 @@ class AnimationDirector:
         if selected is LightPattern.BLINK:
             self._runtime.start_punctuation_blink()
 
+    def _queue_inspection_sfx(self, motion: InspectionMotion) -> None:
+        """Bind one deterministic sound to each authored inspection entrance."""
+
+        if motion is InspectionMotion.REACH:
+            self._queue_sfx(SfxName.WHIRR_SHORT)
+        elif motion is InspectionMotion.SEARCHING:
+            self._queue_sfx(SfxName.CLICK)
+
+    def _queue_sfx(self, name: SfxName) -> None:
+        """Queue a cue once until the router drains this animation beat."""
+
+        cue = SfxCue(name)
+        if cue not in self._effects:
+            self._effects.append(cue)
+
     def _update_blink(self, now: float) -> None:
         if self._blink_restore is None:
             return
@@ -356,7 +373,7 @@ class AnimationDirector:
             self._notice_due = None
             self._desired_target = "person"
             self._set_light(LightPreset.WARM_BRIGHT)
-            self._effects.append(SfxCue(SfxName.CHIRP_UP))
+            self._queue_sfx(SfxName.CHIRP_UP)
         if self._droop_due is not None and now >= self._droop_due:
             self._droop_due = None
             self._runtime.start_gesture(GestureName.DROOP)
