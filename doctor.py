@@ -1333,9 +1333,8 @@ def check_api_key(
         "api key",
         f"{variable} is not set in this environment",
         (
-            f"export {variable} in the shell that launches the core, before ./run.sh",
-            "nothing loads it for you today: run.sh does not read the root .env, so a "
-            "key that lives only in that file will not reach the core",
+            f"put {variable} in the root .env, which ./run.sh reads before launch",
+            f"or export {variable} yourself if you start the core without ./run.sh",
             "the doctor never opens .env, and never prints, logs, or transmits the value",
         ),
     )
