@@ -59,6 +59,12 @@ Combined, and with ``actions.py`` line 141 replacing the bare executor tick::
 its only caller, exactly once per behaviour tick. The observation runtime ticks
 last so that one tick can both raise a blocker and begin servicing it.
 
+Two steps in that chain are conditional, and both conditions are stated with the
+constant that carries them: the router is skipped in ``PLAN_HELD_STATES``, and
+the observation runtime is skipped while its blocker is still waiting to be
+armed (see ``OBSERVATION_ARM_TIMEOUT_S`` below). Neither skip can strand
+anything, and both are pinned by checks.
+
 Capture ownership — the decision this module exists to make
 -----------------------------------------------------------
 
