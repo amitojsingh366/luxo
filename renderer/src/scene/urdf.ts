@@ -126,7 +126,7 @@ export async function loadLampRobot(): Promise<URDFRobot> {
   assertLampFacts(robot);
   enableLampShadows(robot);
 
-  robot.name = "lumen-lamp";
+  robot.name = "luxo-lamp";
   robot.position.set(0, 0, 0);
   robot.rotation.set(0, 0, 0);
   return robot;
@@ -138,7 +138,7 @@ export async function loadLampRobot(): Promise<URDFRobot> {
  */
 export function anchorLampBase(robot: URDFRobot): Group {
   const anchor = new Group();
-  anchor.name = "lumen-base-anchor";
+  anchor.name = "luxo-base-anchor";
   anchor.matrixAutoUpdate = false;
   anchor.updateMatrix();
   anchor.add(robot);

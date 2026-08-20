@@ -1,4 +1,4 @@
-"""Lumen's typed WebSocket protocol boundary."""
+"""Luxo's typed WebSocket protocol boundary."""
 
 from .messages import (
     AudioState,

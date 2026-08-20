@@ -134,14 +134,14 @@ export class LuxoBrowserRuntime {
     this.overlay.setConnectionStatus("connecting");
     const documentRef = root.ownerDocument;
     this.prompt = documentRef.createElement("section");
-    this.prompt.className = "lumen-start";
+    this.prompt.className = "luxo-start";
     this.prompt.setAttribute("aria-label", "Start Luxo sensors and audio");
     this.startButton = documentRef.createElement("button");
     this.startButton.type = "button";
-    this.startButton.className = "lumen-start__button";
+    this.startButton.className = "luxo-start__button";
     this.startButton.textContent = "Start Luxo";
     this.startStatus = documentRef.createElement("p");
-    this.startStatus.className = "lumen-start__status";
+    this.startStatus.className = "luxo-start__status";
     this.startStatus.setAttribute("role", "status");
     this.startStatus.setAttribute("aria-live", "polite");
     this.startStatus.textContent = "Camera, microphone, and audio wait for your gesture.";

@@ -7,7 +7,7 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 if [[ -x "$repo_dir/.venv/bin/python" ]]; then
   python_bin="$repo_dir/.venv/bin/python"
 elif ! python_bin="$(command -v python3)"; then
-  echo "python3 is required to start Lumen" >&2
+  echo "python3 is required to start Luxo" >&2
   exit 127
 fi
 

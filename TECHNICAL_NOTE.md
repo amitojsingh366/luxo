@@ -117,7 +117,7 @@ Look-at is analytic, not IK: `base_yaw + neck_yaw = α`, the neck leads by up to
 Target: clean Ubuntu 24.04, 4 cores, 8 GB, no GPU. Native `setup.sh` + venv +
 npm, **no Docker at runtime**. Venv is mandatory (PEP 668 blocks system pip on
 Noble), requirements pinned with hashes, whisper.cpp built CPU-only from source,
-models fetched to `~/.cache/lumen` with SHA256 verification, never committed.
+models fetched to `~/.cache/luxo` with SHA256 verification, never committed.
 Preflight splits in two: `doctor.py` (913 lines, 131 offline unit checks, injected
 probes, presence-only key handling) and a `/selftest` page exercising the real
 runtime path. `localhost` is a secure context: no TLS, no LAN bind.

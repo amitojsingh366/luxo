@@ -178,8 +178,8 @@ function addField(
   key: string,
   label: string,
 ): FieldElements {
-  const term = element(documentRef, "dt", "lumen-telemetry__label", label);
-  const value = element(documentRef, "dd", "lumen-telemetry__value", EMPTY_VALUE);
+  const term = element(documentRef, "dt", "luxo-telemetry__label", label);
+  const value = element(documentRef, "dd", "luxo-telemetry__value", EMPTY_VALUE);
   term.style.cssText = LABEL_STYLE;
   value.style.cssText = VALUE_STYLE;
   value.dataset.field = key;
@@ -198,17 +198,17 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
   private disposed = false;
 
   constructor(root: HTMLElement, documentRef: Document = root.ownerDocument) {
-    const panel = element(documentRef, "section", "lumen-telemetry");
-    const header = element(documentRef, "header", "lumen-telemetry__header");
-    const title = element(documentRef, "span", "lumen-telemetry__title", "LUXO TELEMETRY");
-    const connectionValue = element(documentRef, "span", "lumen-telemetry__connection");
+    const panel = element(documentRef, "section", "luxo-telemetry");
+    const header = element(documentRef, "header", "luxo-telemetry__header");
+    const title = element(documentRef, "span", "luxo-telemetry__title", "LUXO TELEMETRY");
+    const connectionValue = element(documentRef, "span", "luxo-telemetry__connection");
     const disconnectedBadge = element(
       documentRef,
       "div",
-      "lumen-telemetry__disconnected",
+      "luxo-telemetry__disconnected",
       "CORE DISCONNECTED",
     );
-    const grid = element(documentRef, "dl", "lumen-telemetry__grid");
+    const grid = element(documentRef, "dl", "luxo-telemetry__grid");
 
     panel.style.cssText = PANEL_STYLE;
     header.style.cssText = HEADER_STYLE;

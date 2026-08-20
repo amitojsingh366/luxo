@@ -11,8 +11,8 @@ Rate separation
 
 Three domains run in one process (PRD 4.4):
 
-* **10 Hz behaviour** — :meth:`LumenApp.tick_behavior`. Owns intent.
-* **120 Hz animation** — :meth:`LumenApp.tick_animation`. Owns motion and
+* **10 Hz behaviour** — :meth:`LuxoApp.tick_behavior`. Owns intent.
+* **120 Hz animation** — :meth:`LuxoApp.tick_animation`. Owns motion and
   performs no I/O of any kind (see below).
 * **60 Hz ``body_state``** — published from every second animation tick, so the
   body snapshot is always exactly one animation sample old and never
@@ -87,7 +87,7 @@ blocked on a frame that was never asked for again. Staleness handling
 component for the same reason.
 
 **The router's ``capture_callback`` therefore feeds the observation runtime, not
-the protocol.** It is the *arming* signal: :meth:`LumenApp._on_router_capture`
+the protocol.** It is the *arming* signal: :meth:`LuxoApp._on_router_capture`
 records the request id and never touches the socket. ``ObservationRuntime.tick``
 is withheld while the runtime is idle, a blocker exists, and that arming signal
 has not yet named the blocker's id. This preserves a real body-owned beat: when
@@ -118,7 +118,7 @@ to release.
 Cancellation is atomic across all three
 ---------------------------------------
 
-:meth:`LumenApp._cancel_engagement` runs the router transition, the
+:meth:`LuxoApp._cancel_engagement` runs the router transition, the
 conversation disengage, and the observation disengage as independent guarded
 steps. A failure in any one is logged and the rest still run, so a director that
 rejects a transition can never leave the plan queue, the speech staging, or the
@@ -696,7 +696,7 @@ class LatencyRecorder:
             self.last_latency_ms = record.stage_ms_end_to_end
 
 
-class LumenApp:
+class LuxoApp:
     """One assembled character: config, mind, body, transport, and clocks.
 
     Every collaborator is injectable so the whole assembly can be driven
@@ -1491,10 +1491,10 @@ def _check_rates(config: FrozenConfig) -> None:
             )
 
 
-def build_app(**kwargs: object) -> LumenApp:
+def build_app(**kwargs: object) -> LuxoApp:
     """Thin factory kept so ``core.main`` never reaches for private names."""
 
-    return LumenApp(**kwargs)  # type: ignore[arg-type]
+    return LuxoApp(**kwargs)  # type: ignore[arg-type]
 
 
 __all__ = [
@@ -1506,7 +1506,7 @@ __all__ = [
     "BODY_STATE_HZ",
     "CameraGeometry",
     "LatencyRecorder",
-    "LumenApp",
+    "LuxoApp",
     "NarrationSpeaker",
     "OBSERVATION_ARM_TIMEOUT_S",
     "PLAN_HELD_STATES",

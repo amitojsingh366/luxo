@@ -6,7 +6,7 @@ accepts body state from the core, but it makes no behavioral decisions.
 
 ## Model contract
 
-- `base_link` is held at the world origin by `lumen-base-anchor`; the URDF has
+- `base_link` is held at the world origin by `luxo-base-anchor`; the URDF has
   no world joint.
 - The source URDF and `assets/lamp_shade.stl` are imported with Vite `?url`
   assets. A `LoadingManager` URL modifier explicitly redirects the URDF's bare

@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "about": [
-    "Pinned asset manifest. setup.sh downloads these into ~/.cache/lumen (core)",
+    "Pinned asset manifest. setup.sh downloads these into ~/.cache/luxo (core)",
     "or renderer/public (browser), verifies SHA-256, and never commits weights.",
     "This file is JSON-compatible YAML for the same reason as config/default.yaml:",
     "JSON is a strict YAML subset, so the repo needs no YAML dependency. JSON has",
@@ -24,7 +24,7 @@
   "unverified_marker": "UNVERIFIED",
   "destinations": {
     "core_cache": {
-      "root": "~/.cache/lumen",
+      "root": "~/.cache/luxo",
       "note": "PRD 12.1. Core-side weights, outside the repo, never committed."
     },
     "browser_public": {
@@ -40,7 +40,7 @@
       "consumer_detail": "WhisperCppSpeechToText model_path. _MODEL_NAME accepts ggml-base.en-q5_0.bin or ggml-base.en-q5_1.bin.",
       "destination": {
         "layout": "core_cache",
-        "path": "~/.cache/lumen/ggml-base.en-q5_1.bin",
+        "path": "~/.cache/luxo/ggml-base.en-q5_1.bin",
         "served_at": null
       },
       "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en-q5_1.bin",
@@ -52,7 +52,7 @@
       "size_note": "57 MiB",
       "license": "MIT",
       "license_source": "https://huggingface.co/ggerganov/whisper.cpp - repo card license: mit. OpenAI Whisper weights are MIT and the ggml conversion is published under the whisper.cpp MIT licence.",
-      "verify_command": "sha256sum ~/.cache/lumen/ggml-base.en-q5_1.bin   # macOS: shasum -a 256 ~/.cache/lumen/ggml-base.en-q5_1.bin",
+      "verify_command": "sha256sum ~/.cache/luxo/ggml-base.en-q5_1.bin   # macOS: shasum -a 256 ~/.cache/luxo/ggml-base.en-q5_1.bin",
       "notes": "PRD 2 names base.en Q5. The canonical repo publishes ONLY q5_1 for base.en - there is no ggml-base.en-q5_0.bin in ggerganov/whisper.cpp, so q5_1 is the approved q5 variant and is what stt.py's regex must match. Build whisper.cpp from source with CPU-only flags per PRD 12.3; the binary is not an asset in this manifest."
     },
     {
@@ -62,7 +62,7 @@
       "consumer_detail": "PiperTextToSpeech model_path, loaded through onnxruntime (PRD 12.3 pip path, not a prebuilt Linux binary).",
       "destination": {
         "layout": "core_cache",
-        "path": "~/.cache/lumen/en_US-lessac-medium.onnx",
+        "path": "~/.cache/luxo/en_US-lessac-medium.onnx",
         "served_at": null
       },
       "url": "https://huggingface.co/rhasspy/piper-voices/resolve/f5a6e9094787fd865d65cb024472f977f9c542b5/en/en_US/lessac/medium/en_US-lessac-medium.onnx",
@@ -74,7 +74,7 @@
       "size_note": "60 MiB",
       "license": "Blizzard Challenge 2013 Lessac corpus licence",
       "license_source": "https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html - cited by the voice's own MODEL_CARD at the pinned commit.",
-      "verify_command": "sha256sum ~/.cache/lumen/en_US-lessac-medium.onnx   # macOS: shasum -a 256 ~/.cache/lumen/en_US-lessac-medium.onnx",
+      "verify_command": "sha256sum ~/.cache/luxo/en_US-lessac-medium.onnx   # macOS: shasum -a 256 ~/.cache/luxo/en_US-lessac-medium.onnx",
       "notes": "OWNER ACTION: this is a research-corpus licence, not a permissive one. It is fine for a recorded challenge demo but must be reviewed before any commercial or redistributed use. Permissively-licensed alternatives were checked: en_US-ryan-medium is CC BY-NC-SA 4.0 (also non-commercial) and en_US-amy-medium's MODEL_CARD says only 'See URL'. No clearly permissive 22.05 kHz espeak-type en_US voice was found.",
       "voice": {
         "phoneme_type": "espeak",
@@ -94,7 +94,7 @@
       "consumer_detail": "tts.load_piper_metadata and phonemes.load_voice_phoneme_config both read this file. It carries phoneme_id_map, phoneme_type, espeak.voice, and the noise scales.",
       "destination": {
         "layout": "core_cache",
-        "path": "~/.cache/lumen/en_US-lessac-medium.onnx.json",
+        "path": "~/.cache/luxo/en_US-lessac-medium.onnx.json",
         "served_at": null
       },
       "url": "https://huggingface.co/rhasspy/piper-voices/resolve/f5a6e9094787fd865d65cb024472f977f9c542b5/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json",
@@ -106,7 +106,7 @@
       "size_note": "4.8 KiB",
       "license": "Blizzard Challenge 2013 Lessac corpus licence",
       "license_source": "https://www.cstr.ed.ac.uk/projects/blizzard/2013/lessac_blizzard2013/license.html - inherits the voice's licence.",
-      "verify_command": "sha256sum ~/.cache/lumen/en_US-lessac-medium.onnx.json   # macOS: shasum -a 256 ~/.cache/lumen/en_US-lessac-medium.onnx.json",
+      "verify_command": "sha256sum ~/.cache/luxo/en_US-lessac-medium.onnx.json   # macOS: shasum -a 256 ~/.cache/luxo/en_US-lessac-medium.onnx.json",
       "notes": "Verified content at this digest: audio.sample_rate 22050, phoneme_type espeak, espeak.voice en-us, num_symbols 256, num_speakers 1, phoneme_map {}, and a 154-entry phoneme_id_map whose special symbols are _ = 0, ^ = 1, $ = 2, space = 3. Every key in that map is a single codepoint, so multi-codepoint handling in phonemes.py is defensive rather than exercised by this voice."
     },
     {

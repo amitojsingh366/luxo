@@ -567,8 +567,8 @@ def _first_string(entry: Mapping[str, Any], keys: Sequence[str]) -> str | None:
 def _entry_path(entry: Mapping[str, Any], keys: Sequence[str] = MANIFEST_PATH_KEYS) -> str | None:
     """Read the destination path, accepting a bare string or a nested mapping.
 
-    ``{"destination": "~/.cache/lumen/x.bin"}`` and
-    ``{"destination": {"layout": "core_cache", "path": "~/.cache/lumen/x.bin"}}``
+    ``{"destination": "~/.cache/luxo/x.bin"}`` and
+    ``{"destination": {"layout": "core_cache", "path": "~/.cache/luxo/x.bin"}}``
     both yield the same path. Only the ``path`` member of the mapping is read;
     ``layout`` and ``served_at`` are consumed by setup.sh and the renderer.
     """
@@ -838,7 +838,7 @@ VERDICT_MALFORMED = "malformed"
 
 _MISSING_FILE_HELP = (
     "./setup.sh downloads model assets and verifies their sha256",
-    "weights live under ~/.cache/lumen and are never committed",
+    "weights live under ~/.cache/luxo and are never committed",
 )
 _MISSING_DIRECTORY_HELP = (
     "./setup.sh stages this directory and verifies every file the manifest requires",

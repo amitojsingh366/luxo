@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://lumen.local/schema/messages.schema.json",
-  "title": "LumenTextMessage",
-  "description": "The complete JSON text-frame protocol for the Lumen body/mind WebSocket.",
+  "$id": "https://luxo.local/schema/messages.schema.json",
+  "title": "LuxoTextMessage",
+  "description": "The complete JSON text-frame protocol for the Luxo body/mind WebSocket.",
   "oneOf": [
     { "$ref": "#/$defs/HelloMessage" },
     { "$ref": "#/$defs/GazeMessage" },

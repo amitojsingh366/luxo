@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Lumen setup — clean Ubuntu 24.04 LTS (4 cores, 8 GB, no GPU) is the target;
+# Luxo setup — clean Ubuntu 24.04 LTS (4 cores, 8 GB, no GPU) is the target;
 # macOS is supported as the development platform and degrades where apt cannot
 # apply.  PRD 12.1 and 12.3.
 #
@@ -13,14 +13,14 @@
 #                        Python externally managed, so system pip is blocked)
 #   4. whisper.cpp       built from source at a pinned commit, CPU-only flags
 #   5. model assets      parsed out of config/models.yaml, downloaded to
-#                        ~/.cache/lumen and renderer/public, SHA-256 verified
+#                        ~/.cache/luxo and renderer/public, SHA-256 verified
 #   6. renderer          npm ci, stage the browser-side assets, vite build
 #
 # What this script deliberately never does:
 #
 #   * It never reads, prints, copies, or commits the root .env or any API key.
 #     Loading .env is run.sh's job.  There is not one reference to it below.
-#   * It never commits model weights.  Core weights live in ~/.cache/lumen,
+#   * It never commits model weights.  Core weights live in ~/.cache/luxo,
 #     outside the repo entirely.  Browser weights are staged into
 #     renderer/public and are checked against .gitignore at the end of the run
 #     (see check_ignored) rather than assumed to be covered.
@@ -34,13 +34,13 @@
 # skipped when they are already correct.
 #
 # Environment overrides (all optional):
-#   LUMEN_PYTHON            path to the CPython 3.12 interpreter to build .venv
-#   LUMEN_NODE_MAJOR        Node major line to install on Linux (default 22)
-#   LUMEN_WHISPER_REF       whisper.cpp tag to build (default below)
-#   LUMEN_WHISPER_COMMIT    commit that tag must resolve to; "" disables the check
-#   LUMEN_SKIP_APT=1        skip the system-package step entirely
-#   LUMEN_FORCE_DOWNLOAD=1  re-download every asset even if it already verifies
-#   LUMEN_GGML_NATIVE=OFF   build whisper.cpp without -march=native
+#   LUXO_PYTHON            path to the CPython 3.12 interpreter to build .venv
+#   LUXO_NODE_MAJOR        Node major line to install on Linux (default 22)
+#   LUXO_WHISPER_REF       whisper.cpp tag to build (default below)
+#   LUXO_WHISPER_COMMIT    commit that tag must resolve to; "" disables the check
+#   LUXO_SKIP_APT=1        skip the system-package step entirely
+#   LUXO_FORCE_DOWNLOAD=1  re-download every asset even if it already verifies
+#   LUXO_GGML_NATIVE=OFF   build whisper.cpp without -march=native
 
 set -Eeuo pipefail
 
@@ -53,13 +53,13 @@ repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # whisper.cpp.  The tag is what we fetch; the commit is what we assert we got,
 # which makes a mutable tag behave like an immutable pin without needing the
 # server to support fetching a bare SHA.
-whisper_ref="${LUMEN_WHISPER_REF:-v1.9.2}"
-whisper_commit="${LUMEN_WHISPER_COMMIT-306c88f4d1286aec1bf96e544632897886af5501}"
+whisper_ref="${LUXO_WHISPER_REF:-v1.9.2}"
+whisper_commit="${LUXO_WHISPER_COMMIT-306c88f4d1286aec1bf96e544632897886af5501}"
 whisper_repo="https://github.com/ggml-org/whisper.cpp.git"
 
 # Vite 8 declares engines.node "^20.19.0 || >=22.12.0" (renderer/package-lock.json).
 # Ubuntu 24.04's apt nodejs is 18.x and does NOT satisfy that — see ensure_node.
-node_major="${LUMEN_NODE_MAJOR:-22}"
+node_major="${LUXO_NODE_MAJOR:-22}"
 nodesource_key_url="https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key"
 nodesource_keyring="/usr/share/keyrings/nodesource.gpg"
 nodesource_list="/etc/apt/sources.list.d/nodesource.list"
@@ -72,7 +72,7 @@ python_series="3.12"
 
 manifest_path="$repo_dir/config/models.yaml"
 venv_dir="$repo_dir/.venv"
-cache_dir="${HOME}/.cache/lumen"
+cache_dir="${HOME}/.cache/luxo"
 whisper_src_dir="$cache_dir/whisper.cpp"
 whisper_bin_dir="$cache_dir/bin"
 whisper_bin="$whisper_bin_dir/whisper-cli"
@@ -268,8 +268,8 @@ install_system_packages_macos() {
 }
 
 install_system_packages() {
-  if [[ "${LUMEN_SKIP_APT:-0}" == "1" ]]; then
-    info "LUMEN_SKIP_APT=1, skipping system packages"
+  if [[ "${LUXO_SKIP_APT:-0}" == "1" ]]; then
+    info "LUXO_SKIP_APT=1, skipping system packages"
     return 0
   fi
   if is_linux; then
@@ -413,7 +413,7 @@ interpreter_series() {
 
 select_python() {
   local candidate series
-  for candidate in "${LUMEN_PYTHON:-}" "python${python_series}" python3; do
+  for candidate in "${LUXO_PYTHON:-}" "python${python_series}" python3; do
     [[ -n "$candidate" ]] || continue
     have "$candidate" || continue
     series="$(interpreter_series "$candidate")"
@@ -429,7 +429,7 @@ select_python() {
     other series has nothing to match and pip fails obscurely.
       sudo apt-get install -y python${python_series} python${python_series}-venv   # Ubuntu 24.04 ships it
       brew install python@${python_series}                                        # macOS
-    Or point at one directly: LUMEN_PYTHON=/path/to/python${python_series} ./setup.sh"
+    Or point at one directly: LUXO_PYTHON=/path/to/python${python_series} ./setup.sh"
 }
 
 create_venv() {
@@ -531,8 +531,8 @@ build_whisper() {
     head="$(git -C "$whisper_src_dir" rev-parse HEAD)"
     [[ "$head" == "$whisper_commit" ]] \
       || die "whisper.cpp $whisper_ref resolved to $head but the pin expects $whisper_commit;
-    the tag moved, or the pin is stale. Verify upstream, then set LUMEN_WHISPER_COMMIT
-    (or LUMEN_WHISPER_COMMIT= to disable the assertion) before re-running."
+    the tag moved, or the pin is stale. Verify upstream, then set LUXO_WHISPER_COMMIT
+    (or LUXO_WHISPER_COMMIT= to disable the assertion) before re-running."
   fi
 
   # CPU-only build.  PRD 12.3: provide a CPU-only flag path and do not assume
@@ -542,7 +542,7 @@ build_whisper() {
   #   GGML_CUDA / VULKAN     off: the deploy box has no GPU
   #   GGML_BLAS              off: no external BLAS is installed and none is needed
   #   GGML_NATIVE            on: this builds on the machine that will run it.
-  #                          Set LUMEN_GGML_NATIVE=OFF when building elsewhere,
+  #                          Set LUXO_GGML_NATIVE=OFF when building elsewhere,
   #                          or the binary can die on an illegal instruction.
   local -a cmake_flags
   cmake_flags=(
@@ -550,7 +550,7 @@ build_whisper() {
     -B "$whisper_src_dir/build"
     -DCMAKE_BUILD_TYPE=Release
     -DBUILD_SHARED_LIBS=OFF
-    -DGGML_NATIVE="${LUMEN_GGML_NATIVE:-ON}"
+    -DGGML_NATIVE="${LUXO_GGML_NATIVE:-ON}"
     -DGGML_CUDA=OFF
     -DGGML_VULKAN=OFF
     -DGGML_BLAS=OFF
@@ -732,7 +732,7 @@ fetch_file_asset() {
   mkdir -p "$dest_dir"
 
   # Idempotence: a file already on disk that matches its pin is left alone.
-  if [[ -f "$dest" && "${LUMEN_FORCE_DOWNLOAD:-0}" != "1" ]]; then
+  if [[ -f "$dest" && "${LUXO_FORCE_DOWNLOAD:-0}" != "1" ]]; then
     actual_size="$(size_of "$dest")"
     actual_sha="$(sha256_of "$dest")"
     if [[ "$want_sha" != "$unverified_marker" ]]; then
@@ -743,7 +743,7 @@ fetch_file_asset() {
       die "$name: $dest is on disk but its sha256 does not match the manifest
     expected $want_sha
     found    $actual_sha
-    Delete the file and re-run, or set LUMEN_FORCE_DOWNLOAD=1."
+    Delete the file and re-run, or set LUXO_FORCE_DOWNLOAD=1."
     fi
     if [[ -z "$want_size" || "$actual_size" == "$want_size" ]]; then
       info "$name: present (size matches; digest unpinned)"
@@ -948,7 +948,7 @@ main() {
   notes_file="$work_dir/notes"
   : >"$notes_file"
 
-  printf 'Lumen setup — %s, repo at %s\n' "$os_name" "$repo_dir"
+  printf 'Luxo setup — %s, repo at %s\n' "$os_name" "$repo_dir"
   [[ -f "$manifest_path" ]] || die "config/models.yaml is missing; it is the asset manifest this script reads"
   [[ -f "$repo_dir/requirements.txt" ]] || die "requirements.txt is missing"
 

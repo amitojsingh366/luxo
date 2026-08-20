@@ -65,7 +65,7 @@ README does not repeat it.
 | An OpenRouter API key | Exported as `OPENROUTER_API_KEY` in the shell that launches the core. `doctor.py` probes for presence only and never reads, prints, or transmits the value. |
 
 whisper.cpp is built from source, CPU-only, and is not vendored here. Core-side
-model weights live outside the repository, in `~/.cache/lumen`. Browser-side
+model weights live outside the repository, in `~/.cache/luxo`. Browser-side
 assets are staged into `renderer/public/` at setup time. Neither set is
 committed — see the note under [Repository layout](#repository-layout) about a
 gap in `.gitignore` coverage.

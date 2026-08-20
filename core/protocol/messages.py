@@ -1,4 +1,4 @@
-"""Typed parsing and serialization for Lumen WebSocket frames.
+"""Typed parsing and serialization for Luxo WebSocket frames.
 
 JSON Schema is the validation source of truth.  This module implements the
 small JSON Schema subset used by ``schema/messages.schema.json`` with only the

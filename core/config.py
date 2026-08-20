@@ -121,7 +121,7 @@ _EXPECTED_ENUMS: dict[str, tuple[str, ...]] = {
 
 
 def load_config(path: str | Path | None = None) -> FrozenConfig:
-    """Load, validate, and recursively freeze a Lumen configuration file."""
+    """Load, validate, and recursively freeze a Luxo configuration file."""
 
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     try:

@@ -62,13 +62,13 @@ function buildStage(root: HTMLElement): {
   canvas: HTMLCanvasElement;
   status: HTMLDivElement;
 } {
-  const stage = makeElement("div", "lumen-stage");
-  const canvas = makeElement("canvas", "lumen-canvas");
-  const vignette = makeElement("div", "lumen-vignette");
-  const brand = makeElement("div", "lumen-brand");
-  const name = makeElement("span", "lumen-brand__name");
-  const state = makeElement("span", "lumen-brand__state");
-  const status = makeElement("div", "lumen-status");
+  const stage = makeElement("div", "luxo-stage");
+  const canvas = makeElement("canvas", "luxo-canvas");
+  const vignette = makeElement("div", "luxo-vignette");
+  const brand = makeElement("div", "luxo-brand");
+  const name = makeElement("span", "luxo-brand__name");
+  const state = makeElement("span", "luxo-brand__state");
+  const status = makeElement("div", "luxo-status");
 
   name.textContent = "Luxo";
   state.textContent = "Browser body · 5 DOF";
