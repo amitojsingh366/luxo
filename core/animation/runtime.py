@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import math
 import re
 
 from core.animation import JointVector
-from core.animation.gestures import GestureController
+from core.animation.gestures import GestureController, SearchingController
 from core.animation.layers import IdleLayer, LayerMixer, LayerSample, LightCommand
 from core.animation.lookat import LookAtSolver, LookAtTarget
 from core.animation.output_stage import OutputStage
@@ -44,6 +45,14 @@ class AnimationDiscontinuityError(ValueError):
     """Raised when a tick is not exactly one fixed step after its predecessor."""
 
 
+class InspectionMotion(str, Enum):
+    """Body-owned presentation within the closed INSPECTING FSM state."""
+
+    OFF = "off"
+    REACH = "inspecting"
+    SEARCHING = "searching"
+
+
 @dataclass(frozen=True, slots=True)
 class LookAtFact:
     """Fresh local geometry fact; it is not a model-authored action."""
@@ -76,7 +85,7 @@ class AnimationSample:
     velocities: JointVector
     light: LightCommand
     clamps: ClampCounts
-    active_motion: GestureName | PostureName | None
+    active_motion: GestureName | PostureName | InspectionMotion | None
     look_target: str | None
     requested_posture: PostureName | None
     speaking: bool
@@ -98,13 +107,14 @@ class AnimationRuntime:
         self._look_solver = LookAtSolver()
         self._gestures = GestureController(poses)
         self._inspection = GestureController(poses)
+        self._searching = SearchingController()
         self._output = OutputStage(SpringBank())
 
         self._last_now: float | None = None
         self._look_fact: LookAtFact | None = None
         self._pending_motion: GestureName | PostureName | None = None
         self._pending_cancel = False
-        self._pending_inspection: bool | None = None
+        self._pending_inspection: InspectionMotion | None = None
         self._posture_name: PostureName | None = PostureName.REST
         self._posture_owned_by_look = False
         self._speech_amplitude = 0.0
@@ -146,7 +156,16 @@ class AnimationRuntime:
 
         if not isinstance(active, bool):
             raise TypeError("active must be a boolean")
-        self._pending_inspection = active
+        self._pending_inspection = (
+            InspectionMotion.REACH if active else InspectionMotion.OFF
+        )
+
+    def set_inspection_motion(self, motion: InspectionMotion) -> None:
+        """Select a body-owned inspection presentation for the next tick."""
+
+        if not isinstance(motion, InspectionMotion):
+            raise TypeError("motion must be an InspectionMotion")
+        self._pending_inspection = motion
 
     def set_look_at_target(self, target: LookAtTarget, observed_at: float) -> None:
         """Set a timestamped local target fact without accepting model angles."""
@@ -207,6 +226,7 @@ class AnimationRuntime:
         self._look_solver.reset()
         self._gestures = GestureController(self._poses)
         self._inspection = GestureController(self._poses)
+        self._searching.reset()
         self._output.reset(self._poses.home)
 
     def tick(self, snapshot: BlackboardSnapshot, now: float) -> AnimationSample:
@@ -250,6 +270,8 @@ class AnimationRuntime:
 
         gesture_sample = self._gestures.sample(timestamp)
         gesture = LayerSample(joints=gesture_sample.offsets)
+        searching_sample = self._searching.sample(timestamp)
+        searching = LayerSample(joints=searching_sample.offsets)
         light = LayerSample(light=self._light_command())
         speech = LayerSample(
             joints=JointVector(
@@ -267,7 +289,7 @@ class AnimationRuntime:
         )
 
         summed = self._mixer.sum(
-            (home, idle, gaze, gesture, inspection, light, speech)
+            (home, idle, gaze, gesture, inspection, searching, light, speech)
         )
         output = self._output.emit(summed.joints, FIXED_DT)
         self._last_now = timestamp
@@ -279,10 +301,13 @@ class AnimationRuntime:
             velocities=output.velocities,
             light=summed.light,
             clamps=output.clamps,
-            # INSPECTING is a held physical overlay and is the state cue the
-            # telemetry must expose even while a prior posture is still
-            # settling underneath it.
-            active_motion=self._inspection.active or self._gestures.active,
+            # Inspection presentations are physical overlays and remain the
+            # state cue even while a prior posture settles underneath them.
+            active_motion=(
+                InspectionMotion.SEARCHING
+                if self._searching.active
+                else self._inspection.active or self._gestures.active
+            ),
             look_target=look_target,
             requested_posture=requested_posture,
             speaking=self._speaking,
@@ -320,13 +345,18 @@ class AnimationRuntime:
         self._pending_cancel = False
 
     def _apply_pending_inspection(self, now: float) -> None:
-        active = self._pending_inspection
-        if active is None:
+        motion = self._pending_inspection
+        if motion is None:
             return
-        if active:
+        if motion is InspectionMotion.REACH:
+            self._searching.cancel(now)
             self._inspection.start(GestureName.LEAN_IN, now, hold=True)
+        elif motion is InspectionMotion.SEARCHING:
+            self._inspection.cancel(now)
+            self._searching.start(now)
         else:
             self._inspection.cancel(now)
+            self._searching.cancel(now)
         self._pending_inspection = None
 
     def _fresh_look_fact(self, now: float) -> LookAtFact | None:
@@ -398,6 +428,7 @@ __all__ = [
     "AnimationRuntime",
     "AnimationSample",
     "FIXED_DT",
+    "InspectionMotion",
     "LOOK_TARGET_MAX_AGE_S",
     "LookAtFact",
     "PUNCTUATION_BLINK_DURATION_S",

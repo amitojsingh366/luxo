@@ -15,6 +15,7 @@ from core.animation.runtime import (
     AnimationDiscontinuityError,
     AnimationRuntime,
     AnimationSample,
+    InspectionMotion,
 )
 from core.blackboard import BlackboardSnapshot
 from core.brain.schema import (
@@ -114,7 +115,7 @@ class AnimationDirector:
         self._notice_due: float | None = None
         self._droop_due: float | None = None
         self._thinking_dip = False
-        self._inspecting_reach = False
+        self._inspection_motion = InspectionMotion.OFF
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore: tuple[LightPreset, LightPattern] | None = None
         self._blink_started_at: float | None = None
@@ -175,9 +176,12 @@ class AnimationDirector:
         self._last_transition = transition
         state = transition.current
         self._thinking_dip = state is BehaviorState.THINKING
-        if self._inspecting_reach and state is not BehaviorState.INSPECTING:
-            self._runtime.set_inspection_reach(False)
-            self._inspecting_reach = False
+        if (
+            self._inspection_motion is not InspectionMotion.OFF
+            and state is not BehaviorState.INSPECTING
+        ):
+            self._runtime.set_inspection_motion(InspectionMotion.OFF)
+            self._inspection_motion = InspectionMotion.OFF
 
         if state is BehaviorState.DORMANT:
             self._notice_due = None
@@ -222,8 +226,8 @@ class AnimationDirector:
             # defaults to the live person/hand ray rather than a fixed pose.
             if self._desired_target is None:
                 self._desired_target = "person"
-            self._runtime.set_inspection_reach(True)
-            self._inspecting_reach = True
+            self._runtime.set_inspection_motion(InspectionMotion.REACH)
+            self._inspection_motion = InspectionMotion.REACH
             self._set_light(LightPreset.CURIOUS_FOCUS)
         elif state is BehaviorState.DISENGAGING:
             self._notice_due = None
@@ -232,6 +236,23 @@ class AnimationDirector:
             self._runtime.clear_look_at_target()
             self._set_light(LightPreset.COOL_DIM)
             self._droop_due = transition.t + FIXED_DT
+        return True
+
+    def set_inspection_motion(self, motion: InspectionMotion) -> bool:
+        """Apply fresh observation presentation evidence to INSPECTING only."""
+
+        if not isinstance(motion, InspectionMotion):
+            raise TypeError("motion must be an InspectionMotion")
+        inspecting = (
+            self._last_transition is not None
+            and self._last_transition.current is BehaviorState.INSPECTING
+        )
+        if motion is not InspectionMotion.OFF and not inspecting:
+            return False
+        if motion is self._inspection_motion:
+            return True
+        self._runtime.set_inspection_motion(motion)
+        self._inspection_motion = motion
         return True
 
     def tick(self, snapshot: BlackboardSnapshot, now: float) -> AnimationSample:
@@ -266,7 +287,7 @@ class AnimationDirector:
         self._notice_due = None
         self._droop_due = None
         self._thinking_dip = False
-        self._inspecting_reach = False
+        self._inspection_motion = InspectionMotion.OFF
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore = None
         self._blink_started_at = None

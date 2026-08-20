@@ -88,6 +88,7 @@ ObservationResolver = Callable[
 ]
 ResolutionCallback = Callable[[ObservationOrigin, PlanResponse], bool]
 BaselineObjects = Callable[[], Sequence[ObservationPrior]]
+PresentationCallback = Callable[["ObservationPresentation"], None]
 
 
 class ObservationStage(str, Enum):
@@ -98,6 +99,14 @@ class ObservationStage(str, Enum):
     REQUESTED = "requested"
     ANALYZING = "analyzing"
     RESOLVING = "resolving"
+
+
+class ObservationPresentation(str, Enum):
+    """Typed body cue derived from the active fresh-observation lifecycle."""
+
+    IDLE = "idle"
+    INSPECTING = "inspecting"
+    SEARCHING = "searching"
 
 
 class FrameRejection(str, Enum):
@@ -172,6 +181,7 @@ class ObservationRuntime:
         capture_callback: CaptureCallback,
         resolver: ObservationResolver,
         resolution_callback: ResolutionCallback,
+        presentation_callback: PresentationCallback | None = None,
         clock: Callable[[], float] = time.monotonic,
         executor: Executor | None = None,
     ) -> None:
@@ -184,6 +194,8 @@ class ObservationRuntime:
         )
         if not all(callable(item) for item in callbacks):
             raise TypeError("observation runtime callbacks must be callable")
+        if presentation_callback is not None and not callable(presentation_callback):
+            raise TypeError("presentation_callback must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._fsm = fsm
@@ -193,6 +205,7 @@ class ObservationRuntime:
         self._capture_callback = capture_callback
         self._resolver = resolver
         self._resolution_callback = resolution_callback
+        self._presentation_callback = presentation_callback
         self._clock = clock
         self._last_clock = _clock_value(clock())
         self._executor = executor or ThreadPoolExecutor(
@@ -222,6 +235,7 @@ class ObservationRuntime:
         self._pending_origin: ObservationOrigin | None = None
         self._active_origin: ObservationOrigin | None = None
         self._origin_recent: tuple[RecentExchange, ...] = ()
+        self._presentation = ObservationPresentation.IDLE
 
     @property
     def status(self) -> ObservationStatus:
@@ -448,6 +462,7 @@ class ObservationRuntime:
         self._capture_due_at = (
             cue_started + INSPECTION_CUE_S if already_inspecting else None
         )
+        self._set_presentation_locked(ObservationPresentation.INSPECTING)
         # Dialogue observations enter INSPECTING directly from the typed cloud
         # result so the physical lean-in precedes this capture. Spontaneous
         # observations still begin in ACTING and need the ordinary event.
@@ -508,6 +523,22 @@ class ObservationRuntime:
         self._observations_completed += 1
         comparison = compute_observation_missing(self._baseline, response)
         self._last_missing = comparison.missing_labels
+        # ``focus`` is the schema's typed answer to "which visible object best
+        # answers this exact origin?" A dialogue frame with no focus and a
+        # stable-id absence is therefore a genuine search case. This uses no
+        # local English classifier, and a present focused object keeps the
+        # ordinary forward inspection reach even if unrelated history changed.
+        searching = (
+            self._active_origin is not None
+            and self._active_origin.kind == "dialogue"
+            and response.focus is None
+            and bool(comparison.missing)
+        )
+        self._set_presentation_locked(
+            ObservationPresentation.SEARCHING
+            if searching
+            else ObservationPresentation.INSPECTING
+        )
         LOGGER.info(
             "SCENE comparison=%s",
             json.dumps(
@@ -680,6 +711,7 @@ class ObservationRuntime:
         """Abandon the observation, clearing both sides in one lock hold."""
 
         self._generation += 1
+        self._set_presentation_locked(ObservationPresentation.IDLE)
         self._completions.clear()
         future, self._future = self._future, None
         if future is not None:
@@ -700,6 +732,24 @@ class ObservationRuntime:
         self._pending_origin = None
         self._active_origin = None
         self._origin_recent = ()
+
+    def _set_presentation_locked(
+        self, presentation: ObservationPresentation
+    ) -> None:
+        """Publish one typed cosmetic cue without risking the blocker."""
+
+        if presentation is self._presentation:
+            return
+        self._presentation = presentation
+        callback = self._presentation_callback
+        if callback is None:
+            return
+        try:
+            callback(presentation)
+        except Exception:
+            # Presentation is never allowed to fault capture, memory, speech,
+            # or the exact request-id lifecycle.
+            LOGGER.exception("observation presentation callback failed")
 
     def _fault_locked(self, reason: str, *, announce_complete: bool) -> None:
         LOGGER.error("observation runtime cleared both sides after %s", reason)
@@ -744,6 +794,8 @@ __all__ = [
     "FrameRejection",
     "MAX_CAPTURE_ATTEMPTS",
     "ObservationResolver",
+    "ObservationPresentation",
+    "PresentationCallback",
     "ResolutionCallback",
     "ObservationRuntime",
     "ObservationStage",

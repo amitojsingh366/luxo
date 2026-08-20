@@ -56,6 +56,22 @@ _INSPECTION_HEAD_OFFSET: Final = (
     _INSPECTION_SHOULDER_OFFSET + _INSPECTION_ELBOW_OFFSET
 )
 
+# A missing subject must read as looking around, not as a negative head shake.
+# This body-owned layer leaves the engaged arm silhouette alone and searches
+# with the two real yaw joints plus a small pitch variation.  The totals stay
+# deliberately modest so a live person target can keep moving underneath it.
+_SEARCH_RIGHT: Final = JointVector(
+    base_yaw=0.16,
+    neck_yaw=0.24,
+    head_pitch=-0.04,
+)
+_SEARCH_LEFT: Final = JointVector(
+    base_yaw=-0.16,
+    neck_yaw=-0.24,
+    head_pitch=0.025,
+)
+SEARCH_HOLD_SECONDS: Final = 0.35
+
 
 @dataclass(frozen=True, slots=True)
 class GestureKeyframe:
@@ -309,6 +325,92 @@ class GestureController:
         return self._settled
 
 
+class SearchingController:
+    """Loop a curious engaged-pose search until the observation resolves.
+
+    The first move uses the same anticipation and mass-ordered arrival compiler
+    as every authored gesture.  A right-left-right cycle then loops from two
+    identical endpoint poses, so even a long cloud round trip has no seam.
+    Cancellation blends every participating joint back to zero.
+    """
+
+    __slots__ = ("_active", "_canceling", "_started_at", "_timeline")
+
+    def __init__(self) -> None:
+        self._active = False
+        self._canceling = False
+        self._started_at = 0.0
+        self._timeline: _Timeline | None = None
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def start(self, now: float) -> None:
+        checked_now = _time(now)
+        if self._active and not self._canceling:
+            return
+        current = self._sample_offset(checked_now)
+        frames = tuple(
+            GestureKeyframe(target, SEARCH_HOLD_SECONDS)
+            for target in (_SEARCH_RIGHT, _SEARCH_LEFT, _SEARCH_RIGHT)
+        )
+        self._timeline = _compile(
+            current,
+            frames,
+            _SEARCH_RIGHT,
+            release=False,
+        )
+        self._started_at = checked_now
+        self._active = True
+        self._canceling = False
+
+    def cancel(self, now: float) -> None:
+        checked_now = _time(now)
+        if not self._active:
+            return
+        current = self._sample_offset(checked_now)
+        self._timeline = _release(current, JointVector())
+        self._started_at = checked_now
+        self._canceling = True
+
+    def reset(self) -> None:
+        self._active = False
+        self._canceling = False
+        self._started_at = 0.0
+        self._timeline = None
+
+    def sample(self, now: float) -> GestureSample:
+        checked_now = _time(now)
+        offsets = self._sample_offset(checked_now)
+        return GestureSample(offsets, not self._active)
+
+    def _sample_offset(self, now: float) -> JointVector:
+        timeline = self._timeline
+        if not self._active or timeline is None:
+            return JointVector()
+        elapsed = max(0.0, now - self._started_at)
+        duration = timeline.timing.duration
+        if self._canceling:
+            if elapsed + 1e-12 >= duration:
+                self.reset()
+                return JointVector()
+            return timeline.at(elapsed)
+
+        # Beat zero ends on the right-hand pose. Beats one and two return from
+        # right -> left -> right, making that suffix a continuous loop.
+        first_beat_end = (
+            ANTICIPATION_SECONDS
+            + MOVE_SECONDS
+            + (len(MASS_ORDER) - 1) * ARRIVAL_STAGGER_SECONDS
+            + SEARCH_HOLD_SECONDS
+        )
+        if elapsed > duration:
+            loop_duration = duration - first_beat_end
+            elapsed = first_beat_end + (elapsed - first_beat_end) % loop_duration
+        return timeline.at(elapsed)
+
+
 def _compile(
     initial: JointVector,
     frames: tuple[GestureKeyframe, ...],
@@ -441,5 +543,7 @@ __all__ = [
     "GestureSample",
     "JointArrival",
     "MotionTiming",
+    "SEARCH_HOLD_SECONDS",
+    "SearchingController",
     "UnknownMotionError",
 ]
