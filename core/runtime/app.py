@@ -1588,7 +1588,6 @@ __all__ = [
     "ANIMATION_HZ",
     "AROUSAL_BY_STATE",
     "AppStatus",
-    "DemoReset",
     "BEHAVIOR_HZ",
     "BODY_STATE_EVERY_N_TICKS",
     "BODY_STATE_HZ",
