@@ -78,8 +78,6 @@ MAX_RECENT: Final = 3
 MAX_SPEECH_ATTEMPTS: Final = 3
 SPEECH_RETRY_BACKOFF_S: Final = 0.25
 DEFAULT_WORKERS: Final = 2
-HELD_OBJECT_ATTRIBUTE: Final = "held in hand"
-
 SpeakCallback = Callable[[SpeakBeginMessage | SpeakEndMessage], None]
 PcmCallback = Callable[[bytes], None]
 MilestoneCallback = Callable[[Milestone, float], None]
@@ -237,7 +235,6 @@ class ConversationCoordinator:
         self._future: Future[object] | None = None
         self._vad_start: float | None = None
         self._transcript: str | None = None
-        self._fresh_observation_required = False
         self._reply: str | None = None
         self._recent: deque[RecentExchange] = deque(maxlen=MAX_RECENT)
         self._envelope: tuple[float, ...] = ()
@@ -556,7 +553,6 @@ class ConversationCoordinator:
         except Exception as error:
             self._stage = Stage.IDLE
             self._vad_start = None
-            self._fresh_observation_required = False
             self._last_error = type(error).__name__
             return False
         self._future = future
@@ -601,14 +597,6 @@ class ConversationCoordinator:
             return
         now = self._now()
         self._transcript = _line(result.text)
-        snapshot = self._blackboard.snapshot()
-        gaze = snapshot.gaze
-        self._fresh_observation_required = (
-            gaze.hands_present and gaze.hand_conf >= 0.5
-        ) or any(
-            record.present and HELD_OBJECT_ATTRIBUTE in record.attributes
-            for record in snapshot.scene_memory
-        )
         LOGGER.info("CHAT human: %s", _log_text(self._transcript))
         self._stage = Stage.TRANSCRIBED
         self._blackboard.publish_utterance(UtteranceFact(now, self._transcript))
@@ -630,19 +618,6 @@ class ConversationCoordinator:
             fallback = True
             self._last_error = type(error).__name__
         observes = bool(reply.plan and reply.plan[-1].op is ActionOp.OBSERVE)
-        guarded = self._fresh_observation_required and not fallback
-        if guarded and not observes:
-            # This is a sensor/state safety gate, not an English intent
-            # classifier. A currently visible hand or a still-present object
-            # last observed in-hand means the camera scene can change between
-            # dialogue turns. The cloud still authors the plan and final
-            # answer, but its direct scene claim cannot bypass a fresh frame.
-            plan = tuple(
-                action for action in reply.plan if action.op is not ActionOp.OBSERVE
-            ) + (Action(ActionOp.OBSERVE),)
-            reply = PlanResponse(reply.say, plan)
-            observes = True
-            LOGGER.info("BRAIN fresh observation enforced by live hand state")
         say = _line(reply.say)
         if observes and self._observation_origin_callback is not None:
             origin = ObservationOrigin("dialogue", self._transcript or "")
@@ -657,11 +632,6 @@ class ConversationCoordinator:
                 # and all non-capture actions.
                 reply = PlanResponse(reply.say, reply.plan[:-1])
                 observes = False
-                if guarded:
-                    reply = PlanResponse(FALLBACK_SAY, reply.plan)
-                    say = FALLBACK_SAY
-                    fallback = True
-                    self._last_error = "fresh_observation_unavailable"
         if not say and not observes:
             # Blank conversational speech is Piper-invalid. A terminal observe
             # is routed structurally above and never reaches Piper, so its blank
@@ -693,7 +663,6 @@ class ConversationCoordinator:
         if not observes:
             self._recent.append(RecentExchange(self._transcript or "", say))
         self._transcript = None
-        self._fresh_observation_required = False
         self._reply = None if observes else say
         self._unprompted = False
         self._stage = Stage.IDLE if observes else Stage.REPLIED
@@ -881,7 +850,6 @@ class ConversationCoordinator:
             future.cancel()
         self._stage = Stage.IDLE
         self._transcript = None
-        self._fresh_observation_required = False
         self._reply = None
         self._unprompted = False
         self._vad_start = None
