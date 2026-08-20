@@ -25,10 +25,10 @@ export type JointPositions = Readonly<Record<BodyJointName, number>>;
 
 export const REST_JOINTS: JointPositions = Object.freeze({
   base_yaw: 0,
-  shoulder_pitch: 0.35,
-  elbow_pitch: -0.75,
+  shoulder_pitch: 0.654,
+  elbow_pitch: -1.265,
   neck_yaw: 0,
-  head_pitch: 0.25,
+  head_pitch: -0.044,
 });
 
 export const LAMP_URDF_URL = lampUrdfUrl;
