@@ -32,7 +32,8 @@ from .logging_setup import configure_logging
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "lumen"
-DEFAULT_WHISPER_BINARY = DEFAULT_CACHE_DIR / "whisper.cpp" / "build" / "bin" / "whisper-cli"
+# setup.sh copies the binary out of the build tree into <cache>/bin.
+DEFAULT_WHISPER_BINARY = DEFAULT_CACHE_DIR / "bin" / "whisper-cli"
 DEFAULT_WHISPER_MODEL = DEFAULT_CACHE_DIR / "ggml-base.en-q5_1.bin"
 DEFAULT_PIPER_MODEL = DEFAULT_CACHE_DIR / "en_US-lessac-medium.onnx"
 DEFAULT_PIPER_CONFIG = DEFAULT_CACHE_DIR / "en_US-lessac-medium.onnx.json"
