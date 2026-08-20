@@ -32,7 +32,8 @@ MASS_ORDER: Final = JOINT_NAMES
 # belong in live animation.  Shoulder and elbow define the silhouette exactly.
 # A quarter of the editor's base turn gives the body a readable twist without
 # consuming the live solver's yaw range; neck cancels it so emitter azimuth is
-# unchanged.  Head pitch cancels the arm-pitch delta for the same reason.
+# unchanged. After the pi flip, emitter elevation is head minus shoulder and
+# elbow, so the head follows the arm-pitch delta with the same sign.
 _REFERENCE_ENGAGED_SHOULDER: Final = 0.654
 _REFERENCE_ENGAGED_ELBOW: Final = -1.265
 _REFERENCE_ENGAGED_BASE: Final = 2.600
@@ -51,7 +52,7 @@ _INSPECTION_ELBOW_OFFSET: Final = (
     _REFERENCE_INSPECTING_ELBOW - _REFERENCE_ENGAGED_ELBOW
 )
 _INSPECTION_NECK_OFFSET: Final = -_INSPECTION_BASE_OFFSET
-_INSPECTION_HEAD_OFFSET: Final = -(
+_INSPECTION_HEAD_OFFSET: Final = (
     _INSPECTION_SHOULDER_OFFSET + _INSPECTION_ELBOW_OFFSET
 )
 

@@ -7,8 +7,11 @@ direction from ``light_emitter_link`` to the render camera or another world
 target; ``camera_link`` is not the aiming frame.
 
 This is deliberately not inverse kinematics. Base and neck share azimuth while
-the neck leads and exponentially recentres. Unreachable elevation asks the
-gesture layer for a whole-body posture. There is no roll joint to author.
+the neck leads and exponentially recentres. The pitch solution does include
+the two upstream arm joints: after the pi flip, emitter elevation in the
+positive-down convention is ``head - shoulder - elbow``. Unreachable elevation
+asks the gesture layer for a whole-body posture. There is no roll joint to
+author.
 """
 
 from __future__ import annotations
@@ -89,9 +92,14 @@ class LookAtSolver:
         composition. All inputs are validated before state changes.
         """
 
-        target_name, raw_azimuth, elevation, current_base, current_heading = (
-            _validated_inputs(target, current, dt)
-        )
+        (
+            target_name,
+            raw_azimuth,
+            elevation,
+            current_base,
+            current_heading,
+            arm_pitch,
+        ) = _validated_inputs(target, current, dt)
 
         if self._target is None:
             unwrapped_azimuth = current_heading + _wrapped_delta(
@@ -126,7 +134,7 @@ class LookAtSolver:
         self._unwrapped_azimuth_rad = unwrapped_azimuth
         self._lead_rad = lead
 
-        head_pitch, posture = _elevation_solution(elevation)
+        head_pitch, posture = _elevation_solution(elevation, arm_pitch)
         return LookAtSolution(
             offsets=JointVector(
                 base_yaw=unwrapped_azimuth - lead - current.base_yaw,
@@ -141,7 +149,7 @@ def _validated_inputs(
     target: LookAtTarget,
     current: JointVector,
     dt: float,
-) -> tuple[str, float, float, float, float]:
+) -> tuple[str, float, float, float, float, float]:
     if not isinstance(target, LookAtTarget):
         raise TypeError("target must be a LookAtTarget")
     if not isinstance(target.target, str) or not target.target:
@@ -165,7 +173,17 @@ def _validated_inputs(
     current_heading = values[0] + values[3]
     if not isfinite(current_heading):
         raise ValueError("current base and neck heading must be finite")
-    return target.target, raw_azimuth, elevation, values[0], current_heading
+    arm_pitch = values[1] + values[2]
+    if not isfinite(arm_pitch):
+        raise ValueError("current shoulder and elbow pitch must be finite")
+    return (
+        target.target,
+        raw_azimuth,
+        elevation,
+        values[0],
+        current_heading,
+        arm_pitch,
+    )
 
 
 def _finite(value: float, label: str) -> float:
@@ -186,12 +204,17 @@ def _wrapped_delta(target: float, reference: float) -> float:
 
 def _elevation_solution(
     elevation: float,
+    arm_pitch: float,
 ) -> tuple[float, PostureName | None]:
-    if elevation > _HEAD_PITCH_MAX:
+    # URDF order is Ry(shoulder) * Ry(elbow) * Rz(pi) * Ry(head).
+    # Therefore the emitter's positive-down elevation is head - shoulder -
+    # elbow, and the absolute head target must carry the upstream arm pitch.
+    required_head_pitch = elevation + arm_pitch
+    if required_head_pitch > _HEAD_PITCH_MAX:
         return _HEAD_PITCH_MAX, PostureName.STOOP
-    if elevation < _HEAD_PITCH_MIN:
+    if required_head_pitch < _HEAD_PITCH_MIN:
         return _HEAD_PITCH_MIN, PostureName.CRANE
-    return elevation, None
+    return required_head_pitch, None
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:

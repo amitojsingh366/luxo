@@ -224,9 +224,13 @@ class AnimationRuntime:
         self._apply_pending_inspection(timestamp)
         home = LayerSample(joints=self._poses.home)
         idle = self._idle.sample(snapshot, timestamp)
-        pre_gaze = self._mixer.sum((home, idle))
         inspection_sample = self._inspection.sample(timestamp)
         inspection = LayerSample(joints=inspection_sample.offsets)
+        # Inspection changes both upstream pitch joints while the camera/model
+        # round trip is in flight. Include that live reach sample in the
+        # kinematic foundation so gaze keeps the emitter on the target through
+        # anticipation, staggered arrivals, and the held owner silhouette.
+        pre_gaze = self._mixer.sum((home, idle, inspection))
 
         gaze = LayerSample()
         requested_posture: PostureName | None = None
