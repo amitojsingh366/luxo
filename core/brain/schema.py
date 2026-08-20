@@ -139,6 +139,7 @@ class ObservedObject:
 class ObservationResponse:
     present: tuple[str, ...]
     new: tuple[ObservedObject, ...]
+    known: tuple[ObservedObject, ...] = ()
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -219,21 +220,34 @@ def parse_plan_response(payload: RawPayload) -> PlanResponse:
     return PlanResponse(say=say, plan=tuple(actions))
 
 
-def parse_observation_response(payload: RawPayload) -> ObservationResponse:
+def parse_observation_response(
+    payload: RawPayload,
+    *,
+    require_known: bool = False,
+) -> ObservationResponse:
     """Validate an ``observe`` response containing facts and no dialogue.
 
-    Unknown top-level and object keys, including a stray ``say``, are ignored.
-    Invalid individual labels or objects are logged and dropped so remaining
-    perception facts stay usable.
+    Unknown top-level and object keys are ignored, except dialogue keys: an
+    observation containing dialogue is invalid and must take the client's one
+    repair path. ``known`` is a backward-compatible extension carrying fresh
+    details for prior objects that remain visible.
     """
 
     root = _payload_object(payload, "observation")
+    forbidden = {"say", "plan", "dialogue"}.intersection(root)
+    if forbidden:
+        raise ResponseSchemaError(
+            f"observation response must not contain dialogue keys {sorted(forbidden)!r}"
+        )
     if "present" not in root or "new" not in root:
         raise ResponseSchemaError("observation response requires 'present' and 'new'")
+    if require_known and "known" not in root:
+        raise ResponseSchemaError("observation response requires 'known'")
     raw_present = root["present"]
     raw_new = root["new"]
-    if not isinstance(raw_present, list) or not isinstance(raw_new, list):
-        raise ResponseSchemaError("observation 'present' and 'new' must be arrays")
+    raw_known = root.get("known", [])
+    if not all(isinstance(value, list) for value in (raw_present, raw_new, raw_known)):
+        raise ResponseSchemaError("observation 'present', 'new', and 'known' must be arrays")
 
     present: list[str] = []
     seen_labels: set[str] = set()
@@ -247,15 +261,39 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
             seen_labels.add(label)
             present.append(label)
 
-    new: list[ObservedObject] = []
-    for index, raw_object in enumerate(raw_new):
-        try:
-            new.append(_parse_observed_object(raw_object))
-        except (TypeError, ValueError) as error:
-            LOGGER.warning("dropping invalid new object at index %d: %s", index, error)
+    new = _observed_objects(raw_new, "new")
     if raw_new and not new:
         raise ResponseSchemaError("observation contained no valid new objects")
-    return ObservationResponse(present=tuple(present), new=tuple(new))
+    known = _observed_objects(raw_known, "known")
+    if raw_known and not known:
+        raise ResponseSchemaError("observation contained no valid known objects")
+    known_by_canonical = {item.canonical: item for item in known}
+    if require_known:
+        missing_details = [label for label in present if label not in known_by_canonical]
+        if missing_details:
+            raise ResponseSchemaError(
+                f"observation known is missing current facts for {missing_details!r}"
+            )
+    return ObservationResponse(
+        present=tuple(present),
+        new=tuple(new),
+        known=tuple(known),
+    )
+
+
+def _observed_objects(values: list[object], field: str) -> list[ObservedObject]:
+    objects: list[ObservedObject] = []
+    seen: set[str] = set()
+    for index, raw_object in enumerate(values):
+        try:
+            item = _parse_observed_object(raw_object)
+        except (TypeError, ValueError) as error:
+            LOGGER.warning("dropping invalid %s object at index %d: %s", field, index, error)
+            continue
+        if item.canonical not in seen:
+            seen.add(item.canonical)
+            objects.append(item)
+    return objects
 
 
 def _payload_object(payload: RawPayload, kind: str) -> JsonObject:

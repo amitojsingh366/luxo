@@ -225,11 +225,16 @@ def _memory_candidates(
 
     prior = {record.canonical: record for record in existing}
     present = frozenset(response.present)
-    candidates = [
-        replace(record, last_seen=observed_at, present=True)
-        for record in existing
-        if record.canonical in present
-    ]
+    refreshed = {item.canonical: item for item in response.known}
+    candidates: list[SceneObject] = []
+    for record in existing:
+        if record.canonical not in present:
+            continue
+        current = refreshed.get(record.canonical)
+        if current is None:
+            candidates.append(replace(record, last_seen=observed_at, present=True))
+        else:
+            candidates.append(_new_candidate(current, 0, observed_at, prior))
     claimed = {record.canonical for record in candidates}
 
     for index, item in enumerate(response.new):
@@ -246,6 +251,15 @@ def _observation_log(response: ObservationResponse) -> str:
     return json.dumps(
         {
             "present": list(response.present),
+            "known": [
+                {
+                    "label": item.label,
+                    "canonical": item.canonical,
+                    "attributes": list(item.attributes),
+                    "bbox_norm": list(item.bbox_norm),
+                }
+                for item in response.known
+            ],
             "new": [
                 {
                     "label": item.label,
