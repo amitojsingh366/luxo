@@ -659,6 +659,7 @@ class LuxoApp:
             plan_executor=self._plans,
             observations=self._observation_coordinator,
             baseline_objects=self._baseline_objects,
+            requested_objects=self._requested_objects,
             # The single owner of outbound capture_frame.
             capture_callback=self._send_capture_frame,
             resolver=lambda origin, observation, missing, recent: brain.resolve_observation(
@@ -1067,10 +1068,16 @@ class LuxoApp:
         origin: ObservationOrigin,
         recent: tuple[RecentExchange, ...],
         presentation: ObservationPresentation,
+        memory_refs: tuple[str, ...],
     ) -> bool:
         """Bind the exact cloud-approved dialogue turn without interpreting it."""
 
-        return self._observations.bind_origin(origin, recent, presentation)
+        return self._observations.bind_origin(
+            origin,
+            recent,
+            presentation,
+            memory_refs,
+        )
 
     def _on_observation_resolution(
         self,
@@ -1130,6 +1137,29 @@ class LuxoApp:
             )
             for record in self._blackboard.snapshot().scene_memory
             if record.present
+        )
+
+    def _requested_objects(
+        self, object_ids: tuple[str, ...]
+    ) -> tuple[ObservationPrior, ...]:
+        """Return exact cloud-referenced records, including absent history.
+
+        The typed converse result has already restricted these ids to the
+        compact memory supplied on that call.  Re-reading the blackboard keeps
+        the lookup local and lets a current visibility check compare the new
+        frame with the specific remembered object without reintroducing every
+        absent record into unrelated observations.
+        """
+
+        requested = set(object_ids)
+        return tuple(
+            ObservationPrior(
+                record.id,
+                record.canonical,
+                cloud_safe_attributes(record.attributes),
+            )
+            for record in self._blackboard.snapshot().scene_memory
+            if record.id in requested
         )
 
     def _resolve_look_target(

@@ -97,6 +97,7 @@ ObservationResolver = Callable[
 ]
 ResolutionCallback = Callable[[ObservationOrigin, PlanResponse], bool]
 BaselineObjects = Callable[[], Sequence[ObservationPrior]]
+RequestedObjects = Callable[[tuple[str, ...]], Sequence[ObservationPrior]]
 PresentationCallback = Callable[["ObservationPresentation"], None]
 
 
@@ -177,7 +178,9 @@ class ObservationRuntime:
 
     ``baseline_objects`` is read on the tick and must therefore be cheap and
     non-blocking. Wire it to the blackboard's mirrored scene memory, never to a
-    disk load.
+    disk load. ``requested_objects`` resolves only the validated ids selected
+    by the cloud for this dialogue, including durable records already absent
+    from the live baseline.
     """
 
     def __init__(
@@ -190,6 +193,7 @@ class ObservationRuntime:
         capture_callback: CaptureCallback,
         resolver: ObservationResolver,
         resolution_callback: ResolutionCallback,
+        requested_objects: RequestedObjects | None = None,
         presentation_callback: PresentationCallback | None = None,
         clock: Callable[[], float] = time.monotonic,
         executor: Executor | None = None,
@@ -205,12 +209,15 @@ class ObservationRuntime:
             raise TypeError("observation runtime callbacks must be callable")
         if presentation_callback is not None and not callable(presentation_callback):
             raise TypeError("presentation_callback must be callable")
+        if requested_objects is not None and not callable(requested_objects):
+            raise TypeError("requested_objects must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._fsm = fsm
         self._plans = plan_executor
         self._observations = observations
         self._baseline_objects = baseline_objects
+        self._requested_objects = requested_objects
         self._capture_callback = capture_callback
         self._resolver = resolver
         self._resolution_callback = resolution_callback
@@ -243,6 +250,7 @@ class ObservationRuntime:
         self._last_error: str | None = None
         self._pending_origin: ObservationOrigin | None = None
         self._active_origin: ObservationOrigin | None = None
+        self._pending_memory_refs: tuple[str, ...] = ()
         self._pending_presentation = ObservationPresentation.INSPECTING
         self._active_presentation = ObservationPresentation.INSPECTING
         self._origin_recent: tuple[RecentExchange, ...] = ()
@@ -361,6 +369,7 @@ class ObservationRuntime:
         origin: ObservationOrigin,
         recent: Sequence[RecentExchange] = (),
         presentation: ObservationPresentation = ObservationPresentation.INSPECTING,
+        memory_refs: Sequence[str] = (),
     ) -> bool:
         """Bind one cloud-approved dialogue intent to the next blocker.
 
@@ -377,6 +386,12 @@ class ObservationRuntime:
             raise TypeError("recent must contain RecentExchange values")
         if not isinstance(presentation, ObservationPresentation):
             raise TypeError("presentation must be an ObservationPresentation")
+        if isinstance(memory_refs, (str, bytes)):
+            raise TypeError("memory_refs must be a sequence of object ids")
+        refs = tuple(memory_refs)
+        if not all(isinstance(value, str) for value in refs):
+            raise TypeError("memory_refs must contain object ids")
+        refs = tuple(dict.fromkeys(refs))
         if origin.kind != "dialogue":
             LOGGER.info("refusing non-dialogue observation origin: %s", origin.kind)
             return False
@@ -390,6 +405,7 @@ class ObservationRuntime:
                 return False
             self._pending_origin = origin
             self._pending_presentation = presentation
+            self._pending_memory_refs = refs
             self._origin_recent = exchanges[-3:]
             # The cloud has already selected a structural plan. Publishing its
             # body-owned interpretation now lets the director queue the cue
@@ -404,6 +420,7 @@ class ObservationRuntime:
             pending = self._pending_origin is not None or self._active_origin is not None
             self._pending_origin = None
             self._active_origin = None
+            self._pending_memory_refs = ()
             self._pending_presentation = ObservationPresentation.INSPECTING
             self._active_presentation = ObservationPresentation.INSPECTING
             self._origin_recent = ()
@@ -448,7 +465,7 @@ class ObservationRuntime:
             self._fault_locked("unbound_observation", announce_complete=False)
             return
         try:
-            baseline = self._baseline_snapshot()
+            baseline = self._baseline_snapshot(self._pending_memory_refs)
         except Exception as error:
             self._fault_locked(type(error).__name__, announce_complete=False)
             return
@@ -488,6 +505,7 @@ class ObservationRuntime:
         self._baseline = request.prior
         self._active_origin = self._pending_origin
         self._pending_origin = None
+        self._pending_memory_refs = ()
         self._active_presentation = self._pending_presentation
         self._pending_presentation = ObservationPresentation.INSPECTING
         self._attempts = 0
@@ -701,7 +719,9 @@ class ObservationRuntime:
             return False
         return self._plans.pending_observation_id == request_id
 
-    def _baseline_snapshot(self) -> tuple[ObservationPrior, ...]:
+    def _baseline_snapshot(
+        self, memory_refs: tuple[str, ...] = ()
+    ) -> tuple[ObservationPrior, ...]:
         objects = self._baseline_objects()
         if isinstance(objects, (str, bytes, bytearray)) or not isinstance(
             objects, Sequence
@@ -710,7 +730,26 @@ class ObservationRuntime:
         result = tuple(objects)
         if not all(isinstance(item, ObservationPrior) for item in result):
             raise TypeError("baseline_objects must contain ObservationPrior values")
-        return result
+        if not memory_refs or self._requested_objects is None:
+            return result
+        requested = self._requested_objects(memory_refs)
+        if isinstance(requested, (str, bytes, bytearray)) or not isinstance(
+            requested, Sequence
+        ):
+            raise TypeError(
+                "requested_objects must return a sequence of ObservationPrior values"
+            )
+        requested_result = tuple(requested)
+        if not all(isinstance(item, ObservationPrior) for item in requested_result):
+            raise TypeError("requested_objects must contain ObservationPrior values")
+        allowed = set(memory_refs)
+        merged = list(result)
+        seen = {item.id for item in merged}
+        for item in requested_result:
+            if item.id in allowed and item.id not in seen:
+                merged.append(item)
+                seen.add(item.id)
+        return tuple(merged)
 
     def _now_locked(self) -> float:
         """Read one finite, nonnegative, monotonic injected-clock value."""
@@ -745,6 +784,7 @@ class ObservationRuntime:
         self._stale_frame_expected = False
         self._pending_origin = None
         self._active_origin = None
+        self._pending_memory_refs = ()
         self._pending_presentation = ObservationPresentation.INSPECTING
         self._active_presentation = ObservationPresentation.INSPECTING
         self._origin_recent = ()
@@ -773,6 +813,7 @@ class ObservationRuntime:
         self._inspecting = False
         self._pending_origin = None
         self._active_origin = None
+        self._pending_memory_refs = ()
         self._pending_presentation = ObservationPresentation.INSPECTING
         self._active_presentation = ObservationPresentation.INSPECTING
         self._origin_recent = ()
@@ -848,6 +889,7 @@ __all__ = [
     "ObservationResolver",
     "ObservationPresentation",
     "PresentationCallback",
+    "RequestedObjects",
     "ResolutionCallback",
     "ObservationRuntime",
     "ObservationStage",
