@@ -144,13 +144,28 @@ check cannot deadlock against each other.
 The animation tick and I/O
 --------------------------
 
-:meth:`tick_animation` calls only: a blackboard snapshot, two pure amplitude
-lookups, the director's fixed step, and ``publish_body_state``, which swaps an
-immutable snapshot under a short lock and returns. It never serializes, never
-touches the event loop, never reads a file, and never takes the router, FSM,
-conversation, or observation lock. Telemetry it needs from other domains
-(behaviour state name, last latency) is cached as a plain attribute by the
-domain that owns it.
+:meth:`tick_animation` calls only: a blackboard snapshot, two speech-envelope
+lookups, the director's fixed step, and ``publish_body_state``. It never
+serializes a message, never touches the event loop, never opens a file, never
+submits a worker job, and never calls a model.
+
+Being precise about the locks it does take, because "no I/O" is not the same as
+"no waiting":
+
+* the **director lock**, held for the fixed step, contended only by the 10 Hz
+  behaviour tick doing pure in-memory routing;
+* the **blackboard lock**, for one snapshot;
+* the **app state lock**, for counters and the cached state name;
+* the **conversation and narration locks**, for ``speaking`` and
+  ``speech_amplitude``. Both read two fields and return; the speech worker holds
+  the conversation lock only across a chunk enqueue, never across Piper
+  synthesis, which happens outside it.
+
+Every one of those is a bounded in-memory critical section. It never takes the
+router, FSM, observation, or plan-executor lock at all. Telemetry it needs from
+the behaviour domain (state name, arousal, last latency) is cached as a plain
+attribute by the domain that owns it, so the 120 Hz tick never waits on the
+10 Hz one to read it.
 """
 
 from __future__ import annotations
@@ -1362,13 +1377,23 @@ class LumenApp:
                 publish = self._animation_step % BODY_STATE_EVERY_N_TICKS == 0
 
         if publish:
-            self._publish_body_state(sample, snapshot, now)
+            self._publish_body_state(sample, snapshot, now, speaking=speaking)
         return sample
 
     def _publish_body_state(
-        self, sample: AnimationSample, snapshot: BlackboardSnapshot, now: float
+        self,
+        sample: AnimationSample,
+        snapshot: BlackboardSnapshot,
+        now: float,
+        *,
+        speaking: bool,
     ) -> None:
-        """Swap one immutable 60 Hz snapshot into the transport, nothing more."""
+        """Swap one immutable 60 Hz snapshot into the transport, nothing more.
+
+        ``speaking`` is the value the caller already read for the speech-bob
+        amplitude. Reusing it keeps the published flag and the head bob
+        describing the same instant, and halves the lock traffic.
+        """
 
         gaze = snapshot.gaze
         with self._lock:
@@ -1392,10 +1417,7 @@ class LumenApp:
                 pattern=sample.light.pattern,  # type: ignore[arg-type]
                 bloom=sample.light.bloom,
             ),
-            audio=AudioState(
-                speaking=self._conversation.speaking or self._narration.speaking,
-                arousal=arousal,
-            ),
+            audio=AudioState(speaking=speaking, arousal=arousal),
             telemetry=TelemetryState(
                 state=state_name.value,  # type: ignore[arg-type]
                 plan_depth=len(snapshot.plan_queue),
