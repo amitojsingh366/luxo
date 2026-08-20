@@ -380,6 +380,9 @@ def _asks_current_visual_question(transcript: str) -> bool:
     if any(phrase in normalized for phrase in historical):
         return False
     current = (
+        "look at this",
+        "look at that",
+        "take a look",
         "what do you see",
         "what can you see",
         "what is in my hand",
@@ -1240,8 +1243,8 @@ class LuxoApp:
         """Stage the observation runtime's narration as an unprompted line.
 
         ``ConversationCoordinator.speak`` is the whole hop: the line is put in
-        the same slot a brain reply occupies and the next behaviour tick
-        dispatches it through the same worker, synthesis, wire validation, raw
+        the same slot a brain reply occupies and immediately submits it through
+        the same worker, synthesis, wire validation, raw
         prefix-free PCM delivery and ``speak_begin``/``speak_end`` pair. Nothing
         about narration reaches the transport from here.
 
@@ -1276,7 +1279,7 @@ class LuxoApp:
             with self._lock:
                 self._narrations_dropped += 1
             return
-        if self._conversation.speak(say):
+        if self._conversation.speak(say, dispatch=True):
             with self._lock:
                 self._narrations_spoken += 1
             return
@@ -1293,7 +1296,7 @@ class LuxoApp:
             with self._lock:
                 self._narrations_dropped += 1
             return
-        if self._conversation.speak(say):
+        if self._conversation.speak(say, dispatch=True):
             with self._lock:
                 self._narrations_spoken += 1
             return

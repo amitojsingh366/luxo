@@ -24,6 +24,9 @@ SAY_MAX_CHARACTERS = 120
 WAIT_MAX_MS = 60_000
 """Longest model-selected hold: one minute prevents accidental stalls."""
 
+BBOX_EDGE_TOLERANCE = 0.025
+"""Maximum normalized edge overflow clipped as vision-model rounding noise."""
+
 _SAFE_OBJECT_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _CANONICAL_SEPARATOR = re.compile(r"[\s_-]+")
 _CANONICAL_LABEL = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)*\Z")
@@ -267,13 +270,6 @@ def parse_observation_response(
     known = _observed_objects(raw_known, "known")
     if raw_known and not known:
         raise ResponseSchemaError("observation contained no valid known objects")
-    known_by_canonical = {item.canonical: item for item in known}
-    if require_known:
-        missing_details = [label for label in present if label not in known_by_canonical]
-        if missing_details:
-            raise ResponseSchemaError(
-                f"observation known is missing current facts for {missing_details!r}"
-            )
     return ObservationResponse(
         present=tuple(present),
         new=tuple(new),
@@ -483,7 +479,27 @@ def _bbox(value: object) -> tuple[float, float, float, float]:
     if not all(0.0 <= part <= 1.0 for part in numbers):
         if (x, y, width, height) == numbers:
             raise ValueError("bbox_norm values must be between 0 and 1")
-    if width <= 0 or height <= 0 or x + width > 1.0 or y + height > 1.0:
+    right = x + width
+    bottom = y + height
+    if width > 0 and height > 0 and x >= 0 and y >= 0 and right <= 1.0 and bottom <= 1.0:
+        return x, y, width, height
+    if (
+        width > 0
+        and height > 0
+        and -BBOX_EDGE_TOLERANCE <= x <= 1.0 + BBOX_EDGE_TOLERANCE
+        and -BBOX_EDGE_TOLERANCE <= y <= 1.0 + BBOX_EDGE_TOLERANCE
+        and -BBOX_EDGE_TOLERANCE <= right <= 1.0 + BBOX_EDGE_TOLERANCE
+        and -BBOX_EDGE_TOLERANCE <= bottom <= 1.0 + BBOX_EDGE_TOLERANCE
+    ):
+        left = min(1.0, max(0.0, x))
+        top = min(1.0, max(0.0, y))
+        clipped_right = min(1.0, max(0.0, right))
+        clipped_bottom = min(1.0, max(0.0, bottom))
+        clipped_width = clipped_right - left
+        clipped_height = clipped_bottom - top
+        if clipped_width > 0 and clipped_height > 0:
+            return left, top, clipped_width, clipped_height
+    if width <= 0 or height <= 0 or right > 1.0 or bottom > 1.0:
         raise ValueError("bbox_norm must describe a positive box inside the frame")
     return x, y, width, height
 
@@ -498,6 +514,7 @@ def _required_finite_number(value: object, field: str) -> float:
 __all__ = [
     "Action",
     "ActionOp",
+    "BBOX_EDGE_TOLERANCE",
     "GestureName",
     "LightPattern",
     "LightPreset",
