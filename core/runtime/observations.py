@@ -362,7 +362,13 @@ class ObservationRuntime:
         recent: Sequence[RecentExchange] = (),
         presentation: ObservationPresentation = ObservationPresentation.INSPECTING,
     ) -> bool:
-        """Bind one typed cloud-approved origin and body cue to the next blocker."""
+        """Bind one cloud-approved dialogue intent to the next blocker.
+
+        Startup probes and passive sensor events may use ``scene_event`` as
+        provenance elsewhere, but they cannot authorize character motion or a
+        camera capture.  Only the conversation coordinator can supply the
+        exact user dialogue paired with a typed visual intent.
+        """
 
         if not isinstance(origin, ObservationOrigin):
             raise TypeError("origin must be an ObservationOrigin")
@@ -371,6 +377,9 @@ class ObservationRuntime:
             raise TypeError("recent must contain RecentExchange values")
         if not isinstance(presentation, ObservationPresentation):
             raise TypeError("presentation must be an ObservationPresentation")
+        if origin.kind != "dialogue":
+            LOGGER.info("refusing non-dialogue observation origin: %s", origin.kind)
+            return False
         with self._lock:
             if (
                 self._closed
@@ -495,8 +504,7 @@ class ObservationRuntime:
         )
         self._set_presentation_locked(self._active_presentation)
         # Dialogue observations enter INSPECTING directly from the typed cloud
-        # result so the physical lean-in precedes this capture. Spontaneous
-        # observations still begin in ACTING and need the ordinary event.
+        # result so the physical lean-in precedes this capture.
         if not already_inspecting:
             self._fsm.post_event(BehaviorEvent.OBSERVE_START)
 
