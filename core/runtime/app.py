@@ -392,7 +392,18 @@ def target_angles(
 
 @dataclass(frozen=True, slots=True)
 class AppStatus:
-    """Immutable diagnostic view; carries no transcript, image, or plan text."""
+    """Immutable diagnostic view; carries no transcript, image, or plan text.
+
+    ``narrations_spoken`` counts lines this module handed to
+    ``ConversationCoordinator.speak`` and that it accepted — staged for speech,
+    not confirmed played. Completion is the browser's to declare and lands on
+    the coordinator, which is where to read it from; counting it here would
+    mean tracking a line the coordinator already owns.
+    ``narrations_dropped`` counts the rest: blank lines, and lines refused
+    because the one speech slot was in use. Together they are every narration
+    that reached :meth:`LuxoApp._on_narration`, so a line can never vanish
+    unaccounted for.
+    """
 
     state: BehaviorState
     behavior_ticks: int
