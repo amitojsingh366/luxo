@@ -48,6 +48,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -71,6 +73,8 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_CAPTURE_ATTEMPTS: Final = 1
 DEFAULT_WORKERS: Final = 1
+INSPECTION_CUE_S: Final = 0.55
+INSPECTION_FAILURE_SAY: Final = "I couldn't get a clear look—could you show me again?"
 
 CaptureCallback = Callable[[CaptureFrameMessage], None]
 ObservationResolver = Callable[
@@ -85,6 +89,7 @@ class ObservationStage(str, Enum):
     """Position of the one in-flight observation, owned by the runtime."""
 
     IDLE = "idle"
+    PREPARING = "preparing"
     REQUESTED = "requested"
     ANALYZING = "analyzing"
     RESOLVING = "resolving"
@@ -162,6 +167,7 @@ class ObservationRuntime:
         capture_callback: CaptureCallback,
         resolver: ObservationResolver,
         resolution_callback: ResolutionCallback,
+        clock: Callable[[], float] = time.monotonic,
         executor: Executor | None = None,
     ) -> None:
         callbacks = (
@@ -169,6 +175,7 @@ class ObservationRuntime:
             capture_callback,
             resolver,
             resolution_callback,
+            clock,
         )
         if not all(callable(item) for item in callbacks):
             raise TypeError("observation runtime callbacks must be callable")
@@ -181,6 +188,8 @@ class ObservationRuntime:
         self._capture_callback = capture_callback
         self._resolver = resolver
         self._resolution_callback = resolution_callback
+        self._clock = clock
+        self._last_clock = _clock_value(clock())
         self._executor = executor or ThreadPoolExecutor(
             max_workers=DEFAULT_WORKERS, thread_name_prefix="luxo-observation"
         )
@@ -194,6 +203,7 @@ class ObservationRuntime:
         self._request_id: str | None = None
         self._baseline: tuple[str, ...] = ()
         self._attempts = 0
+        self._capture_due_at: float | None = None
         self._inspecting = False
         self._stale_frame_expected = False
         self._captures_requested = 0
@@ -259,6 +269,22 @@ class ObservationRuntime:
                 and self._plans.blocked_on_observation
             ):
                 self._begin_locked()
+            elif self._stage is ObservationStage.PREPARING:
+                try:
+                    now = self._now_locked()
+                except ValueError as error:
+                    self._fault_locked(str(error), announce_complete=True)
+                else:
+                    if self._fsm.state is BehaviorState.INSPECTING:
+                        if self._capture_due_at is None:
+                            self._capture_due_at = now + INSPECTION_CUE_S
+                        elif (
+                            now >= self._capture_due_at
+                            and not self._dispatch_capture_locked()
+                        ):
+                            self._fault_locked(
+                                "capture_dispatch_failed", announce_complete=True
+                            )
 
     def on_jpeg(self, jpeg: bytes) -> bool:
         """Map one prefix-free ``0x02`` payload to the single active blocker.
@@ -402,11 +428,22 @@ class ObservationRuntime:
         self._active_origin = self._pending_origin
         self._pending_origin = None
         self._attempts = 0
-        self._stage = ObservationStage.REQUESTED
+        try:
+            cue_started = self._now_locked()
+        except ValueError as error:
+            self._fault_locked(str(error), announce_complete=False)
+            return
+        already_inspecting = self._fsm.state is BehaviorState.INSPECTING
+        self._stage = ObservationStage.PREPARING
         self._inspecting = True
-        self._fsm.post_event(BehaviorEvent.OBSERVE_START)
-        if not self._dispatch_capture_locked():
-            self._fault_locked("capture_dispatch_failed", announce_complete=True)
+        self._capture_due_at = (
+            cue_started + INSPECTION_CUE_S if already_inspecting else None
+        )
+        # Dialogue observations enter INSPECTING directly from the typed cloud
+        # result so the physical lean-in precedes this capture. Spontaneous
+        # observations still begin in ACTING and need the ordinary event.
+        if not already_inspecting:
+            self._fsm.post_event(BehaviorEvent.OBSERVE_START)
 
     def _dispatch_capture_locked(self) -> bool:
         """Ask the browser for exactly one frame for the pending request."""
@@ -414,6 +451,7 @@ class ObservationRuntime:
         request_id = self._request_id
         if request_id is None:  # pragma: no cover - internal invariant
             raise RuntimeError("cannot dispatch a capture without a request id")
+        self._stage = ObservationStage.REQUESTED
         self._attempts += 1
         self._captures_requested += 1
         try:
@@ -539,7 +577,27 @@ class ObservationRuntime:
         """Fail the one-frame observation without sampling a different scene."""
 
         self._last_error = reason
-        self._fault_locked("observe_failed", announce_complete=True)
+        origin = self._active_origin
+        if origin is None:
+            self._fault_locked("observe_failed", announce_complete=True)
+            return
+        try:
+            accepted = self._resolution_callback(
+                origin,
+                PlanResponse(INSPECTION_FAILURE_SAY, ()),
+            )
+        except Exception:
+            LOGGER.exception("observation failure speech callback failed")
+            accepted = False
+        if not accepted:
+            self._fault_locked("observe_failed", announce_complete=True)
+            return
+        self._faults += 1
+        self._release_blocker_locked()
+        self._cancel_pending_locked()
+        self._inspecting = False
+        self._fsm.post_event(BehaviorEvent.OBSERVATION_RESPONSE)
+        self._finish_locked()
 
     def _reject_locked(self, reason: FrameRejection) -> bool:
         """Refuse one frame and record why; the model is never given it."""
@@ -571,6 +629,15 @@ class ObservationRuntime:
             raise TypeError("baseline_labels must return a sequence of canonical labels")
         return tuple(labels)
 
+    def _now_locked(self) -> float:
+        """Read one finite, nonnegative, monotonic injected-clock value."""
+
+        now = _clock_value(self._clock())
+        if now < self._last_clock:
+            raise ValueError("clock_moved_backward")
+        self._last_clock = now
+        return now
+
     def _analyze(self, request_id: str, jpeg: bytes) -> ObservationResponse:
         """Blocking capture-to-memory work; this never runs on the tick."""
 
@@ -589,6 +656,7 @@ class ObservationRuntime:
         self._request_id = None
         self._baseline = ()
         self._attempts = 0
+        self._capture_due_at = None
         self._inspecting = False
         self._stale_frame_expected = False
         self._pending_origin = None
@@ -603,7 +671,7 @@ class ObservationRuntime:
         future, self._future = self._future, None
         if future is not None:
             future.cancel()
-        if self._stage in _OUTSTANDING:
+        if self._stage in _OUTSTANDING and self._attempts > 0:
             # A frame may already be in flight for the capture being cancelled.
             self._stale_frame_expected = True
         self._cancel_pending_locked()
@@ -614,6 +682,7 @@ class ObservationRuntime:
         self._request_id = None
         self._baseline = ()
         self._attempts = 0
+        self._capture_due_at = None
         self._inspecting = False
         self._pending_origin = None
         self._active_origin = None
@@ -644,10 +713,21 @@ class ObservationRuntime:
             LOGGER.warning("observation blocker vanished before release")
 
 
+def _clock_value(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("clock_must_be_finite_nonnegative")
+    result = float(value)
+    if not math.isfinite(result) or result < 0.0:
+        raise ValueError("clock_must_be_finite_nonnegative")
+    return result
+
+
 __all__ = [
     "BaselineLabels",
     "CaptureCallback",
     "DEFAULT_WORKERS",
+    "INSPECTION_CUE_S",
+    "INSPECTION_FAILURE_SAY",
     "FrameRejection",
     "MAX_CAPTURE_ATTEMPTS",
     "ObservationResolver",
