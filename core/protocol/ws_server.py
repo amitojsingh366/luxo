@@ -12,6 +12,8 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable
 
+from core.animation.poses import load_pose_library
+
 from .messages import (
     AudioState,
     BinaryFrame,
@@ -40,17 +42,19 @@ BinaryCallback = Callable[[BinaryFrame], object | Awaitable[object]]
 
 
 def canonical_rest_body_state(*, seq: int = 0, timestamp: float = 0.0) -> BodyStateMessage:
-    """Return the complete Phase 0 body state at the canonical rest pose."""
+    """Return the complete initial body state at the configured home pose."""
+
+    home = load_pose_library().home
 
     return BodyStateMessage(
         t=timestamp,
         seq=seq,
         joints=JointsState(
-            base_yaw=0.0,
-            shoulder_pitch=0.35,
-            elbow_pitch=-0.75,
-            neck_yaw=0.0,
-            head_pitch=0.25,
+            base_yaw=home.base_yaw,
+            shoulder_pitch=home.shoulder_pitch,
+            elbow_pitch=home.elbow_pitch,
+            neck_yaw=home.neck_yaw,
+            head_pitch=home.head_pitch,
         ),
         light=LightState(
             intensity=0.55,
