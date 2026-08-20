@@ -23,7 +23,7 @@ What "atomic" means here
 ------------------------
 
 Not one global lock. The runtime deliberately has no such lock, and taking one
-across the director, the router, the plan executor, and three staging
+across the director, the router, the plan executor, and two staging
 components would invert the documented order in ``app.py`` and deadlock against
 the animation tick. Atomic here means *no participant can observe a half-reset
 character*, which four separate properties deliver together:
@@ -37,7 +37,7 @@ character*, which four separate properties deliver together:
   internally atomic under its own lock.
 * **Generations make the in-flight work inert, not merely ignored.** Every
   staging component bumps a generation counter as it clears. A superseded STT,
-  brain, speech, capture, or narration worker that completes afterwards finds
+  brain, speech, or capture worker that completes afterwards finds
   its token stale and enqueues nothing; a superseded speech delivery raises out
   of its own send path instead of writing to the socket.
 * **The FSM is reset first, which closes every inbound door.** ``on_vad_start``
@@ -47,7 +47,7 @@ character*, which four separate properties deliver together:
   remaining steps run cannot re-arm anything that has already been cleared.
 
 The step order is therefore load-bearing and is asserted by the checks: FSM,
-conversation, narration, observation, body, blackboard, then the runtime's own
+conversation, observation, body, blackboard, then the runtime's own
 arming state. Each step is guarded independently and a failure is logged and
 counted rather than allowed to abandon the steps after it, for the same reason
 ``app.py`` guards the steps of a cancelling transition: a director that rejects
@@ -119,41 +119,12 @@ DEFAULT_REASON: Final = "reset"
 STEP_NAMES: Final = (
     "fsm",
     "conversation",
-    "narration",
     "observation",
     "body",
     "blackboard",
     "runtime",
 )
 """The fixed order of the reset, published so checks can pin it."""
-
-_FSM_FIELDS: Final = (
-    "_lock",
-    "_state",
-    "_state_entered_at",
-    "_last_transition",
-    "_gaze_on",
-    "_gaze_on_since",
-    "_gaze_off_since",
-    "_events",
-    "_dropped_events",
-)
-"""``BehaviorFSM`` internals this module writes directly.
-
-``core/fsm.py`` exposes no path from an engaged state to DORMANT: every
-transition it performs is earned by gaze dwell or by a closed worker event, and
-the only route to DORMANT from an engaged state costs 2.50 s of gaze loss plus
-a 1.50 s droop. Waiting four seconds is not a reset, and a reset that half
-happens now and half happens later is precisely the stranded state this packet
-exists to remove, so the baseline is written in one hold of the FSM's own lock.
-
-Reconstructing the FSM instead is not an option: the conversation coordinator,
-the observation runtime, and the wake sequence all captured the instance at
-construction, and a replacement would leave them posting into an object nobody
-reads. The names are checked at construction so that a future change to
-``core/fsm.py`` fails loudly here instead of silently resetting nothing.
-"""
-
 
 @dataclass(frozen=True, slots=True)
 class ResetReport:
@@ -199,7 +170,6 @@ class DemoReset:
         fsm: BehaviorFSM,
         blackboard: Blackboard,
         conversation: object,
-        narration: object,
         observations: object,
         router: object,
         director_lock: threading.RLock,
@@ -211,10 +181,8 @@ class DemoReset:
             raise TypeError("fsm must be a BehaviorFSM")
         if not isinstance(blackboard, Blackboard):
             raise TypeError("blackboard must be a Blackboard")
-        _require_fsm_fields(fsm)
         stages = {
             "conversation": conversation,
-            "narration": narration,
             "observation": observations,
             "body": router,
         }
@@ -231,7 +199,6 @@ class DemoReset:
         self._fsm = fsm
         self._blackboard = blackboard
         self._conversation = conversation
-        self._narration = narration
         self._observations = observations
         self._router = router
         self._director_lock = director_lock
@@ -328,9 +295,8 @@ class DemoReset:
         label = reason if isinstance(reason, str) and reason.strip() else DEFAULT_REASON
         previous = self._fsm.state
         steps: tuple[tuple[str, Callable[[], object]], ...] = (
-            ("fsm", lambda: self._reset_fsm(now)),
+            ("fsm", lambda: self._fsm.reset(now)),
             ("conversation", self._conversation.reset),  # type: ignore[attr-defined]
-            ("narration", self._narration.reset),  # type: ignore[attr-defined]
             ("observation", self._observations.reset),  # type: ignore[attr-defined]
             ("body", self._reset_body),
             ("blackboard", self._blackboard.reset),
@@ -372,27 +338,6 @@ class DemoReset:
                 ",".join(failed) or "memory",
             )
         return report
-
-    def _reset_fsm(self, now: float) -> None:
-        """Write the resting baseline in one hold of the FSM's own lock.
-
-        Warm-model and browser-ready facts are preserved deliberately: nothing
-        will ever post ``MODELS_WARM`` or ``BROWSER_READY`` again, so dropping
-        them would leave the character permanently unable to leave BOOT. Queued
-        events are counted as dropped rather than silently discarded, so the
-        FSM's own status keeps telling the truth about them.
-        """
-
-        fsm = self._fsm
-        with fsm._lock:  # noqa: SLF001 - see _FSM_FIELDS
-            fsm._dropped_events += len(fsm._events)
-            fsm._events.clear()
-            fsm._state = RESET_STATE
-            fsm._state_entered_at = now
-            fsm._last_transition = None
-            fsm._gaze_on = False
-            fsm._gaze_on_since = None
-            fsm._gaze_off_since = None
 
     def _reset_body(self) -> None:
         """Clear plan, blocker, pending effects, and body under the one lock.
@@ -438,16 +383,6 @@ class DemoReset:
         LOGGER.warning(
             "durable scene-memory clear failed (%s); the mirror is still empty",
             type(error).__name__,
-        )
-
-
-def _require_fsm_fields(fsm: BehaviorFSM) -> None:
-    missing = tuple(name for name in _FSM_FIELDS if not hasattr(fsm, name))
-    if missing:
-        raise AttributeError(
-            "BehaviorFSM no longer carries "
-            + ", ".join(missing)
-            + "; the demo reset writes these directly and must be updated with it"
         )
 
 

@@ -161,10 +161,6 @@ for a completion that has already been consumed. So:
 * :meth:`LuxoApp._on_vad` no longer polices barge-in itself. ``on_vad_start``
   already refuses whenever a line is staged or sounding, whoever authored it, so
   the PRD 16 rule is enforced by the owner instead of alongside it.
-* :class:`UnpromptedSpeech` is a **read-only projection** of that one owner, for
-  diagnostics. It has no state and no mutator; that is what makes it a view
-  rather than a second owner.
-
 An observation result retains its blocker until that one speech slot is reserved.
 
 Outbound ownership
@@ -433,55 +429,6 @@ class AppStatus:
     running: bool
 
 
-class UnpromptedSpeech:
-    """Read-only view of the one unprompted line the coordinator is holding.
-
-    Narration used to be spoken by a second component living here, which meant
-    two owners of ``speaking`` and an inbound ``tts_done`` that had to be routed
-    between them. ``ConversationCoordinator.speak`` removed the need for that:
-    an unprompted line now occupies the same staging slot as a brain reply.
-
-    What is left is this — a projection, not a participant. It reads the
-    coordinator's own status and reports the part of it that is about an
-    unprompted line, for diagnostics and for the demo-reset checks that assert a
-    narration is not left sounding. It holds no state, synthesizes nothing,
-    owns no worker, and deliberately exposes **no mutator at all**: there is no
-    ``speak``, no ``on_tts_done``, no ``reset``. That absence is the proof it
-    cannot become a second owner by accident.
-    """
-
-    __slots__ = ("_conversation",)
-
-    _AWAITING: Final = frozenset({Stage.AWAITING_DONE, Stage.STALLED})
-
-    def __init__(self, conversation: ConversationCoordinator) -> None:
-        self._conversation = conversation
-
-    @property
-    def speaking(self) -> bool:
-        """True while the line the browser is playing is an unprompted one.
-
-        Narrower than ``ConversationCoordinator.speaking``, and deliberately so:
-        that property is the ``body_state`` fact and covers every line, whoever
-        authored it. This one answers the different question "is a *narration*
-        sounding", which is only ever asked by diagnostics.
-        """
-
-        status = self._conversation.status
-        return status.speaking and status.unprompted
-
-    @property
-    def awaiting_done(self) -> bool:
-        """True from a delivered unprompted line until the browser reports it.
-
-        ``STALLED`` counts: a partial delivery already put audio in front of the
-        listener and is waiting on the same browser ``tts_done``.
-        """
-
-        status = self._conversation.status
-        return status.unprompted and status.stage in self._AWAITING
-
-
 class LatencyRecorder:
     """Turn coordinator milestones into PRD 11.1 CSV rows without blocking.
 
@@ -720,10 +667,6 @@ class LuxoApp:
             executor=observation_executor,
         )
 
-        # A projection of the coordinator, not a second speaker. All lines
-        # share one staging slot, one worker pool, and one ``speaking`` fact.
-        self._narration = UnpromptedSpeech(self._conversation)
-
         self._wake = WakeSequenceCoordinator(
             stt=stt,
             tts=tts,
@@ -778,20 +721,10 @@ class LuxoApp:
         # other entry into the animation body takes, so its body step is
         # serialized against the 120 Hz tick like any other.
         #
-        # ``conversation`` and ``narration`` are deliberately the same object.
-        # ``reset.py`` names them as two steps because there were once two
-        # components; there is now one, and the collapse is stated here rather
-        # than by quietly dropping a step the module still declares in
-        # ``STEP_NAMES``. ``ConversationCoordinator.reset`` is idempotent —
-        # it invalidates the generation, clears the staged line, the envelope
-        # and the ``speaking`` flag, and forgets recent turns — so running it
-        # twice in the sequence clears the same baseline twice and cannot
-        # regress the coverage either step used to provide.
         self._reset = DemoReset(
             fsm=self._fsm,
             blackboard=self._blackboard,
             conversation=self._conversation,
-            narration=self._conversation,
             observations=self._observations,
             router=self._router,
             director_lock=self._director_lock,
@@ -825,12 +758,6 @@ class LuxoApp:
     @property
     def observations(self) -> ObservationRuntime:
         return self._observations
-
-    @property
-    def narration(self) -> UnpromptedSpeech:
-        """Diagnostics only. A view of :attr:`conversation`, not a component."""
-
-        return self._narration
 
     @property
     def wake(self) -> WakeSequenceCoordinator:
@@ -1042,7 +969,7 @@ class LuxoApp:
             # A new browser will never send tts_done for audio the previous one
             # was playing, and will never return a frame the previous one was
             # asked for. Clear both so a reconnect cannot strand either. One
-            # conversation reset covers a narration too: it is the same slot.
+            # One conversation reset clears every staged or sounding line.
             self._conversation.reset()
             self._observations.reset()
             with self._lock:
@@ -1084,12 +1011,8 @@ class LuxoApp:
     def _on_vad(self, message: VadMessage) -> None:
         """Hand a VAD start straight to the one owner of the staging slot.
 
-        PRD 16 forbids barge-in, and this method used to enforce that for
-        narration on its own because narration audio was not coordinator
-        speech. It is now, so ``on_vad_start`` refuses on its own whenever a
-        line is staged or sounding, whoever authored it. Keeping a second check
-        here would be a copy of a rule the owner already applies, and copies of
-        rules drift.
+        PRD 16 forbids barge-in. ``on_vad_start`` refuses whenever a line is
+        staged or sounding, so this boundary needs no duplicate check.
         """
 
         accepted = self._conversation.on_vad_start(message.t)
@@ -1345,8 +1268,7 @@ class LuxoApp:
         steps: list[tuple[str, Callable[[], object]]] = [("director", apply_to_body)]
         if cancelling:
             steps += [
-                # One disengage covers dialogue and narration alike: they are
-                # the same staged line in the same component.
+                # One disengage covers every line in the same component.
                 ("conversation", self._conversation.disengage),
                 ("observation", self._observations.disengage),
                 ("plan", cancel_plan),
@@ -1625,7 +1547,6 @@ __all__ = [
     "OBSERVATION_ARM_TIMEOUT_S",
     "PLAN_HELD_STATES",
     "ProtocolPort",
-    "UnpromptedSpeech",
     "build_app",
     "target_angles",
     "VIEWER_AZIMUTH_RAD",
