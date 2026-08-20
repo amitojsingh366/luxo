@@ -12,6 +12,12 @@ Asset paths. ``setup.sh`` and ``config/models.yaml`` own where weights land.
 Every path below is overridable by environment variable so the two can be
 reconciled without touching Python, and every default matches the manifest
 destination that exists today.
+
+Signals. Two dispositions, and they are deliberately different things.
+``SIGINT`` and ``SIGTERM`` end the process. ``SIGUSR1`` performs the PRD 13.1
+between-takes demo reset and leaves the process, the models, and the browser
+exactly where they were. See :func:`_install_reset_handler` for why that signal
+and not another.
 """
 
 from __future__ import annotations
@@ -23,7 +29,7 @@ import os
 import signal
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 from urllib.parse import urlsplit
 
 from .config import DEFAULT_CONFIG_PATH, FrozenConfig, load_config
@@ -41,6 +47,9 @@ DEFAULT_LATENCY_CSV = Path(__file__).resolve().parents[1] / "measurements" / "la
 
 FREE_PROFILE_MODEL = "openrouter/free"
 """Placeholder model id for profile ``free``; ``config`` leaves the id unset."""
+
+RESET_SIGNAL: Final = "SIGUSR1"
+"""The signal that performs the PRD 13.1 demo reset. See ``_install_reset_handler``."""
 
 
 class ServingProtocol(Protocol):
@@ -217,6 +226,7 @@ async def run_character(
 
     stopped = asyncio.Event()
     _install_signal_handlers(stopped)
+    _install_reset_handler(app)
     app.start()
     serving = asyncio.ensure_future(server.serve_forever())
     shutdown = asyncio.ensure_future(stopped.wait())
@@ -259,6 +269,64 @@ def _install_signal_handlers(stopped: asyncio.Event) -> None:
             loop.add_signal_handler(handled, stopped.set)
         except (NotImplementedError, RuntimeError):  # pragma: no cover - non-main thread
             LOGGER.debug("no loop signal handler for %s", name)
+
+
+def _install_reset_handler(app: object) -> bool:
+    """Arm the PRD 13.1 between-takes reset on one POSIX signal.
+
+    Why a signal rather than a script or a CLI flag. The reset has to reach a
+    character that is *already running*, so a second process would need a way
+    to talk to the first one. The only channels this core has are the browser
+    WebSocket, which the PRD reserves for the closed message schema and which
+    this reset is explicitly not allowed to extend, and the process itself. A
+    signal is the process channel, and it costs no port, no socket, no pidfile,
+    and no dependency. The operator types one line in the terminal that is
+    already showing the core's log, and never touches the browser tab, so the
+    page keeps its socket and its camera and microphone permission.
+
+    Why ``SIGUSR1`` and not ``SIGHUP``. PRD 13.1 is explicit that this is a dev
+    tool that is never used mid-take, so the only property that really matters
+    is that it cannot fire by accident. ``SIGUSR1`` exists for exactly this and
+    is never raised by a terminal, by job control, by ``run.sh``, or by any
+    tool in this repository: it only ever arrives because someone typed it.
+    ``SIGHUP`` is the opposite — the kernel sends it on terminal hangup, so
+    closing the terminal mid-take would reset the character, and installing a
+    handler for it would also quietly suppress the shutdown it normally means.
+    ``SIGINT`` and ``SIGTERM`` stay shutdown, so nothing about Ctrl-C changes.
+
+    The handler does no work. It records the request and returns; the reset is
+    applied by the next serialized behaviour tick. That is required for the
+    fallback path below, where the handler really does run on the main thread
+    between bytecodes, and it stays true on the loop path so that both are the
+    same code. Returns whether the reset ended up armed.
+    """
+
+    handled = getattr(signal, RESET_SIGNAL, None)
+    if handled is None:  # pragma: no cover - every POSIX platform has SIGUSR1
+        LOGGER.warning("%s is unavailable; the demo reset is not armed", RESET_SIGNAL)
+        return False
+
+    def request() -> None:
+        app.request_reset(RESET_SIGNAL.lower())  # type: ignore[attr-defined]
+
+    def raw_handler(signum: int, frame: object) -> None:  # pragma: no cover - fallback
+        del signum, frame
+        request()
+
+    try:
+        asyncio.get_running_loop().add_signal_handler(handled, request)
+    except (NotImplementedError, RuntimeError):  # pragma: no cover - no loop support
+        try:
+            signal.signal(handled, raw_handler)
+        except (OSError, ValueError):
+            LOGGER.warning("no %s handler; the demo reset is not armed", RESET_SIGNAL)
+            return False
+    LOGGER.info(
+        "demo reset armed: kill -%s %d resets the character between takes",
+        RESET_SIGNAL.removeprefix("SIG"),
+        os.getpid(),
+    )
+    return True
 
 
 def run_core(
