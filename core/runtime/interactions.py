@@ -50,7 +50,12 @@ from threading import RLock
 from typing import Final
 
 from ..blackboard import Blackboard, UtteranceFact
-from ..brain.client import BrainClient, ObservationOrigin, RecentExchange
+from ..brain.client import (
+    BrainClient,
+    ConversationUnavailableError,
+    ObservationOrigin,
+    RecentExchange,
+)
 from ..brain.memory import CloudSceneObject
 from ..brain.schema import Action, ActionOp, PlanResponse
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
@@ -65,7 +70,7 @@ from ..speech.tts import SpeechAudio, TextToSpeech
 
 LOGGER = logging.getLogger(__name__)
 
-# Byte-identical to the brain client's in-character fallback line.
+# Deterministic local wording for conversation and speech delivery failures.
 FALLBACK_SAY: Final = "Oops—my thoughts got tangled! Can we try that again?"
 MAX_RECENT: Final = 3
 MAX_SPEECH_ATTEMPTS: Final = 3
@@ -594,12 +599,18 @@ class ConversationCoordinator:
         self._emit(Milestone.TRANSCRIPT, now)
 
     def _apply_brain_locked(self, future: Future[object]) -> None:
+        fallback = False
         try:
             reply = future.result()
             if not isinstance(reply, PlanResponse):
                 raise TypeError("brain must return a PlanResponse")
+        except ConversationUnavailableError as error:
+            reply = PlanResponse(_conversation_fallback(error), ())
+            fallback = True
+            self._last_error = error.kind
         except Exception as error:
             reply = PlanResponse(FALLBACK_SAY, ())
+            fallback = True
             self._last_error = type(error).__name__
         say = _line(reply.say)
         if not say:
@@ -607,8 +618,8 @@ class ConversationCoordinator:
             # existing in-character fallback line and an empty plan.
             reply = PlanResponse(FALLBACK_SAY, ())
             say = FALLBACK_SAY
+            fallback = True
             self._last_error = "blank_say"
-        fallback = say == FALLBACK_SAY and not reply.plan
         LOGGER.info("CHAT Luxo: %s", _log_text(say))
         LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
         observes = bool(reply.plan and reply.plan[-1].op is ActionOp.OBSERVE)
@@ -846,6 +857,17 @@ def _line(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError("dialogue text must be a string")
     return " ".join(value.split())
+
+
+def _conversation_fallback(error: ConversationUnavailableError) -> str:
+    """Render one deterministic line from a typed operational outcome."""
+
+    if error.kind != "rate_limited":
+        return FALLBACK_SAY
+    if error.retry_after_s is None:
+        return "OpenRouter is rate-limiting me—please try again later."
+    seconds = max(1, int(math.ceil(error.retry_after_s)))
+    return f"OpenRouter is rate-limiting me—please try again in {seconds} seconds."
 
 
 def _time(name: str, value: object) -> float:
