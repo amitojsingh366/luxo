@@ -116,6 +116,7 @@ class AnimationDirector:
         self._droop_due: float | None = None
         self._thinking_dip = False
         self._inspection_motion = InspectionMotion.OFF
+        self._pending_inspection_motion: InspectionMotion | None = None
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore: tuple[LightPreset, LightPattern] | None = None
         self._blink_started_at: float | None = None
@@ -159,7 +160,14 @@ class AnimationDirector:
         elif action.op is ActionOp.LOOK_AT:
             self._desired_target = action.target
         elif action.op is ActionOp.SCAN:
-            self._scan = _scan_from_action(action)
+            # A dialogue ``scan -> observe`` structurally selects the authored
+            # SEARCHING presentation before this action is routed. The search
+            # controller already sweeps the real emitter with anticipation and
+            # mass-ordered arrivals, so composing the legacy analytic scan here
+            # would double yaw and invite clamps. Keep ordinary standalone scans
+            # unchanged; consume only the redundant search marker.
+            if self._inspection_motion is not InspectionMotion.SEARCHING:
+                self._scan = _scan_from_action(action)
         # WAIT is deliberately PlanExecutor-owned and creates no director timer.
 
     def apply_transition(self, transition: Transition) -> bool:
@@ -182,6 +190,12 @@ class AnimationDirector:
         ):
             self._runtime.set_inspection_motion(InspectionMotion.OFF)
             self._inspection_motion = InspectionMotion.OFF
+        if state in {
+            BehaviorState.BOOT,
+            BehaviorState.DORMANT,
+            BehaviorState.DISENGAGING,
+        }:
+            self._pending_inspection_motion = None
 
         if state is BehaviorState.DORMANT:
             self._notice_due = None
@@ -226,8 +240,10 @@ class AnimationDirector:
             # defaults to the live person/hand ray rather than a fixed pose.
             if self._desired_target is None:
                 self._desired_target = "person"
-            self._runtime.set_inspection_motion(InspectionMotion.REACH)
-            self._inspection_motion = InspectionMotion.REACH
+            selected = self._pending_inspection_motion or InspectionMotion.REACH
+            self._pending_inspection_motion = None
+            self._runtime.set_inspection_motion(selected)
+            self._inspection_motion = selected
             self._set_light(LightPreset.CURIOUS_FOCUS)
         elif state is BehaviorState.DISENGAGING:
             self._notice_due = None
@@ -248,7 +264,17 @@ class AnimationDirector:
             and self._last_transition.current is BehaviorState.INSPECTING
         )
         if motion is not InspectionMotion.OFF and not inspecting:
+            # Conversation binds its typed observation before the FSM consumes
+            # MODEL_OBSERVE. Queue that body cue; do not animate it in THINKING.
+            if (
+                self._last_transition is not None
+                and self._last_transition.current is BehaviorState.THINKING
+            ):
+                self._pending_inspection_motion = motion
+                return True
             return False
+        if motion is InspectionMotion.OFF:
+            self._pending_inspection_motion = None
         if motion is self._inspection_motion:
             return True
         self._runtime.set_inspection_motion(motion)
@@ -288,6 +314,7 @@ class AnimationDirector:
         self._droop_due = None
         self._thinking_dip = False
         self._inspection_motion = InspectionMotion.OFF
+        self._pending_inspection_motion = None
         self._nonblink_light = (LightPreset.WARM_IDLE, LightPattern.STEADY)
         self._blink_restore = None
         self._blink_started_at = None

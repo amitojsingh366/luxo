@@ -74,6 +74,14 @@ LOGGER = logging.getLogger(__name__)
 MAX_CAPTURE_ATTEMPTS: Final = 1
 DEFAULT_WORKERS: Final = 1
 INSPECTION_CUE_S: Final = 0.55
+SEARCH_CUE_S: Final = 1.15
+"""One complete authored search arrival and hold before sampling the scene.
+
+The searching controller reaches its first strong pose after anticipation,
+mass-ordered arrivals, and a short hold. Waiting for that readable beat keeps
+the JPEG coupled to the visible search instead of firing as soon as the plan's
+typed ``scan`` marker reaches the body.
+"""
 INSPECTION_FAILURE_SAY: Final = "I couldn't get a clear look—could you show me again?"
 
 CaptureCallback = Callable[[CaptureFrameMessage], None]
@@ -234,6 +242,8 @@ class ObservationRuntime:
         self._last_error: str | None = None
         self._pending_origin: ObservationOrigin | None = None
         self._active_origin: ObservationOrigin | None = None
+        self._pending_presentation = ObservationPresentation.INSPECTING
+        self._active_presentation = ObservationPresentation.INSPECTING
         self._origin_recent: tuple[RecentExchange, ...] = ()
         self._presentation = ObservationPresentation.IDLE
 
@@ -296,7 +306,7 @@ class ObservationRuntime:
                 else:
                     if self._fsm.state is BehaviorState.INSPECTING:
                         if self._capture_due_at is None:
-                            self._capture_due_at = now + INSPECTION_CUE_S
+                            self._capture_due_at = now + self._cue_duration_locked()
                         elif (
                             now >= self._capture_due_at
                             and not self._dispatch_capture_locked()
@@ -349,14 +359,17 @@ class ObservationRuntime:
         self,
         origin: ObservationOrigin,
         recent: Sequence[RecentExchange] = (),
+        presentation: ObservationPresentation = ObservationPresentation.INSPECTING,
     ) -> bool:
-        """Bind one typed cloud-approved origin to the next observe blocker."""
+        """Bind one typed cloud-approved origin and body cue to the next blocker."""
 
         if not isinstance(origin, ObservationOrigin):
             raise TypeError("origin must be an ObservationOrigin")
         exchanges = tuple(recent)
         if not all(isinstance(item, RecentExchange) for item in exchanges):
             raise TypeError("recent must contain RecentExchange values")
+        if not isinstance(presentation, ObservationPresentation):
+            raise TypeError("presentation must be an ObservationPresentation")
         with self._lock:
             if (
                 self._closed
@@ -366,7 +379,12 @@ class ObservationRuntime:
             ):
                 return False
             self._pending_origin = origin
+            self._pending_presentation = presentation
             self._origin_recent = exchanges[-3:]
+            # The cloud has already selected a structural plan. Publishing its
+            # body-owned interpretation now lets the director queue the cue
+            # before THINKING transitions into INSPECTING.
+            self._set_presentation_locked(presentation)
             return True
 
     def cancel_origin(self) -> bool:
@@ -376,7 +394,10 @@ class ObservationRuntime:
             pending = self._pending_origin is not None or self._active_origin is not None
             self._pending_origin = None
             self._active_origin = None
+            self._pending_presentation = ObservationPresentation.INSPECTING
+            self._active_presentation = ObservationPresentation.INSPECTING
             self._origin_recent = ()
+            self._set_presentation_locked(ObservationPresentation.IDLE)
             return pending
 
     def disengage(self) -> None:
@@ -450,6 +471,8 @@ class ObservationRuntime:
         self._baseline = request.prior
         self._active_origin = self._pending_origin
         self._pending_origin = None
+        self._active_presentation = self._pending_presentation
+        self._pending_presentation = ObservationPresentation.INSPECTING
         self._attempts = 0
         try:
             cue_started = self._now_locked()
@@ -460,9 +483,9 @@ class ObservationRuntime:
         self._stage = ObservationStage.PREPARING
         self._inspecting = True
         self._capture_due_at = (
-            cue_started + INSPECTION_CUE_S if already_inspecting else None
+            cue_started + self._cue_duration_locked() if already_inspecting else None
         )
-        self._set_presentation_locked(ObservationPresentation.INSPECTING)
+        self._set_presentation_locked(self._active_presentation)
         # Dialogue observations enter INSPECTING directly from the typed cloud
         # result so the physical lean-in precedes this capture. Spontaneous
         # observations still begin in ACTING and need the ordinary event.
@@ -695,6 +718,7 @@ class ObservationRuntime:
             self._fsm.post_event(BehaviorEvent.OBSERVE_COMPLETE)
 
     def _finish_locked(self) -> None:
+        self._set_presentation_locked(ObservationPresentation.IDLE)
         self._stage = ObservationStage.IDLE
         self._future = None
         self._request_id = None
@@ -705,6 +729,8 @@ class ObservationRuntime:
         self._stale_frame_expected = False
         self._pending_origin = None
         self._active_origin = None
+        self._pending_presentation = ObservationPresentation.INSPECTING
+        self._active_presentation = ObservationPresentation.INSPECTING
         self._origin_recent = ()
 
     def _invalidate_locked(self, *, announce_complete: bool = False) -> None:
@@ -731,7 +757,16 @@ class ObservationRuntime:
         self._inspecting = False
         self._pending_origin = None
         self._active_origin = None
+        self._pending_presentation = ObservationPresentation.INSPECTING
+        self._active_presentation = ObservationPresentation.INSPECTING
         self._origin_recent = ()
+
+    def _cue_duration_locked(self) -> float:
+        return (
+            SEARCH_CUE_S
+            if self._active_presentation is ObservationPresentation.SEARCHING
+            else INSPECTION_CUE_S
+        )
 
     def _set_presentation_locked(
         self, presentation: ObservationPresentation
@@ -790,6 +825,7 @@ __all__ = [
     "CaptureCallback",
     "DEFAULT_WORKERS",
     "INSPECTION_CUE_S",
+    "SEARCH_CUE_S",
     "INSPECTION_FAILURE_SAY",
     "FrameRejection",
     "MAX_CAPTURE_ATTEMPTS",

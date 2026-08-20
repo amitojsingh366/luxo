@@ -69,6 +69,7 @@ from ..speech.stt import SpeechToText, Transcript
 from ..speech.tts import DEFAULT_CHUNK_BYTES, ENVELOPE_HZ
 from ..speech.tts import SAMPLE_HZ as TTS_SAMPLE_HZ
 from ..speech.tts import SpeechAudio, TextToSpeech
+from .observations import ObservationPresentation
 
 LOGGER = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ SpeakCallback = Callable[[SpeakBeginMessage | SpeakEndMessage], None]
 PcmCallback = Callable[[bytes], None]
 MilestoneCallback = Callable[[Milestone, float], None]
 ObservationOriginCallback = Callable[
-    [ObservationOrigin, tuple[RecentExchange, ...]], bool
+    [ObservationOrigin, tuple[RecentExchange, ...], ObservationPresentation], bool
 ]
 
 
@@ -103,6 +104,23 @@ def _plan_log(plan: tuple[Action, ...]) -> str:
             item[field] = value.value if isinstance(value, Enum) else value
         actions.append(item)
     return json.dumps(actions, ensure_ascii=False, separators=(",", ":"))
+
+
+def _observation_presentation(
+    plan: tuple[Action, ...],
+) -> ObservationPresentation:
+    """Map validated plan structure to a body cue without reading dialogue.
+
+    ``scan`` before the terminal blocking observation is the closed-vocabulary
+    signal that the model is searching the scene. A direct terminal observation
+    is the ordinary close inspection used for held and deictic objects.
+    """
+
+    if plan and plan[-1].op is ActionOp.OBSERVE and any(
+        action.op is ActionOp.SCAN for action in plan[:-1]
+    ):
+        return ObservationPresentation.SEARCHING
+    return ObservationPresentation.INSPECTING
 
 
 class Stage(str, Enum):
@@ -621,8 +639,13 @@ class ConversationCoordinator:
         say = _line(reply.say)
         if observes and self._observation_origin_callback is not None:
             origin = ObservationOrigin("dialogue", self._transcript or "")
+            presentation = _observation_presentation(reply.plan)
             try:
-                bound = self._observation_origin_callback(origin, tuple(self._recent))
+                bound = self._observation_origin_callback(
+                    origin,
+                    tuple(self._recent),
+                    presentation,
+                )
             except Exception:
                 LOGGER.exception("observation origin callback failed")
                 bound = False
