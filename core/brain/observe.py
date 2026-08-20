@@ -413,17 +413,34 @@ def _durable_response(
         retained_indexes[index] = len(visible)
         visible.append(item)
     focus = None if response.focus is None else retained_indexes.get(response.focus)
-    if response.present_prior_ids is None:
-        presence = None
-    else:
-        eligible_ids = {item.id for item in request_prior}
-        presence = tuple(
-            object_id
-            for object_id in response.present_prior_ids
-            if object_id in eligible_ids
-        )
+    eligible_ids = {item.id for item in request_prior}
+    claimed_ids = {
+        item.match for item in visible if item.match is not None
+    }
+    presence = tuple(
+        object_id
+        for object_id in response.present_prior_ids
+        if object_id in eligible_ids and object_id in claimed_ids
+    )
+    corroborated = frozenset(presence)
+    invalidated_focus = False
+    corroborated_visible: list[ObservedObject] = []
+    for index, item in enumerate(visible):
+        if item.match is not None and item.match not in corroborated:
+            invalidated_focus = invalidated_focus or focus == index
+            corroborated_visible.append(
+                replace(item, match=None, match_provided=True)
+            )
+        elif item.match is None and not item.match_provided:
+            # Direct BrainClient implementations must not bypass the same-frame
+            # identity contract through the legacy canonical fallback below.
+            corroborated_visible.append(replace(item, match_provided=True))
+        else:
+            corroborated_visible.append(item)
+    if invalidated_focus:
+        focus = None
     return ObservationResponse(
-        visible=tuple(visible),
+        visible=tuple(corroborated_visible),
         focus=focus,
         present_prior_ids=presence,
         raw_saturated=response.raw_saturated,
