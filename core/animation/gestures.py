@@ -58,17 +58,20 @@ _INSPECTION_HEAD_OFFSET: Final = (
 
 # A missing subject must read as looking around, not as a negative head shake.
 # This body-owned layer leaves the engaged arm silhouette alone and searches
-# with the two real yaw joints plus a small pitch variation.  The totals stay
-# deliberately modest so a live person target can keep moving underneath it.
+# with the two real yaw joints while aiming below the live face-height target.
+# Positive head pitch looks down after the URDF's pi flip.  Keeping the bias in
+# this additive layer makes it search the nearby work surface without changing
+# ordinary engaged gaze or the arm-owned inspection reach.
+_SEARCH_DOWNWARD_BIAS_RAD: Final = 0.22
 _SEARCH_RIGHT: Final = JointVector(
     base_yaw=0.16,
     neck_yaw=0.24,
-    head_pitch=-0.04,
+    head_pitch=_SEARCH_DOWNWARD_BIAS_RAD - 0.03,
 )
 _SEARCH_LEFT: Final = JointVector(
     base_yaw=-0.16,
     neck_yaw=-0.24,
-    head_pitch=0.025,
+    head_pitch=_SEARCH_DOWNWARD_BIAS_RAD + 0.03,
 )
 SEARCH_HOLD_SECONDS: Final = 0.35
 
