@@ -14,7 +14,7 @@ from typing import Final, Mapping
 
 from ..brain.schema import GestureName, PostureName
 from . import JOINT_NAMES, JointName, JointVector
-from .poses import PoseLibrary
+from .poses import ENGAGED_BASE_YAW_RAD, PoseLibrary
 
 
 ANTICIPATION_SECONDS: Final = 0.120
@@ -27,12 +27,11 @@ ANTICIPATION_SCALE: Final = 0.16
 MASS_ORDER: Final = JOINT_NAMES
 
 # Owner-authored URDF-editor anchors, adapted into a gaze-relative inspection
-# layer.  The editor's base endpoint was the hard limit (+2.6 rad) and its
-# neck/head values aimed at one fixed camera, so those absolute angles do not
-# belong in live animation.  Shoulder and elbow define the silhouette exactly.
-# A quarter of the editor's base turn gives the body a readable twist without
-# consuming the live solver's yaw range; neck cancels it so emitter azimuth is
-# unchanged. After the pi flip, emitter elevation is head minus shoulder and
+# layer. The editor's base endpoint was the hard limit (+2.6 rad), so live
+# animation preserves its engaged-to-inspecting ratio against the soft-safe
+# engaged anchor. Shoulder and elbow define the silhouette exactly. Neck and
+# head counter the body offsets so the live solver continues to own the real
+# emitter axis. After the pi flip, emitter elevation is head minus shoulder and
 # elbow, so the head follows the arm-pitch delta with the same sign.
 _REFERENCE_ENGAGED_SHOULDER: Final = 0.654
 _REFERENCE_ENGAGED_ELBOW: Final = -1.265
@@ -40,11 +39,9 @@ _REFERENCE_ENGAGED_BASE: Final = 2.600
 _REFERENCE_INSPECTING_BASE: Final = 1.7836
 _REFERENCE_INSPECTING_SHOULDER: Final = -0.1686
 _REFERENCE_INSPECTING_ELBOW: Final = -0.57425
-_INSPECTION_TWIST_SCALE: Final = 0.25
-
-_INSPECTION_BASE_OFFSET: Final = (
-    _REFERENCE_INSPECTING_BASE - _REFERENCE_ENGAGED_BASE
-) * _INSPECTION_TWIST_SCALE
+_INSPECTION_BASE_OFFSET: Final = ENGAGED_BASE_YAW_RAD * (
+    _REFERENCE_INSPECTING_BASE / _REFERENCE_ENGAGED_BASE - 1.0
+)
 _INSPECTION_SHOULDER_OFFSET: Final = (
     _REFERENCE_INSPECTING_SHOULDER - _REFERENCE_ENGAGED_SHOULDER
 )
@@ -56,22 +53,18 @@ _INSPECTION_HEAD_OFFSET: Final = (
     _INSPECTION_SHOULDER_OFFSET + _INSPECTION_ELBOW_OFFSET
 )
 
-# A missing subject must read as looking around, not as a negative head shake.
-# This body-owned layer leaves the engaged arm silhouette alone and searches
-# with the two real yaw joints while aiming below the live face-height target.
-# Positive head pitch looks down after the URDF's pi flip.  Keeping the bias in
-# this additive layer makes it search the nearby work surface without changing
-# ordinary engaged gaze or the arm-owned inspection reach.
-_SEARCH_DOWNWARD_BIAS_RAD: Final = 0.22
+# The search reference holds the engaged base and both arm joints while the
+# shade explores with neck and head. These live-target-relative endpoints keep
+# that silhouette: neck supplies the side-to-side scan, positive head pitch
+# looks down after the URDF's pi flip, and the gaze foundation can still follow
+# a moving person or object underneath the authored offsets.
 _SEARCH_RIGHT: Final = JointVector(
-    base_yaw=0.16,
-    neck_yaw=0.24,
-    head_pitch=_SEARCH_DOWNWARD_BIAS_RAD - 0.03,
+    neck_yaw=0.42,
+    head_pitch=0.38,
 )
 _SEARCH_LEFT: Final = JointVector(
-    base_yaw=-0.16,
-    neck_yaw=-0.24,
-    head_pitch=_SEARCH_DOWNWARD_BIAS_RAD + 0.03,
+    neck_yaw=-0.14,
+    head_pitch=0.52,
 )
 SEARCH_HOLD_SECONDS: Final = 0.35
 

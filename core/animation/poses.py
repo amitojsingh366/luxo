@@ -22,6 +22,7 @@ POSE_NAMES: Final[tuple[PoseName, ...]] = (
     "crane",
 )
 HOME_POSE_NAME: Final[PoseName] = "rest"
+ENGAGED_BASE_YAW_RAD: Final = 0.44
 DEFAULT_POSES_PATH = Path(__file__).resolve().parents[2] / "config" / "poses.yaml"
 
 SOFT_LIMITS: Final[Mapping[JointName, tuple[float, float]]] = MappingProxyType(
@@ -178,6 +179,7 @@ def _number(value: Any, path: str) -> float:
 
 __all__ = [
     "DEFAULT_POSES_PATH",
+    "ENGAGED_BASE_YAW_RAD",
     "HOME_POSE_NAME",
     "POSE_NAMES",
     "PoseError",
