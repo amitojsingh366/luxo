@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Final, Iterable
 
-from .schema import normalize_canonical_label
+from .schema import is_durable_scene_canonical, normalize_canonical_label
 
 
 MAX_SCENE_OBJECTS: Final = 10
@@ -220,14 +220,21 @@ def _validate_collection(
     return records
 
 
-def _legacy_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
-    """Select the ten strongest records while migrating an old 19-record file."""
+def _eligible_records(records: Iterable[SceneObject]) -> tuple[SceneObject, ...]:
+    return tuple(
+        record for record in records if is_durable_scene_canonical(record.canonical)
+    )
 
-    if len(records) <= MAX_SCENE_OBJECTS:
-        return records
+
+def _durable_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
+    """Remove non-object noise, then select the ten strongest durable facts."""
+
+    eligible = _eligible_records(records)
+    if len(eligible) <= MAX_SCENE_OBJECTS:
+        return eligible
     return tuple(
         sorted(
-            records,
+            eligible,
             key=lambda record: (
                 not record.present,
                 -record.last_seen,
@@ -336,7 +343,7 @@ class SceneMemoryStore:
                 next_id = minimum_next_id
             elif next_id < minimum_next_id:
                 raise SceneMemoryError("next_id is below an existing object id")
-            selected = _legacy_selection(validated)
+            selected = _durable_selection(validated)
         except SceneMemoryError as exc:
             raise SceneMemoryError(f"invalid scene memory {self._path}: {exc}") from exc
         if legacy or len(selected) != len(validated):
@@ -349,8 +356,9 @@ class SceneMemoryStore:
         return selected
 
     def save(self, objects: tuple[SceneObject, ...]) -> None:
-        records = _validate_collection(objects)
-        next_id = max(_next_numeric_id(records), self._stored_next_id())
+        supplied = _validate_collection(objects, maximum=None)
+        records = _validate_collection(_eligible_records(supplied))
+        next_id = max(_next_numeric_id(supplied), self._stored_next_id())
         self._save(records, next_id)
 
     def _save(self, records: tuple[SceneObject, ...], next_id: int) -> None:
@@ -405,7 +413,8 @@ class SceneMemoryStore:
         return 1
 
     def update(self, objects: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
-        observed = _validate_collection(objects)
+        supplied = _validate_collection(objects, maximum=None)
+        observed = _validate_collection(_eligible_records(supplied))
         existing = self.load()
         by_id = {record.id: record for record in existing}
         next_id = max(_next_numeric_id(existing), self._stored_next_id())

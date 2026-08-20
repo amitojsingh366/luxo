@@ -22,6 +22,7 @@ from .schema import (
     ObservationPrior,
     ObservationResponse,
     ObservedObject,
+    is_durable_scene_canonical,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -156,6 +157,7 @@ class ObservationCoordinator:
                 )
                 if not isinstance(response, ObservationResponse):
                     raise TypeError("brain.observe must return validated observation facts")
+                response = _durable_response(response, pending.request.prior)
                 LOGGER.info("SCENE noticed=%s", _observation_log(response))
                 observed_at = _timestamp(self._clock())
                 pending.response = response
@@ -238,6 +240,9 @@ def _prior_objects(values: Sequence[ObservationPrior]) -> tuple[ObservationPrior
     for value in values:
         if not isinstance(value, ObservationPrior):
             raise TypeError("prior must contain ObservationPrior values")
+        if not is_durable_scene_canonical(value.canonical):
+            LOGGER.warning("dropping non-durable observation prior %s", value.canonical)
+            continue
         if value.id in seen:
             continue
         seen.add(value.id)
@@ -291,6 +296,8 @@ def _memory_candidates(
     for index, item in enumerate(response.visible):
         if not isinstance(item, ObservedObject):
             raise TypeError("observation visible entries must be validated ObservedObject values")
+        if not is_durable_scene_canonical(item.canonical):
+            continue
         previous = None
         if (
             item.match is not None
@@ -315,6 +322,38 @@ def _memory_candidates(
             claimed.add(previous.id)
         candidates.append(_new_candidate(item, index, observed_at, previous))
     return tuple(candidates)
+
+
+def _durable_response(
+    response: ObservationResponse,
+    request_prior: tuple[ObservationPrior, ...],
+) -> ObservationResponse:
+    """Apply durable-memory eligibility even to directly constructed facts."""
+
+    visible: list[ObservedObject] = []
+    retained_indexes: dict[int, int] = {}
+    for index, item in enumerate(response.visible):
+        if not is_durable_scene_canonical(item.canonical):
+            LOGGER.warning("dropping non-durable observed object %s", item.canonical)
+            continue
+        retained_indexes[index] = len(visible)
+        visible.append(item)
+    focus = None if response.focus is None else retained_indexes.get(response.focus)
+    if response.present_prior_ids is None:
+        presence = None
+    else:
+        eligible_ids = {item.id for item in request_prior}
+        presence = tuple(
+            object_id
+            for object_id in response.present_prior_ids
+            if object_id in eligible_ids
+        )
+    return ObservationResponse(
+        visible=tuple(visible),
+        focus=focus,
+        present_prior_ids=presence,
+        raw_saturated=response.raw_saturated,
+    )
 
 
 def _observation_log(response: ObservationResponse) -> str:
