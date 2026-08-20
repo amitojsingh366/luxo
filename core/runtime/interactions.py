@@ -22,9 +22,11 @@ delivery that never reached ``speak_begin`` retries a bounded number of times
 and then waits for explicit recovery; a partial delivery sends one best-effort
 ``speak_end`` and then waits for the browser, a reset, or a disengage.
 
-A line usually arrives as a brain reply, but :meth:`ConversationCoordinator.speak`
-stages an *unprompted* one — an observation narration, say — into that same
-machinery instead of standing up a parallel speaker. The coordinator therefore
+A line usually arrives as a brain reply, but a reply whose validated plan ends
+in ``observe`` is different: its ``say`` is a silent inspection cue, the FSM
+enters ``INSPECTING`` immediately, and only the fresh observation resolution is
+spoken. :meth:`ConversationCoordinator.speak` stages an *unprompted* line into
+that same machinery instead of standing up a parallel speaker. The coordinator therefore
 stays the single owner of the ``speaking`` fact and the single destination for
 ``tts_done``. An unprompted line differs from a reply in exactly two ways, both
 because it is not a dialogue turn: it drives no FSM transition, because the
@@ -417,11 +419,15 @@ class ConversationCoordinator:
             self._stage = Stage.REPLIED
             self._last_error = "blank_say" if not response.say.strip() else None
             if origin.kind == "dialogue":
+                replaced = False
                 for index in range(len(self._recent) - 1, -1, -1):
                     exchange = self._recent[index]
-                    if exchange.human_say == origin.text:
+                    if exchange.human_say == origin.text and not exchange.lamp_say:
                         self._recent[index] = RecentExchange(origin.text, say)
+                        replaced = True
                         break
+                if not replaced:
+                    self._recent.append(RecentExchange(origin.text, say))
             LOGGER.info("CHAT Luxo (scene): %s", _log_text(say))
             return True
 
@@ -612,17 +618,8 @@ class ConversationCoordinator:
             reply = PlanResponse(FALLBACK_SAY, ())
             fallback = True
             self._last_error = type(error).__name__
-        say = _line(reply.say)
-        if not say:
-            # Blank say is schema-valid but Piper-invalid, so it takes the
-            # existing in-character fallback line and an empty plan.
-            reply = PlanResponse(FALLBACK_SAY, ())
-            say = FALLBACK_SAY
-            fallback = True
-            self._last_error = "blank_say"
-        LOGGER.info("CHAT Luxo: %s", _log_text(say))
-        LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
         observes = bool(reply.plan and reply.plan[-1].op is ActionOp.OBSERVE)
+        say = _line(reply.say)
         if observes and self._observation_origin_callback is not None:
             origin = ObservationOrigin("dialogue", self._transcript or "")
             try:
@@ -635,19 +632,41 @@ class ConversationCoordinator:
                 # the terminal observe while preserving the cloud-authored say
                 # and all non-capture actions.
                 reply = PlanResponse(reply.say, reply.plan[:-1])
+                observes = False
+        if not say and not observes:
+            # Blank conversational speech is Piper-invalid. A terminal observe
+            # is routed structurally above and never reaches Piper, so its blank
+            # silent cue must not erase the observation plan.
+            reply = PlanResponse(FALLBACK_SAY, ())
+            say = FALLBACK_SAY
+            fallback = True
+            self._last_error = "blank_say"
+        if observes:
+            LOGGER.info(
+                "BRAIN silent inspection cue: %s",
+                _log_text(say) if say else "<blank>",
+            )
+        else:
+            LOGGER.info("CHAT Luxo: %s", _log_text(say))
+        LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
         now = self._now()
         with self._blackboard.lock:
             self._plans.submit(reply.plan)
             self._mirror_plan_locked()
             self._blackboard.publish_utterance(None)
-        self._fsm.post_event(
-            BehaviorEvent.MODEL_FALLBACK if fallback else BehaviorEvent.MODEL_RESPONSE
-        )
-        self._recent.append(RecentExchange(self._transcript or "", say))
+        if fallback:
+            event = BehaviorEvent.MODEL_FALLBACK
+        elif observes:
+            event = BehaviorEvent.MODEL_OBSERVE
+        else:
+            event = BehaviorEvent.MODEL_RESPONSE
+        self._fsm.post_event(event)
+        if not observes:
+            self._recent.append(RecentExchange(self._transcript or "", say))
         self._transcript = None
-        self._reply = say
+        self._reply = None if observes else say
         self._unprompted = False
-        self._stage = Stage.REPLIED
+        self._stage = Stage.IDLE if observes else Stage.REPLIED
         self._emit(Milestone.RESPONSE, now)
 
     def _mirror_plan_locked(self) -> None:

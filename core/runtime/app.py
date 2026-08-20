@@ -664,6 +664,7 @@ class LuxoApp:
                 recent,
             ),
             resolution_callback=self._on_observation_resolution,
+            clock=clock,
             executor=observation_executor,
         )
 

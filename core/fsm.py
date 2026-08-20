@@ -42,6 +42,7 @@ class BehaviorEvent(str, Enum):
     VAD_START = "vad_start"
     TRANSCRIPT_READY = "transcript_ready"
     MODEL_RESPONSE = "model_response"
+    MODEL_OBSERVE = "model_observe"
     MODEL_FALLBACK = "model_fallback"
     SPEECH_DONE = "speech_done"
     OBSERVE_START = "observe_start"
@@ -347,6 +348,8 @@ class BehaviorFSM:
             return BehaviorState.THINKING, "transcript_ready"
 
         elif self._state is BehaviorState.THINKING:
+            if event is BehaviorEvent.MODEL_OBSERVE:
+                return BehaviorState.INSPECTING, "model_observe"
             if event is BehaviorEvent.MODEL_RESPONSE:
                 return BehaviorState.SPEAKING, "model_response"
             if event is BehaviorEvent.MODEL_FALLBACK:
