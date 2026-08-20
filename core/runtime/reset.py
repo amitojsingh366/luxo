@@ -294,10 +294,12 @@ class DemoReset:
         A drain with nothing pending is a deque read and nothing more.
         """
 
+        # Validated before the request is taken: a caller that hands over a
+        # bad clock must not silently swallow the operator's reset.
+        instant = _finite_time(now)
         reason = self._take_request()
         if reason is None:
             return None
-        instant = _finite_time(now)
         with self._lock:
             if self._closed:
                 return None
