@@ -202,7 +202,7 @@ class ActionRouter:
             self._dispatch_locked()
 
     def reset(self) -> None:
-        """Return plan and body to their boot state; use on reconnect."""
+        """Clear the plan and return the body to its canonical rest state."""
 
         with self._lock:
             self._cancel_locked("reset")

@@ -409,7 +409,7 @@ class AppStatus:
     the coordinator, which is where to read it from; counting it here would
     mean tracking a line the coordinator already owns.
     ``observation_responses_dropped`` counts responses refused because the speech
-    slot was unexpectedly in use. There is no separate narration path.
+    slot was unexpectedly in use. There is no separate observation-speech path.
     """
 
     state: BehaviorState
@@ -969,7 +969,7 @@ class LuxoApp:
             # A new browser will never send tts_done for audio the previous one
             # was playing, and will never return a frame the previous one was
             # asked for. Clear both so a reconnect cannot strand either. One
-            # One conversation reset clears every staged or sounding line.
+            # conversation reset clears every staged or sounding line.
             self._conversation.reset()
             self._observations.reset()
             with self._lock:
@@ -1387,7 +1387,8 @@ class LuxoApp:
         snapshot, looks up one pure speech envelope, runs the director's fixed
         step, and swaps an immutable body-state snapshot into the transport.
         Nothing here serializes, opens a file, touches the event loop, or takes
-        the router, FSM, or conversation staging lock.
+        the router or FSM lock. The two conversation reads each take its short
+        in-memory lock, as documented in the module locking notes.
 
         ``speaking`` is read from the coordinator and from nowhere else. It is
         one field, not a union of two, because there is one component that can

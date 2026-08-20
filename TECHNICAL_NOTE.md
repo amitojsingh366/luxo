@@ -58,6 +58,15 @@ defined once in `schema/messages.schema.json`, TypeScript types are generated
 from it, and a check asserts the generated file matches, so **core and renderer
 cannot drift**.
 
+The `capture_frame` JSON request carries an observation ID, but its returned
+`0x02` JPEG does not: the binary contract has only the type byte followed by the
+image. The core therefore maps a JPEG to the one outstanding capture and rejects
+frames when no capture is outstanding. One race cannot be resolved under this
+wire format: a late frame from a cancelled capture that arrives while a newer
+capture is outstanding is indistinguishable from the newer frame. Closing that
+gap requires an acknowledged or request-tagged binary response, not another
+local heuristic.
+
 ## 3. The model-to-action boundary
 
 **The model never emits joint angles.** It emits a plan over a closed eight-verb
@@ -200,3 +209,6 @@ CSV output in source control.
 - No full IK; no physics dynamics; single subject; no barge-in; no wake word
   (gaze is the signal); no cross-frame tracking (`observe` is discrete);
   localhost only.
+- Returned JPEG frames carry no observation ID. A late frame from a cancelled
+  capture can be claimed by a newer outstanding capture; §2 describes the wire
+  constraint and the protocol change required to remove the race.

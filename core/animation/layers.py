@@ -1,6 +1,6 @@
 """Public additive animation-layer boundary.
 
-Later feature packets evaluate idle, gaze, gesture, light, and speech-bob in
+The animation runtime evaluates idle, gaze, gesture, light, and speech-bob in
 that order. Layer sampling is pure CPU work and must never wait on I/O.
 """
 

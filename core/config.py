@@ -1,8 +1,8 @@
 """Immutable configuration loading for the character core.
 
 ``default.yaml`` is deliberately JSON-compatible YAML. JSON is a strict YAML
-subset, which lets the Phase 0 scaffold validate config without introducing a
-YAML dependency that the PRD does not require.
+subset, so the assembled application can validate configuration without adding
+a YAML dependency that the PRD does not require.
 """
 
 from __future__ import annotations
