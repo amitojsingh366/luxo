@@ -12,7 +12,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
 
@@ -26,6 +26,9 @@ WAIT_MAX_MS = 60_000
 
 BBOX_EDGE_TOLERANCE = 0.025
 """Maximum normalized edge overflow clipped as vision-model rounding noise."""
+
+OBSERVATION_MAX_VISIBLE = 10
+"""Maximum nearest-first object facts accepted from one captured frame."""
 
 _SAFE_OBJECT_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _CANONICAL_SEPARATOR = re.compile(r"[\s_-]+")
@@ -137,11 +140,66 @@ class ObservedObject:
     bbox_norm: tuple[float, float, float, float]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class ObservationResponse:
-    present: tuple[str, ...]
-    new: tuple[ObservedObject, ...]
-    known: tuple[ObservedObject, ...] = ()
+    """Nearest-first facts from one frame.
+
+    The cloud contract has only ``visible``. The compatibility fields are kept
+    solely so in-process callers created against the earlier contract can be
+    drained without putting its present/known/new choreography back on the
+    wire.
+    """
+
+    visible: tuple[ObservedObject, ...]
+    _legacy_present: tuple[str, ...] = field(repr=False, compare=False)
+    _legacy_new: tuple[ObservedObject, ...] = field(repr=False, compare=False)
+    _legacy_known: tuple[ObservedObject, ...] = field(repr=False, compare=False)
+
+    def __init__(
+        self,
+        present: tuple[str, ...] = (),
+        new: tuple[ObservedObject, ...] = (),
+        known: tuple[ObservedObject, ...] = (),
+        *,
+        visible: tuple[ObservedObject, ...] | None = None,
+    ) -> None:
+        if visible is not None:
+            if present or new or known:
+                raise ValueError("visible cannot be combined with legacy observation fields")
+            facts = _validated_observed_tuple(visible, "visible")
+            legacy_present: tuple[str, ...] = ()
+            legacy_new: tuple[ObservedObject, ...] = ()
+            legacy_known: tuple[ObservedObject, ...] = ()
+        else:
+            legacy_present = tuple(
+                dict.fromkeys(normalize_canonical_label(value) for value in present)
+            )
+            legacy_new = _validated_observed_tuple(new, "new")
+            legacy_known = _validated_observed_tuple(known, "known")
+            facts = tuple(
+                {
+                    item.canonical: item
+                    for item in (*legacy_known, *legacy_new)
+                }.values()
+            )
+        object.__setattr__(self, "visible", facts[:OBSERVATION_MAX_VISIBLE])
+        object.__setattr__(self, "_legacy_present", legacy_present)
+        object.__setattr__(self, "_legacy_new", legacy_new)
+        object.__setattr__(self, "_legacy_known", legacy_known)
+
+    @property
+    def present(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(
+            (*self._legacy_present, *(item.canonical for item in self.visible))
+        ))
+
+    @property
+    def new(self) -> tuple[ObservedObject, ...]:
+        return self._legacy_new if self._legacy_present or self._legacy_known else self.visible
+
+    @property
+    def known(self) -> tuple[ObservedObject, ...]:
+        return self._legacy_known
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -184,12 +242,7 @@ def parse_plan_response(payload: RawPayload) -> PlanResponse:
 
 
 def parse_observation_response(payload: RawPayload) -> ObservationResponse:
-    """Validate an ``observe`` response containing facts and no dialogue.
-
-    Unknown top-level and object keys are ignored, except dialogue keys. Invalid
-    entries are logged and dropped; the three top-level fact arrays are always
-    required.
-    """
+    """Validate the single nearest-first object list returned by ``observe``."""
 
     root = _payload_object(payload, "observation")
     forbidden = {"say", "plan", "dialogue"}.intersection(root)
@@ -197,40 +250,19 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
         raise ResponseSchemaError(
             f"observation response must not contain dialogue keys {sorted(forbidden)!r}"
         )
-    if not {"present", "known", "new"} <= root.keys():
-        raise ResponseSchemaError("observation response requires 'present', 'known', and 'new'")
-    raw_present = root["present"]
-    raw_new = root["new"]
-    raw_known = root["known"]
-    if not all(isinstance(value, list) for value in (raw_present, raw_new, raw_known)):
-        raise ResponseSchemaError("observation 'present', 'new', and 'known' must be arrays")
-
-    present: list[str] = []
-    seen_labels: set[str] = set()
-    for index, value in enumerate(raw_present):
-        try:
-            label = normalize_canonical_label(value)
-        except ValueError as error:
-            LOGGER.warning("dropping invalid present label at index %d: %s", index, error)
-            continue
-        if label not in seen_labels:
-            seen_labels.add(label)
-            present.append(label)
-
-    new = _observed_objects(raw_new, "new")
-    if raw_new and not new:
-        raise ResponseSchemaError("observation contained no valid new objects")
-    known = _observed_objects(raw_known, "known")
-    if raw_known and not known:
-        raise ResponseSchemaError("observation contained no valid known objects")
+    if "visible" not in root:
+        raise ResponseSchemaError("observation response requires 'visible'")
+    raw_visible = root["visible"]
+    if not isinstance(raw_visible, list):
+        raise ResponseSchemaError("observation 'visible' must be an array")
     return ObservationResponse(
-        present=tuple(present),
-        new=tuple(new),
-        known=tuple(known),
+        visible=tuple(_observed_objects(raw_visible, "visible", OBSERVATION_MAX_VISIBLE))
     )
 
 
-def _observed_objects(values: list[object], field: str) -> list[ObservedObject]:
+def _observed_objects(
+    values: list[object], field: str, limit: int | None = None
+) -> list[ObservedObject]:
     objects: list[ObservedObject] = []
     seen: set[str] = set()
     for index, raw_object in enumerate(values):
@@ -242,7 +274,23 @@ def _observed_objects(values: list[object], field: str) -> list[ObservedObject]:
         if item.canonical not in seen:
             seen.add(item.canonical)
             objects.append(item)
+            if limit is not None and len(objects) == limit:
+                break
     return objects
+
+
+def _validated_observed_tuple(
+    values: object, field: str
+) -> tuple[ObservedObject, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{field} must be a sequence of ObservedObject values")
+    try:
+        result = tuple(values)  # type: ignore[arg-type]
+    except TypeError as error:
+        raise TypeError(f"{field} must be a sequence of ObservedObject values") from error
+    if not all(isinstance(value, ObservedObject) for value in result):
+        raise TypeError(f"{field} must contain ObservedObject values")
+    return result
 
 
 def _payload_object(payload: RawPayload, kind: str) -> JsonObject:
@@ -470,6 +518,7 @@ __all__ = [
     "LightPattern",
     "LightPreset",
     "ObservedObject",
+    "OBSERVATION_MAX_VISIBLE",
     "ObservationResponse",
     "PlanResponse",
     "PostureName",

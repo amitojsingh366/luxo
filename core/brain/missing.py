@@ -49,19 +49,13 @@ def compute_observation_missing(
 ) -> MissingComparison:
     """Compare against every object the observation says is visible.
 
-    Vision models sometimes repeat an already-known canonical in ``new``
-    instead of ``present``. Scene memory correctly treats either location as
-    visible, so missing-object narration must do the same or it will announce
-    objects that are plainly still in frame.
+    The vision model reports one nearest-first visible list. Python alone
+    compares that list with the stored baseline.
     """
 
     if not isinstance(observation, ObservationResponse):
         raise TypeError("observation must be a validated ObservationResponse")
-    visible = (
-        observation.present
-        + tuple(item.canonical for item in observation.known)
-        + tuple(item.canonical for item in observation.new)
-    )
+    visible = observation.present
     return compute_missing(baseline, visible)
 
 
