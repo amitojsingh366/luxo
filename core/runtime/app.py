@@ -249,7 +249,7 @@ from ..brain.client import (
 )
 from ..brain.memory import SceneMemoryStore, cloud_safe_attributes
 from ..brain.observe import ObservationCoordinator
-from ..brain.schema import Action, ActionOp, ObservationPrior, PlanResponse
+from ..brain.schema import Action, ObservationPrior, PlanResponse
 from ..config import FrozenConfig, load_config
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState, Transition
 from ..instrumentation import InteractionCSVLogger, InteractionTimeline, Milestone, TimelineError
@@ -280,7 +280,7 @@ from ..speech.stt import SpeechToText
 from ..speech.tts import TextToSpeech
 from ..wake_sequence import WakeSequenceCoordinator
 from .actions import CANCELLING_STATES, ActionRouter
-from .interactions import ConversationCoordinator, Stage
+from .interactions import ConversationCoordinator
 from .observations import (
     ObservationPresentation,
     ObservationRuntime,
@@ -334,12 +334,6 @@ actual viewer used by ``renderer/src/scene/camera.ts`` instead of world ``-x``.
 The positive sign follows the URDF's post-yaw pi head flip: positive joint yaw
 turns the emitter from world ``-x`` toward world ``-y``.
 """
-
-HAND_INQUIRY_DELAY_S: Final = 4.0
-"""Continuous hand visibility before Luxo asks what the person is doing."""
-
-HAND_LOST_GRACE_S: Final = 0.6
-"""Brief landmark dropouts do not restart the hand-attention dwell."""
 
 MAX_TICK_BACKSTEP_S: Final = 1.0
 """A wall-clock step back larger than this re-anchors instead of being clamped."""
@@ -716,12 +710,6 @@ class LuxoApp:
         self._observation_responses_dropped = 0
         self._cue_failures = 0
 
-        # Hand attention is a measured browser fact. The behavior tick owns
-        # the one-shot social response so sensor jitter can never speak.
-        self._hands_seen_since: float | None = None
-        self._hands_last_seen: float | None = None
-        self._hand_inquiry_asked = False
-
         self._camera = CameraGeometry()
         self._hellos = 0
         self._camera_ready = False
@@ -911,9 +899,6 @@ class LuxoApp:
             self._capture_armed_id = None
             self._pending_blocker_id = None
             self._pending_blocker_since = None
-            self._hands_seen_since = None
-            self._hands_last_seen = None
-            self._hand_inquiry_asked = False
             self._state_name = BehaviorState.DORMANT
             self._arousal = AROUSAL_BY_STATE[BehaviorState.DORMANT]
 
@@ -994,10 +979,6 @@ class LuxoApp:
             # conversation reset clears every staged or sounding line.
             self._conversation.reset()
             self._observations.reset()
-            with self._lock:
-                self._hands_seen_since = None
-                self._hands_last_seen = None
-                self._hand_inquiry_asked = False
             LOGGER.info("browser reconnected; speech and observation staging reset")
         self._wake.mark_browser_hello()
 
@@ -1017,11 +998,6 @@ class LuxoApp:
                 hand_conf=message.hand_conf,
             )
         )
-        if message.hands_present and message.hand_conf >= 0.5:
-            with self._lock:
-                if self._hands_seen_since is None:
-                    self._hands_seen_since = message.t
-                self._hands_last_seen = message.t
         # The renderer refuses to start the gaze sensor until the camera track
         # is live, so any gaze frame at all is proof of camera permission.
         with self._lock:
@@ -1037,12 +1013,7 @@ class LuxoApp:
         staged or sounding, so this boundary needs no duplicate check.
         """
 
-        accepted = self._conversation.on_vad_start(message.t)
-        if accepted:
-            # A person who starts speaking while showing something has already
-            # initiated the interaction; do not interrupt with the idle prompt.
-            with self._lock:
-                self._hand_inquiry_asked = True
+        self._conversation.on_vad_start(message.t)
 
     def _on_tts_done(self, message: TtsDoneMessage) -> None:
         """The browser's completion has exactly one destination and no branch.
@@ -1243,12 +1214,10 @@ class LuxoApp:
 
         self._conversation.tick()
 
-        hand_plan_started = self._tick_hand_inquiry(now)
-
         # The coordinator may have submitted a plan and re-mirrored its depth,
         # so the router must route against the fresh view, not the stale one.
         snapshot = self._blackboard.snapshot()
-        if not hand_plan_started and self._fsm.state not in PLAN_HELD_STATES:
+        if self._fsm.state not in PLAN_HELD_STATES:
             with self._director_lock:
                 try:
                     self._router.tick(snapshot, now)
@@ -1267,42 +1236,6 @@ class LuxoApp:
             self._behavior_ticks += 1
             self._state_name = self._fsm.state
             self._arousal = AROUSAL_BY_STATE.get(self._state_name, 0.15)
-
-    def _tick_hand_inquiry(self, now: float) -> bool:
-        """Observe once after a quiet, continuous hand presentation."""
-
-        with self._lock:
-            last_seen = self._hands_last_seen
-            if last_seen is None or now - last_seen > HAND_LOST_GRACE_S:
-                self._hands_seen_since = None
-                self._hands_last_seen = None
-                self._hand_inquiry_asked = False
-                return False
-            seen_since = self._hands_seen_since
-            already_asked = self._hand_inquiry_asked
-        if (
-            already_asked
-            or seen_since is None
-            or now - seen_since < HAND_INQUIRY_DELAY_S
-            or self._fsm.state is not BehaviorState.ENGAGED
-            or self._conversation.status.stage is not Stage.IDLE
-            or self._plans.state.depth > 0
-            or self._observations.stage is not ObservationStage.IDLE
-        ):
-            return False
-        origin = ObservationOrigin("scene_event", "hand_presented")
-        if not self._observations.bind_origin(
-            origin,
-            self._conversation.status.recent,
-        ):
-            return False
-        self._plans.submit((Action(ActionOp.OBSERVE),))
-        self._fsm.post_event(BehaviorEvent.PLAN_READY)
-        with self._lock:
-            self._hand_inquiry_asked = True
-        # Do not route in ENGAGED on this same beat. PLAN_READY moves the FSM
-        # to ACTING first, so OBSERVE_START is posted from its valid source.
-        return True
 
     def _apply_transition(self, transition: Transition) -> None:
         """Apply one state beat to the body, cancelling everything it must.
