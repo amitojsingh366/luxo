@@ -142,6 +142,30 @@ class OpenRouterTransportError(RuntimeError):
         self.retry_after_s = retry_after_s
 
 
+class ConversationUnavailableError(RuntimeError):
+    """A conversation could not produce a validated cloud response."""
+
+    def __init__(
+        self,
+        kind: Literal["unavailable", "rate_limited"],
+        *,
+        retry_after_s: float | None = None,
+    ) -> None:
+        if kind not in ("unavailable", "rate_limited"):
+            raise ValueError("kind must be unavailable or rate_limited")
+        if retry_after_s is not None:
+            if isinstance(retry_after_s, bool) or not isinstance(
+                retry_after_s, (int, float)
+            ):
+                raise TypeError("retry_after_s must be a number or None")
+            retry_after_s = float(retry_after_s)
+            if not math.isfinite(retry_after_s) or retry_after_s < 0.0:
+                raise ValueError("retry_after_s must be finite and nonnegative")
+        super().__init__(f"OpenRouter conversation {kind.replace('_', ' ')}")
+        self.kind = kind
+        self.retry_after_s = retry_after_s
+
+
 class BrainWarmError(RuntimeError):
     """Warm-up exhausted its repair attempt without a validated response."""
 
@@ -486,6 +510,12 @@ class OpenRouterBrainClient:
             raise ObservationUnavailableError(
                 "OpenRouter observation failed after its repair attempt"
             )
+        if call_type == "converse":
+            if rate_limit is not None:
+                raise ConversationUnavailableError(
+                    "rate_limited", retry_after_s=rate_limit.retry_after_s
+                )
+            raise ConversationUnavailableError("unavailable")
         if rate_limit is not None:
             wait = rate_limit.retry_after_s
             if wait is not None:
@@ -494,7 +524,9 @@ class OpenRouterBrainClient:
             else:
                 say = "OpenRouter is rate-limiting me—please try again later."
             return PlanResponse(say, ())  # type: ignore[return-value]
-        return PlanResponse("Oops—my thoughts got tangled! Can we try that again?", ())  # type: ignore[return-value]
+        # Observation resolution is staged through ConversationCoordinator,
+        # which owns the deterministic line used for an empty response.
+        return PlanResponse("", ())  # type: ignore[return-value]
 
     def _request(
         self,
