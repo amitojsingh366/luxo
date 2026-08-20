@@ -231,7 +231,14 @@ from typing import Final, Protocol
 
 from ..animation.director import AnimationDirector
 from ..animation.lookat import LookAtTarget
-from ..animation.runtime import FIXED_DT, TICK_HZ, AnimationDiscontinuityError, AnimationRuntime, AnimationSample
+from ..animation.runtime import (
+    FIXED_DT,
+    TICK_HZ,
+    AnimationDiscontinuityError,
+    AnimationRuntime,
+    AnimationSample,
+    InspectionMotion,
+)
 from ..animation.poses import PoseLibrary, load_pose_library
 from ..blackboard import Blackboard, BlackboardSnapshot, GazeFact, Telemetry
 from ..brain.client import (
@@ -274,7 +281,11 @@ from ..speech.tts import TextToSpeech
 from ..wake_sequence import WakeSequenceCoordinator
 from .actions import CANCELLING_STATES, ActionRouter
 from .interactions import ConversationCoordinator, Stage
-from .observations import ObservationRuntime, ObservationStage
+from .observations import (
+    ObservationPresentation,
+    ObservationRuntime,
+    ObservationStage,
+)
 from .reset import DemoReset, ResetReport
 
 LOGGER = logging.getLogger(__name__)
@@ -664,6 +675,7 @@ class LuxoApp:
                 recent,
             ),
             resolution_callback=self._on_observation_resolution,
+            presentation_callback=self._on_observation_presentation,
             clock=clock,
             executor=observation_executor,
         )
@@ -1093,6 +1105,21 @@ class LuxoApp:
             else:
                 self._observation_responses_dropped += 1
         return accepted
+
+    def _on_observation_presentation(
+        self, presentation: ObservationPresentation
+    ) -> None:
+        """Map typed fresh-scene evidence onto the body-owned inspection layer."""
+
+        if not isinstance(presentation, ObservationPresentation):
+            raise TypeError("presentation must be an ObservationPresentation")
+        motion = {
+            ObservationPresentation.IDLE: InspectionMotion.OFF,
+            ObservationPresentation.INSPECTING: InspectionMotion.REACH,
+            ObservationPresentation.SEARCHING: InspectionMotion.SEARCHING,
+        }[presentation]
+        with self._director_lock:
+            self._director.set_inspection_motion(motion)
 
     def _emit_wake_action(self, action: Action) -> None:
         """Submit one PRD 10.4 waking beat through the normal plan path.
