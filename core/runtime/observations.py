@@ -64,7 +64,7 @@ from ..brain.observe import (
     ObservationCoordinator,
     ObservationRequestError,
 )
-from ..brain.schema import ObservationResponse, PlanResponse
+from ..brain.schema import ObservationPrior, ObservationResponse, PlanResponse
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..plan_executor import ObservationReleaseError, PlanExecutor
 from ..protocol.messages import CaptureFrameMessage
@@ -82,7 +82,7 @@ ObservationResolver = Callable[
     PlanResponse,
 ]
 ResolutionCallback = Callable[[ObservationOrigin, PlanResponse], bool]
-BaselineLabels = Callable[[], Sequence[str]]
+BaselineObjects = Callable[[], Sequence[ObservationPrior]]
 
 
 class ObservationStage(str, Enum):
@@ -152,7 +152,7 @@ class ObservationRuntime:
     so that no reset or close can interleave between the generation check and
     the enqueue.
 
-    ``baseline_labels`` is read on the tick and must therefore be cheap and
+    ``baseline_objects`` is read on the tick and must therefore be cheap and
     non-blocking. Wire it to the blackboard's mirrored scene memory, never to a
     disk load.
     """
@@ -163,7 +163,7 @@ class ObservationRuntime:
         fsm: BehaviorFSM,
         plan_executor: PlanExecutor,
         observations: ObservationCoordinator,
-        baseline_labels: BaselineLabels,
+        baseline_objects: BaselineObjects,
         capture_callback: CaptureCallback,
         resolver: ObservationResolver,
         resolution_callback: ResolutionCallback,
@@ -171,7 +171,7 @@ class ObservationRuntime:
         executor: Executor | None = None,
     ) -> None:
         callbacks = (
-            baseline_labels,
+            baseline_objects,
             capture_callback,
             resolver,
             resolution_callback,
@@ -184,7 +184,7 @@ class ObservationRuntime:
         self._fsm = fsm
         self._plans = plan_executor
         self._observations = observations
-        self._baseline_labels = baseline_labels
+        self._baseline_objects = baseline_objects
         self._capture_callback = capture_callback
         self._resolver = resolver
         self._resolution_callback = resolution_callback
@@ -201,7 +201,7 @@ class ObservationRuntime:
         self._completions: list[_Completion] = []
         self._future: Future[object] | None = None
         self._request_id: str | None = None
-        self._baseline: tuple[str, ...] = ()
+        self._baseline: tuple[ObservationPrior, ...] = ()
         self._attempts = 0
         self._capture_due_at: float | None = None
         self._inspecting = False
@@ -404,7 +404,11 @@ class ObservationRuntime:
             return
 
         try:
-            request = self._observations.begin(pending_id, baseline)
+            request = self._observations.begin(
+                pending_id,
+                baseline,
+                self._pending_origin,
+            )
         except ObservationBusyError:
             existing = self._observations.pending
             if existing is None or existing.request_id != pending_id:
@@ -424,7 +428,7 @@ class ObservationRuntime:
             return
 
         self._request_id = request.request_id
-        self._baseline = request.prior_canonical
+        self._baseline = request.prior
         self._active_origin = self._pending_origin
         self._pending_origin = None
         self._attempts = 0
@@ -498,14 +502,15 @@ class ObservationRuntime:
 
         self._observations_completed += 1
         comparison = compute_observation_missing(self._baseline, response)
-        self._last_missing = comparison.missing
+        self._last_missing = comparison.missing_labels
         LOGGER.info(
             "SCENE comparison=%s",
             json.dumps(
                 {
-                    "baseline": comparison.baseline,
-                    "visible": comparison.present,
-                    "missing": comparison.missing,
+                    "baseline_ids": comparison.baseline_ids,
+                    "visible_ids": comparison.present_ids,
+                    "missing_ids": comparison.missing_ids,
+                    "missing": comparison.missing_labels,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
@@ -522,7 +527,7 @@ class ObservationRuntime:
                 self._resolver,
                 origin,
                 response,
-                comparison.missing,
+                comparison.missing_labels,
                 self._origin_recent,
             )
         except Exception as error:
@@ -621,13 +626,16 @@ class ObservationRuntime:
             return False
         return self._plans.pending_observation_id == request_id
 
-    def _baseline_snapshot(self) -> tuple[str, ...]:
-        labels = self._baseline_labels()
-        if isinstance(labels, (str, bytes, bytearray)) or not isinstance(
-            labels, Sequence
+    def _baseline_snapshot(self) -> tuple[ObservationPrior, ...]:
+        objects = self._baseline_objects()
+        if isinstance(objects, (str, bytes, bytearray)) or not isinstance(
+            objects, Sequence
         ):
-            raise TypeError("baseline_labels must return a sequence of canonical labels")
-        return tuple(labels)
+            raise TypeError("baseline_objects must return a sequence of ObservationPrior values")
+        result = tuple(objects)
+        if not all(isinstance(item, ObservationPrior) for item in result):
+            raise TypeError("baseline_objects must contain ObservationPrior values")
+        return result
 
     def _now_locked(self) -> float:
         """Read one finite, nonnegative, monotonic injected-clock value."""
@@ -723,7 +731,7 @@ def _clock_value(value: object) -> float:
 
 
 __all__ = [
-    "BaselineLabels",
+    "BaselineObjects",
     "CaptureCallback",
     "DEFAULT_WORKERS",
     "INSPECTION_CUE_S",

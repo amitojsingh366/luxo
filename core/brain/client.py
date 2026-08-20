@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, Protocol, TypeVar
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -22,6 +22,7 @@ from .prompts import FixedPromptBuilder, PromptBuilder
 from .memory import CloudSceneObject
 from .schema import (
     ActionOp,
+    ObservationPrior,
     ObservationResponse,
     PlanResponse,
     ResponseSchemaError,
@@ -53,7 +54,6 @@ class ObservationOrigin:
             or "\r" in self.text
         ):
             raise ValueError("origin text must be non-empty single-line text")
-        object.__setattr__(self, "text", " ".join(self.text.split()))
 
 
 T = TypeVar("T", PlanResponse, ObservationResponse)
@@ -67,10 +67,10 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     ),
     "observe": (
         "Your observation response was invalid. Inspect the supplied image and return one "
-        "bare JSON object with exactly one top-level key, visible. visible must be an array "
-        "of at most 10 objects ordered nearest-to-camera first. Each object needs label, "
-        "canonical, attributes, and bbox_norm. bbox_norm must contain decimal x, y, width, "
-        "and height values between 0 and 1, not pixel or corner coordinates. Do not return "
+        "bare JSON object with exactly the top-level keys visible and focus. visible must be "
+        "an array of at most 10 objects ordered nearest-to-camera first. Each object needs "
+        "match, label, canonical, attributes, and bbox_norm; match and bbox_norm may be null. "
+        "focus must be a visible array index or null. Do not return "
         "say, plan, dialogue, or prose."
     ),
     "resolve_observation": (
@@ -192,7 +192,8 @@ class BrainClient(Protocol):
     def observe(
         self,
         jpeg: bytes,
-        prior_canonical: Sequence[str],
+        prior: Sequence[ObservationPrior],
+        origin: ObservationOrigin,
     ) -> ObservationResponse: ...
 
     def resolve_observation(
@@ -341,7 +342,7 @@ class OpenRouterBrainClient:
                 return
             self._resolve_observation(
                 ObservationOrigin("scene_event", "startup_warm"),
-                ObservationResponse(visible=()),
+                ObservationResponse(visible=(), focus=None),
                 (),
                 "",
                 (),
@@ -364,25 +365,40 @@ class OpenRouterBrainClient:
             "converse", self._text_messages(payload), _parse_converse_response
         )
 
-    def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ObservationResponse:
-        payload = self._prompts.observe_payload(jpeg, prior_canonical)
-        prior = payload["prior_canonical"]
-        labels = {"call": "observe", "prior_canonical": prior}
+    def observe(
+        self,
+        jpeg: bytes,
+        prior: Sequence[ObservationPrior],
+        origin: ObservationOrigin,
+    ) -> ObservationResponse:
+        payload = self._prompts.observe_payload(jpeg, prior, origin)
+        prior_objects = payload["prior"]
+        labels = {
+            "call": "observe",
+            "origin": payload["origin"],
+            "prior": prior_objects,
+        }
         content = [
             {"type": "text", "text": _compact_json(labels)},
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
-        parse_attempt = 0
-
         def parse_observation(raw: str) -> ObservationResponse:
-            nonlocal parse_attempt
-            parse_attempt += 1
-            try:
-                return parse_observation_response(raw)
-            except ResponseSchemaError:
-                if parse_attempt < 2:
-                    raise
-                return _parse_legacy_observation_repair(raw)
+            response = parse_observation_response(raw)
+            prior_ids = {
+                value["id"]
+                for value in prior_objects
+                if isinstance(value, dict) and isinstance(value.get("id"), str)
+            }
+            claimed: set[str] = set()
+            visible = []
+            for item in response.visible:
+                match = item.match
+                if match not in prior_ids or match in claimed:
+                    match = None
+                else:
+                    claimed.add(match)
+                visible.append(replace(item, match=match))
+            return ObservationResponse(tuple(visible), response.focus)
 
         return self._run("observe", self._messages(content), parse_observation)
 
@@ -587,24 +603,6 @@ def _parse_resolved_response(raw: str) -> PlanResponse:
         response.say,
         tuple(action for action in response.plan if action.op is not ActionOp.OBSERVE),
     )
-
-
-def _parse_legacy_observation_repair(raw: str) -> ObservationResponse:
-    """Drain a repaired old-shape result without restoring it as a first try."""
-
-    try:
-        decoded = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ResponseSchemaError("observation response requires 'visible'") from error
-    if not isinstance(decoded, dict) or not {"present", "known", "new"} <= decoded.keys():
-        raise ResponseSchemaError("observation response requires 'visible'")
-    if any(key in decoded for key in ("say", "plan", "dialogue")):
-        raise ResponseSchemaError("observation response must not contain dialogue")
-    known = decoded["known"]
-    new = decoded["new"]
-    if not isinstance(known, list) or not isinstance(new, list):
-        raise ResponseSchemaError("legacy observation facts must be arrays")
-    return parse_observation_response({"visible": [*known, *new]})
 
 
 def _retry_after_seconds(value: object) -> float | None:

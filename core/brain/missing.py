@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .schema import ObservationResponse, normalize_canonical_label
+from .schema import ObservationPrior, ObservationResponse, normalize_canonical_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +20,16 @@ class MissingComparison:
     baseline: tuple[str, ...]
     present: tuple[str, ...]
     missing: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationMissingComparison:
+    """Stable-id difference plus canonical labels safe for narration."""
+
+    baseline_ids: tuple[str, ...]
+    present_ids: tuple[str, ...]
+    missing_ids: tuple[str, ...]
+    missing_labels: tuple[str, ...]
 
 
 def compute_missing(
@@ -44,9 +54,9 @@ def compute_missing(
 
 
 def compute_observation_missing(
-    baseline: Sequence[str],
+    baseline: Sequence[ObservationPrior],
     observation: ObservationResponse,
-) -> MissingComparison:
+) -> ObservationMissingComparison:
     """Compare against every object the observation says is visible.
 
     The vision model reports one nearest-first visible list. Python alone
@@ -55,8 +65,28 @@ def compute_observation_missing(
 
     if not isinstance(observation, ObservationResponse):
         raise TypeError("observation must be a validated ObservationResponse")
-    visible = observation.present
-    return compute_missing(baseline, visible)
+    if isinstance(baseline, (str, bytes, bytearray)) or not isinstance(
+        baseline, Sequence
+    ):
+        raise TypeError("baseline must be a sequence of ObservationPrior values")
+    priors = tuple(baseline)
+    if not all(isinstance(item, ObservationPrior) for item in priors):
+        raise TypeError("baseline must contain ObservationPrior values")
+    baseline_ids = tuple(dict.fromkeys(item.id for item in priors))
+    present_ids = tuple(
+        dict.fromkeys(
+            item.match for item in observation.visible if item.match is not None
+        )
+    )
+    present_set = frozenset(present_ids)
+    missing_ids = tuple(item for item in baseline_ids if item not in present_set)
+    by_id = {item.id: item.canonical for item in priors}
+    return ObservationMissingComparison(
+        baseline_ids,
+        present_ids,
+        missing_ids,
+        tuple(by_id[item] for item in missing_ids),
+    )
 
 
 def _canonical_labels(values: Sequence[str], field: str) -> tuple[str, ...]:
@@ -78,6 +108,7 @@ def _canonical_labels(values: Sequence[str], field: str) -> tuple[str, ...]:
 
 __all__ = [
     "MissingComparison",
+    "ObservationMissingComparison",
     "compute_observation_missing",
     "compute_missing",
 ]
