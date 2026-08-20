@@ -7,11 +7,11 @@ direction from ``light_emitter_link`` to the render camera or another world
 target; ``camera_link`` is not the aiming frame.
 
 This is deliberately not inverse kinematics. Base and neck share azimuth while
-the neck leads and exponentially recentres. The pitch solution does include
-the two upstream arm joints: after the pi flip, emitter elevation in the
-positive-down convention is ``head - shoulder - elbow``. Unreachable elevation
-asks the gesture layer for a whole-body posture. There is no roll joint to
-author.
+the neck leads and exponentially recentres around the body-authored base
+silhouette. The pitch solution does include the two upstream arm joints: after
+the pi flip, emitter elevation in the positive-down convention is ``head -
+shoulder - elbow``. Unreachable elevation asks the gesture layer for a
+whole-body posture. There is no roll joint to author.
 """
 
 from __future__ import annotations
@@ -54,9 +54,10 @@ class LookAtSolver:
     A newly acquired target is unwrapped beside the current emitter heading.
     The neck takes up to 0.5 rad of the change, leaving the base at its current
     angle whenever that is sufficient. While the target remains unchanged,
-    the neck lead decays toward zero with the specified 0.9 second time
-    constant and the base absorbs exactly the same angle. This keeps
-    ``base_yaw + neck_yaw`` on target without authoring base overshoot.
+    the neck lead decays toward the counter-yaw of the body-owned base layer
+    with the specified 0.9 second time constant. This preserves an authored
+    left-facing body silhouette while keeping ``base_yaw + neck_yaw`` exactly
+    on the live target, without authoring base overshoot.
     """
 
     __slots__ = (
@@ -125,7 +126,16 @@ class LookAtSolver:
                     NECK_LEAD_LIMIT_RAD,
                 )
             else:
-                lead = self._lead_rad * exp(
+                # ``current_base`` is the body layer before gaze: canonical
+                # engaged yaw plus any inspection offset. Recenter around its
+                # opposite rather than zero so gaze does not erase the
+                # animator's silhouette. The sum remains the target azimuth.
+                settled_lead = _clamp(
+                    -current_base,
+                    -NECK_LEAD_LIMIT_RAD,
+                    NECK_LEAD_LIMIT_RAD,
+                )
+                lead = settled_lead + (self._lead_rad - settled_lead) * exp(
                     -float(dt) / NECK_RECENTER_TIME_CONSTANT_S
                 )
 
