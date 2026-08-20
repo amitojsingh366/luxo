@@ -105,6 +105,14 @@ class ActionOp(str, Enum):
     WAIT = "wait"
 
 
+class VisualIntent(str, Enum):
+    """Cloud-owned decision about whether and how to acquire a fresh frame."""
+
+    NONE = "none"
+    INSPECT = "inspect"
+    SEARCH = "search"
+
+
 class GestureName(str, Enum):
     PERK_UP = "perk_up"
     NOD = "nod"
@@ -175,6 +183,8 @@ class Action:
 class PlanResponse:
     say: str
     plan: tuple[Action, ...]
+    visual_intent: VisualIntent | None = None
+    memory_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.say, str) or len(self.say) > SAY_MAX_CHARACTERS:
@@ -183,6 +193,21 @@ class PlanResponse:
             isinstance(action, Action) for action in self.plan
         ):
             raise TypeError("plan must be a tuple of Action values")
+        if self.visual_intent is not None and not isinstance(
+            self.visual_intent, VisualIntent
+        ):
+            raise TypeError("visual_intent must be a VisualIntent or null")
+        if not isinstance(self.memory_refs, tuple) or any(
+            not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
+            for value in self.memory_refs
+        ):
+            raise TypeError("memory_refs must be a tuple of safe object ids")
+        if len(self.memory_refs) > OBSERVATION_MAX_VISIBLE:
+            raise ValueError(
+                f"memory_refs supports at most {OBSERVATION_MAX_VISIBLE} ids"
+            )
+        if len(self.memory_refs) != len(set(self.memory_refs)):
+            raise ValueError("memory_refs must not contain duplicates")
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +318,42 @@ def parse_plan_response(payload: RawPayload) -> PlanResponse:
     """
 
     root = _payload_object(payload, "plan")
+    return _parse_plan_object(root)
+
+
+def parse_conversation_response(payload: RawPayload) -> PlanResponse:
+    """Validate the typed cloud decision that owns whether vision is needed."""
+
+    root = _payload_object(payload, "conversation")
+    raw_intent = root.get("visual_intent")
+    try:
+        visual_intent = VisualIntent(raw_intent)
+    except (TypeError, ValueError) as error:
+        raise ResponseSchemaError(
+            "conversation response requires visual_intent none, inspect, or search"
+        ) from error
+    raw_refs = root.get("memory_refs", [])
+    if not isinstance(raw_refs, list):
+        raise ResponseSchemaError("conversation memory_refs must be an array")
+    refs: list[str] = []
+    for value in raw_refs:
+        if not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None:
+            raise ResponseSchemaError("conversation memory_refs contains an invalid id")
+        if value not in refs:
+            refs.append(value)
+    return _parse_plan_object(
+        root,
+        visual_intent=visual_intent,
+        memory_refs=tuple(refs[:OBSERVATION_MAX_VISIBLE]),
+    )
+
+
+def _parse_plan_object(
+    root: JsonObject,
+    *,
+    visual_intent: VisualIntent | None = None,
+    memory_refs: tuple[str, ...] = (),
+) -> PlanResponse:
     if "say" not in root or "plan" not in root:
         raise ResponseSchemaError("plan response requires 'say' and 'plan'")
     say = _say(root["say"])
@@ -306,7 +367,12 @@ def parse_plan_response(payload: RawPayload) -> PlanResponse:
             actions.append(_parse_action(raw_action))
         except (TypeError, ValueError) as error:
             LOGGER.warning("dropping invalid action at index %d: %s", index, error)
-    return PlanResponse(say=say, plan=tuple(actions))
+    return PlanResponse(
+        say=say,
+        plan=tuple(actions),
+        visual_intent=visual_intent,
+        memory_refs=memory_refs,
+    )
 
 
 def parse_observation_response(payload: RawPayload) -> ObservationResponse:
@@ -639,9 +705,11 @@ __all__ = [
     "ResponseSchemaError",
     "SAY_MAX_CHARACTERS",
     "SfxName",
+    "VisualIntent",
     "WAIT_MAX_MS",
     "is_durable_scene_canonical",
     "normalize_canonical_label",
+    "parse_conversation_response",
     "parse_observation_response",
     "parse_plan_response",
 ]

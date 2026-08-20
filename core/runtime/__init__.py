@@ -17,6 +17,7 @@ from .interactions import (
     SPEECH_RETRY_BACKOFF_S,
     ConversationCoordinator,
     CoordinatorStatus,
+    MemoryReferenceCallback,
     ObservationOriginCallback,
     Stage,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "FrameRejection",
     "MAX_CAPTURE_ATTEMPTS",
     "MAX_SPEECH_ATTEMPTS",
+    "MemoryReferenceCallback",
     "ObservationOriginCallback",
     "ObservationResolver",
     "ObservationRuntime",

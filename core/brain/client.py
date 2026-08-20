@@ -21,11 +21,14 @@ from urllib.request import Request, urlopen
 from .prompts import FixedPromptBuilder, PromptBuilder
 from .memory import CloudSceneObject
 from .schema import (
+    Action,
     ActionOp,
     ObservationPrior,
     ObservationResponse,
     PlanResponse,
     ResponseSchemaError,
+    VisualIntent,
+    parse_conversation_response,
     parse_observation_response,
     parse_plan_response,
 )
@@ -61,7 +64,11 @@ T = TypeVar("T", PlanResponse, ObservationResponse)
 REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     "converse": (
         "Your conversation response was invalid. Return one bare JSON object with exactly "
-        "the top-level keys say and plan. Every plan item needs an op from gesture, "
+        "the top-level keys say, visual_intent, memory_refs, and plan. visual_intent must be none, "
+        "inspect, or search. Use none unless the current transcript needs a new camera "
+        "frame, inspect for a close/deictic subject, and search for a remembered object's "
+        "current location. memory_refs is an array of supplied obj_* ids discussed by the "
+        "current transcript. Every plan item needs an op from gesture, "
         "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
         "perk_up belongs in name with op set to gesture; it is never itself an op."
     ),
@@ -362,8 +369,21 @@ class OpenRouterBrainClient:
         payload = self._prompts.converse_payload(
             transcript, compact_memory, currently_visible, recent
         )
-        return self._run(
+        response = self._run(
             "converse", self._text_messages(payload), _parse_converse_response
+        )
+        allowed_ids = {
+            entry.split(":", 1)[0]
+            for entry in compact_memory.split("; ")
+            if ":" in entry
+        }
+        return replace(
+            response,
+            memory_refs=tuple(
+                object_id
+                for object_id in response.memory_refs
+                if object_id in allowed_ids
+            ),
         )
 
     def observe(
@@ -599,16 +619,28 @@ def _compact_json(value: object) -> str:
 
 
 def _parse_converse_response(raw: str) -> PlanResponse:
-    """Keep arbitrary model wording while bounding observation work."""
+    """Keep wording while making the typed visual decision authoritative."""
 
-    response = parse_plan_response(raw)
-    terminal_observe = bool(
-        response.plan and response.plan[-1].op is ActionOp.OBSERVE
+    response = parse_conversation_response(raw)
+    scan = next(
+        (action for action in response.plan if action.op is ActionOp.SCAN),
+        Action(ActionOp.SCAN),
     )
-    plan = tuple(action for action in response.plan if action.op is not ActionOp.OBSERVE)
-    if terminal_observe:
-        plan += (response.plan[-1],)
-    return PlanResponse(response.say, plan)
+    plan = tuple(
+        action
+        for action in response.plan
+        if action.op not in (ActionOp.SCAN, ActionOp.OBSERVE)
+    )
+    if response.visual_intent is VisualIntent.SEARCH:
+        plan += (scan,)
+    if response.visual_intent is not VisualIntent.NONE:
+        plan += (Action(ActionOp.OBSERVE),)
+    return PlanResponse(
+        response.say,
+        plan,
+        response.visual_intent,
+        response.memory_refs,
+    )
 
 
 def _parse_resolved_response(raw: str) -> PlanResponse:
@@ -618,6 +650,7 @@ def _parse_resolved_response(raw: str) -> PlanResponse:
     return PlanResponse(
         response.say,
         tuple(action for action in response.plan if action.op is not ActionOp.OBSERVE),
+        VisualIntent.NONE,
     )
 
 

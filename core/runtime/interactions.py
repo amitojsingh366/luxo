@@ -59,7 +59,7 @@ from ..brain.client import (
     RecentExchange,
 )
 from ..brain.memory import CloudSceneObject
-from ..brain.schema import Action, ActionOp, PlanResponse
+from ..brain.schema import Action, ActionOp, PlanResponse, VisualIntent
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..instrumentation import Milestone
 from ..plan_executor import PlanExecutor
@@ -85,6 +85,7 @@ MilestoneCallback = Callable[[Milestone, float], None]
 ObservationOriginCallback = Callable[
     [ObservationOrigin, tuple[RecentExchange, ...], ObservationPresentation], bool
 ]
+MemoryReferenceCallback = Callable[[tuple[str, ...], float], None]
 
 
 def _log_text(value: str) -> str:
@@ -205,6 +206,7 @@ class ConversationCoordinator:
         pcm_callback: PcmCallback,
         milestone_callback: MilestoneCallback | None = None,
         observation_origin_callback: ObservationOriginCallback | None = None,
+        memory_reference_callback: MemoryReferenceCallback | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         executor: Executor | None = None,
@@ -225,6 +227,10 @@ class ConversationCoordinator:
             observation_origin_callback
         ):
             raise TypeError("observation_origin_callback must be callable")
+        if memory_reference_callback is not None and not callable(
+            memory_reference_callback
+        ):
+            raise TypeError("memory_reference_callback must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._blackboard = blackboard
@@ -239,6 +245,7 @@ class ConversationCoordinator:
         self._pcm_callback = pcm_callback
         self._milestone_callback = milestone_callback
         self._observation_origin_callback = observation_origin_callback
+        self._memory_reference_callback = memory_reference_callback
         self._clock = clock
         self._sleep = sleep
         self._executor = executor or ThreadPoolExecutor(
@@ -635,6 +642,26 @@ class ConversationCoordinator:
             reply = PlanResponse(FALLBACK_SAY, ())
             fallback = True
             self._last_error = type(error).__name__
+        if reply.visual_intent is not None:
+            scan = next(
+                (action for action in reply.plan if action.op is ActionOp.SCAN),
+                Action(ActionOp.SCAN),
+            )
+            plan = tuple(
+                action
+                for action in reply.plan
+                if action.op not in (ActionOp.SCAN, ActionOp.OBSERVE)
+            )
+            if reply.visual_intent is VisualIntent.SEARCH:
+                plan += (scan,)
+            if reply.visual_intent is not VisualIntent.NONE:
+                plan += (Action(ActionOp.OBSERVE),)
+            reply = PlanResponse(
+                reply.say,
+                plan,
+                reply.visual_intent,
+                reply.memory_refs,
+            )
         observes = bool(reply.plan and reply.plan[-1].op is ActionOp.OBSERVE)
         say = _line(reply.say)
         if observes and self._observation_origin_callback is not None:
@@ -653,7 +680,12 @@ class ConversationCoordinator:
                 # An unbound capture could resolve against a stale turn. Drop
                 # the terminal observe while preserving the cloud-authored say
                 # and all non-capture actions.
-                reply = PlanResponse(reply.say, reply.plan[:-1])
+                reply = PlanResponse(
+                    reply.say,
+                    reply.plan[:-1],
+                    reply.visual_intent,
+                    reply.memory_refs,
+                )
                 observes = False
         if not say and not observes:
             # Blank conversational speech is Piper-invalid. A terminal observe
@@ -672,6 +704,11 @@ class ConversationCoordinator:
             LOGGER.info("CHAT Luxo: %s", _log_text(say))
         LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
         now = self._now()
+        if reply.memory_refs and self._memory_reference_callback is not None:
+            try:
+                self._memory_reference_callback(reply.memory_refs, now)
+            except Exception:
+                LOGGER.exception("memory reference callback failed")
         with self._blackboard.lock:
             self._plans.submit(reply.plan)
             self._mirror_plan_locked()
@@ -932,6 +969,7 @@ __all__ = [
     "FALLBACK_SAY",
     "MAX_RECENT",
     "MAX_SPEECH_ATTEMPTS",
+    "MemoryReferenceCallback",
     "ObservationOriginCallback",
     "SPEECH_RETRY_BACKOFF_S",
     "Stage",
