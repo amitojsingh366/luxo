@@ -76,15 +76,11 @@ naively that is two JPEGs for one ``observe`` (violating the PRD 5.3
 one-frame-per-observe guarantee) or two releases of one blocker.
 
 **ObservationRuntime owns the capture lifecycle and is the only component that
-emits ``capture_frame`` to the browser.** The deciding reason is retry
-ownership: ``ObservationRuntime._retry_or_fault_locked`` re-requests a frame
-through its own ``capture_callback`` after a failed analysis or a refused
-worker, up to ``MAX_CAPTURE_ATTEMPTS``. ``ActionRouter`` emits once per accepted
-``observe`` and has no re-request path at all. If the router owned emission, the
-first frame would arrive and every retry would be swallowed, leaving the plan
-blocked on a frame that was never asked for again. Staleness handling
-(``on_jpeg`` rejecting unsolicited and stale frames) lives with the same
-component for the same reason.
+emits ``capture_frame`` to the browser.** It binds one typed origin to one
+blocker and accepts one JPEG for that origin. Analysis or worker failure clears
+the lifecycle instead of sampling a different scene. Staleness handling
+(``on_jpeg`` rejecting unsolicited and stale frames) lives with that same
+single owner.
 
 **The router's ``capture_callback`` therefore feeds the observation runtime, not
 the protocol.** It is the *arming* signal: :meth:`LuxoApp._on_router_capture`
@@ -144,11 +140,9 @@ Two things about it belong here, because they are wiring decisions:
 Speech ownership — one speaker, one ``tts_done``
 ------------------------------------------------
 
-Three paths in this process produce a line to say: a dialogue reply, a fresh
-visual follow-up, and the observation runtime's narration of what went missing
-from the desk (PRD 8.3). They are **not** separate speakers.
-``ConversationCoordinator.speak`` stages either observation-authored line into
-the very slot a reply occupies, so all reach the browser
+Dialogue and post-observation resolutions both produce lines to say. They are
+**not** separate speakers. ``ConversationCoordinator.stage_observation_response``
+reserves the very slot a dialogue reply occupies, so every line reaches the browser
 through one synthesis, one wire validation, one raw prefix-free PCM delivery,
 one ``speak_begin``/``speak_end`` pair, and one bounded retry.
 
@@ -171,7 +165,7 @@ for a completion that has already been consumed. So:
   diagnostics. It has no state and no mutator; that is what makes it a view
   rather than a second owner.
 
-A narration is refused, never queued: see :meth:`LuxoApp._on_narration`.
+An observation result retains its blocker until that one speech slot is reserved.
 
 Outbound ownership
 ------------------
@@ -222,19 +216,16 @@ attribute by the domain that owns it, so the 120 Hz tick never waits on the
 10 Hz one to read it.
 
 One lock edge elsewhere is worth naming, because it is not visible from the tick
-order. ``ObservationRuntime`` holds its own lock while it invokes
-``narration_callback``, so :meth:`LuxoApp._on_narration` takes the conversation
-lock *under* the observation lock. That is safe in exactly one direction, and it
-is the direction that holds: the coordinator, under its own lock, reaches only
-the FSM, the blackboard, the plan executor, and the outbound callbacks. It never
-reaches the observation runtime, so the two can never close a cycle.
+order. ``ObservationRuntime`` holds its own lock while it invokes the resolution
+callback, so :meth:`LuxoApp._on_observation_resolution` takes the conversation
+lock *under* the observation lock. That is safe in exactly one direction: the
+coordinator never reaches the observation runtime while holding its own lock.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-import re
 import threading
 import time
 from collections.abc import Callable
@@ -247,9 +238,13 @@ from ..animation.lookat import LookAtTarget
 from ..animation.runtime import FIXED_DT, TICK_HZ, AnimationDiscontinuityError, AnimationRuntime, AnimationSample
 from ..animation.poses import PoseLibrary, load_pose_library
 from ..blackboard import Blackboard, BlackboardSnapshot, GazeFact, Telemetry
-from ..brain.client import BrainClient, CallMetrics
+from ..brain.client import (
+    BrainClient,
+    CallMetrics,
+    ObservationOrigin,
+    RecentExchange,
+)
 from ..brain.memory import SceneMemoryStore
-from ..brain.missing import MissingComparison, MissingNarration, MissingObjectCoordinator
 from ..brain.observe import ObservationCoordinator
 from ..brain.schema import Action, ActionOp, PlanResponse
 from ..config import FrozenConfig, load_config
@@ -339,83 +334,6 @@ HAND_INQUIRY_DELAY_S: Final = 4.0
 HAND_LOST_GRACE_S: Final = 0.6
 """Brief landmark dropouts do not restart the hand-attention dwell."""
 
-_MISSING_SCENE_QUERY = re.compile(
-    r"\b(missing|gone|disappear(?:ed)?|vanish(?:ed)?|removed|still\s+(?:there|visible)|"
-    r"still\s+in\s+(?:the\s+)?(?:view|scene)|what\s+changed|where\s+did\b)"
-)
-_SCENE_FOCUS_STOP_WORDS: Final = frozenset(
-    {
-        "about", "ask", "can", "color", "could", "did", "for", "from", "have",
-        "here", "identify", "into", "just", "look", "me", "my", "object", "of",
-        "please", "remember", "scene", "see", "show", "something", "tell", "that",
-        "the", "this", "to", "was", "what", "where", "with", "you", "your",
-    }
-)
-
-
-def _asks_missing_scene_question(transcript: str) -> bool:
-    if not isinstance(transcript, str):
-        return False
-    normalized = " ".join(transcript.casefold().split())
-    return bool(_MISSING_SCENE_QUERY.search(normalized))
-
-
-def _asks_current_visual_question(transcript: str) -> bool:
-    """Recognize present-tense visual detail requests, not memory recall."""
-
-    if not isinstance(transcript, str):
-        return False
-    normalized = " ".join(transcript.casefold().replace("’", "'").split())
-    historical = (
-        "remember",
-        "yesterday",
-        "earlier",
-        "before",
-        "last time",
-        "did you see",
-        "did it look",
-        "what color was",
-        "what colour was",
-    )
-    if any(phrase in normalized for phrase in historical):
-        return False
-    current = (
-        "look at this",
-        "look at that",
-        "take a look",
-        "what do you see",
-        "what can you see",
-        "what is in my hand",
-        "what's in my hand",
-        "what am i holding",
-        "what is this",
-        "what's this",
-        "what is that",
-        "what's that",
-        "what color",
-        "what colour",
-        "which color",
-        "which colour",
-        "what material",
-        "what is it made of",
-        "what does it look like",
-    )
-    return any(phrase in normalized for phrase in current)
-
-
-def _scene_focus_terms(transcript: str) -> frozenset[str]:
-    if not isinstance(transcript, str):
-        return frozenset()
-    return frozenset(
-        token
-        for token in re.findall(r"[a-z0-9]+", transcript.casefold())
-        if len(token) >= 3 and token not in _SCENE_FOCUS_STOP_WORDS
-    )
-
-
-def _label_terms(label: str) -> frozenset[str]:
-    return frozenset(re.findall(r"[a-z0-9]+", label.casefold()))
-
 MAX_TICK_BACKSTEP_S: Final = 1.0
 """A wall-clock step back larger than this re-anchors instead of being clamped."""
 
@@ -489,15 +407,13 @@ def target_angles(
 class AppStatus:
     """Immutable diagnostic view; carries no transcript, image, or plan text.
 
-    ``narrations_spoken`` counts lines this module handed to
-    ``ConversationCoordinator.speak`` and that it accepted — staged for speech,
+    ``observation_responses_spoken`` counts resolved lines this module handed to
+    ``ConversationCoordinator.stage_observation_response`` and that it accepted,
     not confirmed played. Completion is the browser's to declare and lands on
     the coordinator, which is where to read it from; counting it here would
     mean tracking a line the coordinator already owns.
-    ``narrations_dropped`` counts the rest: blank lines, and lines refused
-    because the one speech slot was in use. Together they are every narration
-    that reached :meth:`LuxoApp._on_narration`, so a line can never vanish
-    unaccounted for.
+    ``observation_responses_dropped`` counts responses refused because the speech
+    slot was unexpectedly in use. There is no separate narration path.
     """
 
     state: BehaviorState
@@ -510,8 +426,8 @@ class AppStatus:
     capture_frames_sent: int
     router_capture_signals: int
     observation_arm_timeouts: int
-    narrations_spoken: int
-    narrations_dropped: int
+    observation_responses_spoken: int
+    observation_responses_dropped: int
     resets_applied: int
     last_latency_ms: float
     running: bool
@@ -761,12 +677,6 @@ class LuxoApp:
         else:
             self._latency = None
 
-        # Explicit absence questions are one-shot. Object focus lasts only a
-        # few dialogue turns so incidental background never becomes a topic.
-        self._scene_report_requested = threading.Event()
-        self._scene_focus_lock = threading.Lock()
-        self._scene_focus: set[str] = set()
-        self._scene_focus_turns = 0
         self._conversation = ConversationCoordinator(
             blackboard=self._blackboard,
             fsm=self._fsm,
@@ -775,10 +685,11 @@ class LuxoApp:
             brain=brain,
             tts=tts,
             compact_memory=self._memory.compact_line,
+            currently_visible=self._memory.currently_visible,
             speak_callback=self._send_speak,
             pcm_callback=self._protocol.publish_tts_pcm,
             milestone_callback=None if self._latency is None else self._latency.on_milestone,
-            scene_turn_callback=self._on_scene_turn,
+            observation_origin_callback=self._bind_dialogue_origin,
             clock=clock,
             sleep=sleep,
             executor=conversation_executor,
@@ -794,23 +705,23 @@ class LuxoApp:
             fsm=self._fsm,
             plan_executor=self._plans,
             observations=self._observation_coordinator,
-            missing=MissingObjectCoordinator(brain),
             baseline_labels=self._baseline_labels,
             # The single owner of outbound capture_frame.
             capture_callback=self._send_capture_frame,
-            narration_callback=self._on_narration,
-            scene_commenter=lambda intent, observation: brain.scene_comment(
-                intent,
+            resolver=lambda origin, observation, missing, recent: brain.resolve_observation(
+                origin,
                 observation,
+                missing,
                 self._memory.compact_line(),
+                self._memory.currently_visible(),
+                recent,
             ),
-            scene_comment_callback=self._on_scene_comment,
-            should_narrate=self._should_narrate_scene,
+            resolution_callback=self._on_observation_resolution,
             executor=observation_executor,
         )
 
-        # A projection of the coordinator, not a second speaker. Narration and
-        # dialogue share one staging slot, one worker pool, and one ``speaking``.
+        # A projection of the coordinator, not a second speaker. All lines
+        # share one staging slot, one worker pool, and one ``speaking`` fact.
         self._narration = UnpromptedSpeech(self._conversation)
 
         self._wake = WakeSequenceCoordinator(
@@ -844,8 +755,8 @@ class LuxoApp:
         self._router_capture_signals = 0
         self._capture_frames_sent = 0
         self._observation_arm_timeouts = 0
-        self._narrations_spoken = 0
-        self._narrations_dropped = 0
+        self._observation_responses_spoken = 0
+        self._observation_responses_dropped = 0
         self._cue_failures = 0
 
         # Hand attention is a measured browser fact. The behavior tick owns
@@ -953,8 +864,8 @@ class LuxoApp:
                 capture_frames_sent=self._capture_frames_sent,
                 router_capture_signals=self._router_capture_signals,
                 observation_arm_timeouts=self._observation_arm_timeouts,
-                narrations_spoken=self._narrations_spoken,
-                narrations_dropped=self._narrations_dropped,
+                observation_responses_spoken=self._observation_responses_spoken,
+                observation_responses_dropped=self._observation_responses_dropped,
                 resets_applied=resets,
                 last_latency_ms=0.0 if self._latency is None else self._latency.last_latency_ms,
                 running=self._started and not self._stopping.is_set(),
@@ -1055,10 +966,6 @@ class LuxoApp:
         bound. Every counter above them is cumulative telemetry and is kept.
         """
 
-        self._scene_report_requested.clear()
-        with self._scene_focus_lock:
-            self._scene_focus.clear()
-            self._scene_focus_turns = 0
         with self._lock:
             self._capture_armed_id = None
             self._pending_blocker_id = None
@@ -1096,7 +1003,7 @@ class LuxoApp:
             elif isinstance(message, ErrorMessage):
                 LOGGER.warning("browser reported %s: %s", message.where, message.detail)
                 if message.where == "camera":
-                    pending_visual = self._observations.cancel_visual_followup()
+                    pending_visual = self._observations.cancel_origin()
                     if (
                         pending_visual
                         or self._observations.stage is not ObservationStage.IDLE
@@ -1239,147 +1146,29 @@ class LuxoApp:
             self._router_capture_signals += 1
             self._capture_armed_id = message.req_id
 
-    def _on_narration(self, narration: MissingNarration) -> None:
-        """Stage the observation runtime's narration as an unprompted line.
+    def _bind_dialogue_origin(
+        self,
+        origin: ObservationOrigin,
+        recent: tuple[RecentExchange, ...],
+    ) -> bool:
+        """Bind the exact cloud-approved dialogue turn without interpreting it."""
 
-        ``ConversationCoordinator.speak`` is the whole hop: the line is put in
-        the same slot a brain reply occupies and immediately submits it through
-        the same worker, synthesis, wire validation, raw
-        prefix-free PCM delivery and ``speak_begin``/``speak_end`` pair. Nothing
-        about narration reaches the transport from here.
+        return self._observations.bind_origin(origin, recent)
 
-        **A blank line is dropped before it reaches the coordinator.** That is
-        not a redundant guard: ``PlanResponse`` caps ``say`` at a length but
-        does not require it to be non-empty, and ``speak`` substitutes the
-        in-character *dialogue* fallback for a blank line, which is right for a
-        reply that failed and wrong for a narration — the lamp would answer an
-        observation nobody prompted with "my thoughts got tangled".
+    def _on_observation_resolution(
+        self,
+        origin: ObservationOrigin,
+        response: PlanResponse,
+    ) -> bool:
+        """Reserve final observation speech in the single coordinator slot."""
 
-        **A refused narration is dropped with a log, never retried or queued.**
-        Three reasons, in order of weight:
-
-        * Nothing is stranded by dropping it. ``ObservationRuntime`` releases
-          the plan blocker before it narrates, so the line is the entire cost;
-          the rest of the plan runs either way.
-        * Retrying needs somewhere to hold the line until the slot frees, and
-          that place is a second staging slot — which is a second owner of the
-          spoken line under another name, and is exactly what this wiring
-          exists to remove.
-        * A narration is a remark about a moment. Deferring it behind a reply
-          means saying "your keys wandered off" after the conversation has
-          moved on, which is worse than not saying it.
-
-        The refusal is counted rather than swallowed, so ``status()`` can still
-        show that a line was lost.
-        """
-
-        say = narration.response.say
-        if not say.strip():
-            LOGGER.debug("narration dropped: the model returned a blank line")
-            with self._lock:
-                self._narrations_dropped += 1
-            return
-        if self._conversation.speak(say, dispatch=True):
-            with self._lock:
-                self._narrations_spoken += 1
-            return
+        accepted = self._conversation.stage_observation_response(origin, response)
         with self._lock:
-            self._narrations_dropped += 1
-        LOGGER.info("narration dropped: the speech slot is already in use")
-
-    def _on_scene_comment(self, response: PlanResponse) -> None:
-        """Stage a fresh-fact comment through the one conversation speaker."""
-
-        say = response.say
-        if not say.strip():
-            LOGGER.debug("scene comment dropped: the model returned a blank line")
-            with self._lock:
-                self._narrations_dropped += 1
-            return
-        if self._conversation.speak(say, dispatch=True):
-            with self._lock:
-                self._narrations_spoken += 1
-            return
-        with self._lock:
-            self._narrations_dropped += 1
-        LOGGER.info("scene comment dropped: the speech slot is already in use")
-
-    def _on_scene_turn(self, transcript: str, observes: bool = True) -> None:
-        """Keep short-lived object context and arm explicit absence reports."""
-
-        requested = observes and _asks_missing_scene_question(transcript)
-        if requested:
-            self._scene_report_requested.set()
-            self._observations.cancel_visual_followup()
-        else:
-            self._scene_report_requested.clear()
-            if (
-                observes
-                and _asks_current_visual_question(transcript)
-                and not self._observations.request_visual_followup(transcript)
-            ):
-                LOGGER.info("SCENE visual follow-up dropped: observation already active")
-
-        terms = _scene_focus_terms(transcript)
-        scene_memory = self._blackboard.snapshot().scene_memory
-        known_terms = (
-            frozenset().union(
-                *(_label_terms(record.canonical) for record in scene_memory)
-            )
-            if scene_memory
-            else frozenset()
-        )
-        matched = terms & known_terms
-        normalized = " ".join(transcript.casefold().split())
-        pointing = bool(
-            re.search(r"\b(remember|show(?:ing|ed)?|look\s+at|this\s+is)\b", normalized)
-        )
-        candidate = matched or (terms if pointing else frozenset())
-        with self._scene_focus_lock:
-            if candidate:
-                self._scene_focus = set(candidate)
-                self._scene_focus_turns = 3
-            elif self._scene_focus_turns > 0:
-                self._scene_focus_turns -= 1
-                if self._scene_focus_turns == 0:
-                    self._scene_focus.clear()
-            focus_log = sorted(self._scene_focus)
-        LOGGER.info(
-            "SCENE speech requested=%s observes=%s focus=%s",
-            str(requested).lower(),
-            str(observes).lower(),
-            focus_log,
-        )
-
-    def _should_narrate_scene(
-        self, comparison: MissingComparison
-    ) -> tuple[str, ...] | None:
-        """Select explicit or context-relevant absences; suppress background."""
-
-        requested = self._scene_report_requested.is_set()
-        self._scene_report_requested.clear()
-        with self._scene_focus_lock:
-            focus = frozenset(self._scene_focus)
-        contextual = tuple(
-            label for label in comparison.missing if _label_terms(label) & focus
-        )
-        selected = comparison.missing if requested else contextual
-        if selected:
-            consumed = frozenset().union(*(_label_terms(label) for label in selected))
-            with self._scene_focus_lock:
-                self._scene_focus.difference_update(consumed)
-                if not self._scene_focus:
-                    self._scene_focus_turns = 0
-        LOGGER.info(
-            "SCENE speech decision requested=%s missing=%s contextual=%s speak=%s",
-            str(requested).lower(),
-            len(comparison.missing),
-            list(contextual),
-            str(requested or bool(contextual)).lower(),
-        )
-        # An explicitly requested empty report must still say that nothing is
-        # missing; ``None`` alone means no speech.
-        return tuple(selected) if requested or contextual else None
+            if accepted:
+                self._observation_responses_spoken += 1
+            else:
+                self._observation_responses_dropped += 1
+        return accepted
 
     def _emit_wake_action(self, action: Action) -> None:
         """Submit one PRD 10.4 waking beat through the normal plan path.
@@ -1395,7 +1184,7 @@ class LuxoApp:
     def _baseline_labels(self) -> tuple[str, ...]:
         """Return objects visible on the prior frame, never stale history.
 
-        Missing-object narration compares one scene snapshot with the next.
+        Missing-object resolution compares one scene snapshot with the next.
         Records already marked absent stay in memory for recall, but including
         them in every later baseline would make Luxo repeatedly announce the
         same disappearance after unrelated observations.
@@ -1474,12 +1263,12 @@ class LuxoApp:
 
         self._conversation.tick()
 
-        self._tick_hand_inquiry(now)
+        hand_plan_started = self._tick_hand_inquiry(now)
 
         # The coordinator may have submitted a plan and re-mirrored its depth,
         # so the router must route against the fresh view, not the stale one.
         snapshot = self._blackboard.snapshot()
-        if self._fsm.state not in PLAN_HELD_STATES:
+        if not hand_plan_started and self._fsm.state not in PLAN_HELD_STATES:
             with self._director_lock:
                 try:
                     self._router.tick(snapshot, now)
@@ -1488,7 +1277,7 @@ class LuxoApp:
                     # the only way to avoid a blocker nobody will release.
                     LOGGER.exception("action routing failed; cancelling the plan")
                     self._router.cancel("routing_failed")
-                    self._observations.cancel_visual_followup()
+                    self._observations.cancel_origin()
 
         self._tick_observations(now)
         self._post_plan_drained()
@@ -1499,7 +1288,7 @@ class LuxoApp:
             self._state_name = self._fsm.state
             self._arousal = AROUSAL_BY_STATE.get(self._state_name, 0.15)
 
-    def _tick_hand_inquiry(self, now: float) -> None:
+    def _tick_hand_inquiry(self, now: float) -> bool:
         """Observe once after a quiet, continuous hand presentation."""
 
         with self._lock:
@@ -1508,7 +1297,7 @@ class LuxoApp:
                 self._hands_seen_since = None
                 self._hands_last_seen = None
                 self._hand_inquiry_asked = False
-                return
+                return False
             seen_since = self._hands_seen_since
             already_asked = self._hand_inquiry_asked
         if (
@@ -1520,12 +1309,20 @@ class LuxoApp:
             or self._plans.state.depth > 0
             or self._observations.stage is not ObservationStage.IDLE
         ):
-            return
-        if not self._observations.request_visual_followup("spontaneous_hand"):
-            return
+            return False
+        origin = ObservationOrigin("scene_event", "hand_presented")
+        if not self._observations.bind_origin(
+            origin,
+            self._conversation.status.recent,
+        ):
+            return False
         self._plans.submit((Action(ActionOp.OBSERVE),))
+        self._fsm.post_event(BehaviorEvent.PLAN_READY)
         with self._lock:
             self._hand_inquiry_asked = True
+        # Do not route in ENGAGED on this same beat. PLAN_READY moves the FSM
+        # to ACTING first, so OBSERVE_START is posted from its valid source.
+        return True
 
     def _apply_transition(self, transition: Transition) -> None:
         """Apply one state beat to the body, cancelling everything it must.

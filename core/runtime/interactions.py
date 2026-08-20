@@ -50,7 +50,8 @@ from threading import RLock
 from typing import Final
 
 from ..blackboard import Blackboard, UtteranceFact
-from ..brain.client import BrainClient, RecentExchange
+from ..brain.client import BrainClient, ObservationOrigin, RecentExchange
+from ..brain.memory import CloudSceneObject
 from ..brain.schema import Action, ActionOp, PlanResponse
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..instrumentation import Milestone
@@ -74,7 +75,9 @@ DEFAULT_WORKERS: Final = 2
 SpeakCallback = Callable[[SpeakBeginMessage | SpeakEndMessage], None]
 PcmCallback = Callable[[bytes], None]
 MilestoneCallback = Callable[[Milestone, float], None]
-SceneTurnCallback = Callable[[str, bool], None]
+ObservationOriginCallback = Callable[
+    [ObservationOrigin, tuple[RecentExchange, ...]], bool
+]
 
 
 def _log_text(value: str) -> str:
@@ -173,21 +176,31 @@ class ConversationCoordinator:
         brain: BrainClient,
         tts: TextToSpeech,
         compact_memory: Callable[[], str],
+        currently_visible: Callable[[], tuple[CloudSceneObject, ...]],
         speak_callback: SpeakCallback,
         pcm_callback: PcmCallback,
         milestone_callback: MilestoneCallback | None = None,
-        scene_turn_callback: SceneTurnCallback | None = None,
+        observation_origin_callback: ObservationOriginCallback | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         executor: Executor | None = None,
     ) -> None:
-        callbacks = (compact_memory, speak_callback, pcm_callback, clock, sleep)
+        callbacks = (
+            compact_memory,
+            currently_visible,
+            speak_callback,
+            pcm_callback,
+            clock,
+            sleep,
+        )
         if not all(callable(item) for item in callbacks):
             raise TypeError("coordinator callbacks must be callable")
         if milestone_callback is not None and not callable(milestone_callback):
             raise TypeError("milestone_callback must be callable")
-        if scene_turn_callback is not None and not callable(scene_turn_callback):
-            raise TypeError("scene_turn_callback must be callable")
+        if observation_origin_callback is not None and not callable(
+            observation_origin_callback
+        ):
+            raise TypeError("observation_origin_callback must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._blackboard = blackboard
@@ -197,10 +210,11 @@ class ConversationCoordinator:
         self._brain = brain
         self._tts = tts
         self._compact_memory = compact_memory
+        self._currently_visible = currently_visible
         self._speak_callback = speak_callback
         self._pcm_callback = pcm_callback
         self._milestone_callback = milestone_callback
-        self._scene_turn_callback = scene_turn_callback
+        self._observation_origin_callback = observation_origin_callback
         self._clock = clock
         self._sleep = sleep
         self._executor = executor or ThreadPoolExecutor(
@@ -364,6 +378,46 @@ class ConversationCoordinator:
             LOGGER.info("CHAT Luxo (scene): %s", _log_text(self._reply))
             if dispatch:
                 self._dispatch_speech_locked()
+            return True
+
+    def stage_observation_response(
+        self,
+        origin: ObservationOrigin,
+        response: PlanResponse,
+    ) -> bool:
+        """Reserve the single speech slot for one resolved observation turn.
+
+        The observation runtime keeps its blocker until this succeeds. The FSM
+        then moves INSPECTING -> SPEAKING and the ordinary coordinator tick
+        dispatches the line, so it cannot be superseded by a new dialogue turn.
+        """
+
+        if not isinstance(origin, ObservationOrigin):
+            raise TypeError("origin must be an ObservationOrigin")
+        if not isinstance(response, PlanResponse):
+            raise TypeError("response must be a PlanResponse")
+        say = _line(response.say) or FALLBACK_SAY
+        with self._lock:
+            if (
+                self._closed
+                or self._stage is not Stage.IDLE
+                or self._speaking
+                or self._fsm.state is not BehaviorState.INSPECTING
+            ):
+                return False
+            self._generation += 1
+            self._completions.clear()
+            self._reply = say
+            self._unprompted = False
+            self._stage = Stage.REPLIED
+            self._last_error = "blank_say" if not response.say.strip() else None
+            if origin.kind == "dialogue":
+                for index in range(len(self._recent) - 1, -1, -1):
+                    exchange = self._recent[index]
+                    if exchange.human_say == origin.text:
+                        self._recent[index] = RecentExchange(origin.text, say)
+                        break
+            LOGGER.info("CHAT Luxo (scene): %s", _log_text(say))
             return True
 
     def tick(self) -> None:
@@ -557,16 +611,19 @@ class ConversationCoordinator:
         fallback = say == FALLBACK_SAY and not reply.plan
         LOGGER.info("CHAT Luxo: %s", _log_text(say))
         LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
-        if self._scene_turn_callback is not None:
+        observes = bool(reply.plan and reply.plan[-1].op is ActionOp.OBSERVE)
+        if observes and self._observation_origin_callback is not None:
+            origin = ObservationOrigin("dialogue", self._transcript or "")
             try:
-                self._scene_turn_callback(
-                    self._transcript or "",
-                    any(action.op is ActionOp.OBSERVE for action in reply.plan),
-                )
+                bound = self._observation_origin_callback(origin, tuple(self._recent))
             except Exception:
-                # A policy failure must suppress follow-up speech, never
-                # invalidate an otherwise valid dialogue reply and plan.
-                LOGGER.exception("observation speech policy callback failed")
+                LOGGER.exception("observation origin callback failed")
+                bound = False
+            if not bound:
+                # An unbound capture could resolve against a stale turn. Drop
+                # the terminal observe while preserving the cloud-authored say
+                # and all non-capture actions.
+                reply = PlanResponse(reply.say, reply.plan[:-1])
         now = self._now()
         with self._blackboard.lock:
             self._plans.submit(reply.plan)
@@ -621,7 +678,17 @@ class ConversationCoordinator:
             json.dumps(_log_text(memory), ensure_ascii=False),
             json.dumps(context, ensure_ascii=False, separators=(",", ":")),
         )
-        return self._brain.converse(transcript, memory, recent[-MAX_RECENT:])
+        visible = self._currently_visible()
+        if not isinstance(visible, tuple) or not all(
+            isinstance(item, CloudSceneObject) for item in visible
+        ):
+            raise TypeError("currently_visible must return CloudSceneObject values")
+        return self._brain.converse(
+            transcript,
+            memory,
+            visible,
+            recent[-MAX_RECENT:],
+        )
 
     def _deliver(self, generation: int, text: str, unprompted: bool = False) -> None:
         """Synthesize and stream one utterance; this never runs on the tick."""
@@ -802,6 +869,7 @@ __all__ = [
     "FALLBACK_SAY",
     "MAX_RECENT",
     "MAX_SPEECH_ATTEMPTS",
+    "ObservationOriginCallback",
     "SPEECH_RETRY_BACKOFF_S",
     "Stage",
 ]

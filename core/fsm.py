@@ -46,6 +46,8 @@ class BehaviorEvent(str, Enum):
     SPEECH_DONE = "speech_done"
     OBSERVE_START = "observe_start"
     OBSERVE_COMPLETE = "observe_complete"
+    PLAN_READY = "plan_ready"
+    OBSERVATION_RESPONSE = "observation_response"
     PLAN_DRAINED = "plan_drained"
 
 
@@ -303,6 +305,9 @@ class BehaviorFSM:
         if self._state is BehaviorState.ENGAGED and event is BehaviorEvent.VAD_START:
             return BehaviorState.LISTENING, "vad_start"
 
+        elif self._state is BehaviorState.ENGAGED and event is BehaviorEvent.PLAN_READY:
+            return BehaviorState.ACTING, "plan_ready"
+
         elif (
             self._state is BehaviorState.LISTENING
             and event is BehaviorEvent.TRANSCRIPT_READY
@@ -331,6 +336,11 @@ class BehaviorFSM:
             and event is BehaviorEvent.OBSERVE_COMPLETE
         ):
             return BehaviorState.ACTING, "observe_complete"
+        elif (
+            self._state is BehaviorState.INSPECTING
+            and event is BehaviorEvent.OBSERVATION_RESPONSE
+        ):
+            return BehaviorState.SPEAKING, "observation_response"
         return None
 
     def _transition(

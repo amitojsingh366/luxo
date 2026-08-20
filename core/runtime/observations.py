@@ -39,10 +39,10 @@ re-verified before every capture dispatch and again before any frame is handed
 to a worker. A disagreement is a bug: it is logged, counted, and resolved by
 clearing both sides together so neither is left stranded.
 
-Comparison. The model performs perception (``observe``) and narration
-(``narrate``) only. ``missing`` is computed here in Python by
-:func:`core.brain.missing.compute_missing` against the baseline captured
-*before* the observation, and the model is never asked to compare (PRD 8.3).
+Resolution. The vision call returns facts only. ``missing`` is computed here in
+Python against the baseline captured *before* the observation. The runtime then
+always makes one generalized resolution call with the exact typed origin,
+fresh facts, and complete diff, including when the diff is empty.
 """
 
 from __future__ import annotations
@@ -56,34 +56,30 @@ from enum import Enum
 from threading import RLock
 from typing import Final
 
-from ..brain.missing import (
-    MissingComparison,
-    MissingNarration,
-    MissingObjectCoordinator,
-    compute_observation_missing,
-)
+from ..brain.client import ObservationOrigin, RecentExchange
+from ..brain.missing import compute_observation_missing
 from ..brain.observe import (
     ObservationBusyError,
     ObservationCoordinator,
     ObservationRequestError,
 )
-from ..brain.client import ObservationEnvelope, ValidatedObservation
-from ..brain.schema import ObservationResponse, PlanResponse, normalize_canonical_label
+from ..brain.schema import ObservationResponse, PlanResponse
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..plan_executor import ObservationReleaseError, PlanExecutor
 from ..protocol.messages import CaptureFrameMessage
 
 LOGGER = logging.getLogger(__name__)
 
-MAX_CAPTURE_ATTEMPTS: Final = 3
+MAX_CAPTURE_ATTEMPTS: Final = 1
 DEFAULT_WORKERS: Final = 1
 
 CaptureCallback = Callable[[CaptureFrameMessage], None]
-NarrationCallback = Callable[[MissingNarration], None]
-SceneCommenter = Callable[[str, ValidatedObservation], PlanResponse]
-SceneCommentCallback = Callable[[PlanResponse], None]
+ObservationResolver = Callable[
+    [ObservationOrigin, ObservationResponse, tuple[str, ...], tuple[RecentExchange, ...]],
+    PlanResponse,
+]
+ResolutionCallback = Callable[[ObservationOrigin, PlanResponse], bool]
 BaselineLabels = Callable[[], Sequence[str]]
-NarratePolicy = Callable[[MissingComparison], bool | Sequence[str] | None]
 
 
 class ObservationStage(str, Enum):
@@ -92,8 +88,7 @@ class ObservationStage(str, Enum):
     IDLE = "idle"
     REQUESTED = "requested"
     ANALYZING = "analyzing"
-    NARRATING = "narrating"
-    COMMENTING = "commenting"
+    RESOLVING = "resolving"
 
 
 class FrameRejection(str, Enum):
@@ -116,7 +111,7 @@ class ObservationStatus:
     capture_attempts: int
     captures_requested: int
     observations_completed: int
-    narrations: int
+    resolutions: int
     rejected_frames: int
     faults: int
     last_missing: tuple[str, ...]
@@ -144,37 +139,8 @@ _OUTSTANDING: Final = frozenset(
 )
 
 
-def _narrate_when_missing(comparison: MissingComparison) -> bool:
-    """Narrate only a real absence; a plain inspection has nothing to report."""
-
-    return bool(comparison.missing)
-
-
-def _selected_comparison(
-    comparison: MissingComparison,
-    decision: bool | Sequence[str] | None,
-) -> MissingComparison | None:
-    """Turn policy output into a safe subset; ``None`` means stay silent."""
-
-    if decision is True:
-        selected = comparison.missing
-    elif decision is False or decision is None:
-        return None
-    else:
-        if isinstance(decision, (str, bytes, bytearray)) or not isinstance(
-            decision, Sequence
-        ):
-            raise TypeError("narration policy must return bool, labels, or None")
-        selected = tuple(
-            dict.fromkeys(normalize_canonical_label(label) for label in decision)
-        )
-        if not set(selected).issubset(comparison.missing):
-            raise ValueError("narration policy selected an object that is not missing")
-    return MissingComparison(comparison.baseline, comparison.present, selected)
-
-
 class ObservationRuntime:
-    """Tie one ``observe`` op to one captured frame, memory, and narration.
+    """Tie one typed observation origin to one frame, memory, and resolution.
 
     Every public method is safe to call from socket, worker, and tick threads.
     The outbound callbacks must be quick, non-blocking enqueues and must never
@@ -193,38 +159,29 @@ class ObservationRuntime:
         fsm: BehaviorFSM,
         plan_executor: PlanExecutor,
         observations: ObservationCoordinator,
-        missing: MissingObjectCoordinator,
         baseline_labels: BaselineLabels,
         capture_callback: CaptureCallback,
-        narration_callback: NarrationCallback,
-        scene_commenter: SceneCommenter | None = None,
-        scene_comment_callback: SceneCommentCallback | None = None,
-        should_narrate: NarratePolicy | None = None,
+        resolver: ObservationResolver,
+        resolution_callback: ResolutionCallback,
         executor: Executor | None = None,
     ) -> None:
-        callbacks = (baseline_labels, capture_callback, narration_callback)
+        callbacks = (
+            baseline_labels,
+            capture_callback,
+            resolver,
+            resolution_callback,
+        )
         if not all(callable(item) for item in callbacks):
             raise TypeError("observation runtime callbacks must be callable")
-        if should_narrate is not None and not callable(should_narrate):
-            raise TypeError("should_narrate must be callable")
-        if (scene_commenter is None) != (scene_comment_callback is None):
-            raise TypeError("scene comment worker and callback must be provided together")
-        if scene_commenter is not None and not callable(scene_commenter):
-            raise TypeError("scene_commenter must be callable")
-        if scene_comment_callback is not None and not callable(scene_comment_callback):
-            raise TypeError("scene_comment_callback must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._fsm = fsm
         self._plans = plan_executor
         self._observations = observations
-        self._missing = missing
         self._baseline_labels = baseline_labels
         self._capture_callback = capture_callback
-        self._narration_callback = narration_callback
-        self._scene_commenter = scene_commenter
-        self._scene_comment_callback = scene_comment_callback
-        self._should_narrate = should_narrate or _narrate_when_missing
+        self._resolver = resolver
+        self._resolution_callback = resolution_callback
         self._executor = executor or ThreadPoolExecutor(
             max_workers=DEFAULT_WORKERS, thread_name_prefix="luxo-observation"
         )
@@ -242,13 +199,15 @@ class ObservationRuntime:
         self._stale_frame_expected = False
         self._captures_requested = 0
         self._observations_completed = 0
-        self._narrations = 0
+        self._resolutions = 0
         self._rejected_frames = 0
         self._faults = 0
         self._last_missing: tuple[str, ...] = ()
         self._last_rejection: FrameRejection | None = None
         self._last_error: str | None = None
-        self._visual_intent: str | None = None
+        self._pending_origin: ObservationOrigin | None = None
+        self._active_origin: ObservationOrigin | None = None
+        self._origin_recent: tuple[RecentExchange, ...] = ()
 
     @property
     def status(self) -> ObservationStatus:
@@ -261,7 +220,7 @@ class ObservationRuntime:
                 capture_attempts=self._attempts,
                 captures_requested=self._captures_requested,
                 observations_completed=self._observations_completed,
-                narrations=self._narrations,
+                resolutions=self._resolutions,
                 rejected_frames=self._rejected_frames,
                 faults=self._faults,
                 last_missing=self._last_missing,
@@ -334,9 +293,7 @@ class ObservationRuntime:
             try:
                 future = self._executor.submit(self._analyze, request_id, frame)
             except Exception as error:
-                # A refused worker leaves the capture unanalyzed, so it takes
-                # the same bounded re-capture path as a failed analysis.
-                self._retry_or_fault_locked(type(error).__name__)
+                self._fail_observation_locked(type(error).__name__)
                 return False
             self._future = future
             future.add_done_callback(
@@ -344,35 +301,38 @@ class ObservationRuntime:
             )
             return True
 
-    def request_visual_followup(self, intent: str) -> bool:
-        """Attach one dialogue intent to the next observation.
+    def bind_origin(
+        self,
+        origin: ObservationOrigin,
+        recent: Sequence[RecentExchange] = (),
+    ) -> bool:
+        """Bind one typed cloud-approved origin to the next observe blocker."""
 
-        The intent contains no image or telemetry. It is held until a complete
-        JPEG has passed through perception and memory, then consumed by the
-        scene-comment worker. A second request is refused rather than replacing
-        the observation it belongs to.
-        """
-
-        if not isinstance(intent, str) or not intent.strip():
-            raise ValueError("visual intent must be non-empty text")
-        normalized = " ".join(intent.split())
+        if not isinstance(origin, ObservationOrigin):
+            raise TypeError("origin must be an ObservationOrigin")
+        exchanges = tuple(recent)
+        if not all(isinstance(item, RecentExchange) for item in exchanges):
+            raise TypeError("recent must contain RecentExchange values")
         with self._lock:
             if (
                 self._closed
                 or self._stage is not ObservationStage.IDLE
-                or self._visual_intent is not None
-                or self._scene_commenter is None
+                or self._pending_origin is not None
+                or self._active_origin is not None
             ):
                 return False
-            self._visual_intent = normalized
+            self._pending_origin = origin
+            self._origin_recent = exchanges[-3:]
             return True
 
-    def cancel_visual_followup(self) -> bool:
-        """Forget an intent whose plan was cancelled; report whether one existed."""
+    def cancel_origin(self) -> bool:
+        """Forget an origin whose plan was cancelled before observation."""
 
         with self._lock:
-            pending = self._visual_intent is not None
-            self._visual_intent = None
+            pending = self._pending_origin is not None or self._active_origin is not None
+            self._pending_origin = None
+            self._active_origin = None
+            self._origin_recent = ()
             return pending
 
     def disengage(self) -> None:
@@ -409,6 +369,9 @@ class ObservationRuntime:
         pending_id = self._plans.pending_observation_id
         if pending_id is None:  # pragma: no cover - checked by the caller
             return
+        if self._pending_origin is None:
+            self._fault_locked("unbound_observation", announce_complete=False)
+            return
         try:
             baseline = self._baseline_snapshot()
         except Exception as error:
@@ -437,6 +400,8 @@ class ObservationRuntime:
 
         self._request_id = request.request_id
         self._baseline = request.prior_canonical
+        self._active_origin = self._pending_origin
+        self._pending_origin = None
         self._attempts = 0
         self._stage = ObservationStage.REQUESTED
         self._inspecting = True
@@ -472,11 +437,7 @@ class ObservationRuntime:
         expected = (
             ObservationStage.ANALYZING
             if completion.kind == "analyze"
-            else (
-                ObservationStage.NARRATING
-                if completion.kind == "narrate"
-                else ObservationStage.COMMENTING
-            )
+            else ObservationStage.RESOLVING
         )
         if self._stage is not expected:
             self._last_error = "out_of_order_completion"
@@ -484,37 +445,22 @@ class ObservationRuntime:
         self._future = None
         if completion.kind == "analyze":
             self._apply_analyze_locked(completion.future)
-        elif completion.kind == "narrate":
-            self._apply_narrate_locked(completion.future)
         else:
-            self._apply_comment_locked(completion.future)
+            self._apply_resolve_locked(completion.future)
 
     def _apply_analyze_locked(self, future: Future[object]) -> None:
-        """Release the blocker, then compare locally before any narration."""
+        """Commit fresh facts, compare locally, then resolve the exact origin."""
 
         try:
             response = future.result()
-            if not isinstance(response, (ObservationResponse, ObservationEnvelope)):
+            if not isinstance(response, ObservationResponse):
                 raise TypeError("observation must return validated observation facts")
         except Exception as error:
-            self._retry_or_fault_locked(type(error).__name__)
-            return
-
-        request_id = self._request_id
-        try:
-            if request_id is None:
-                raise ObservationReleaseError("observation completed without a request id")
-            self._plans.release_observation(request_id)
-        except ObservationReleaseError:
-            # Memory already changed, so the surviving blocker cannot simply be
-            # ignored; both sides are cleared and the inspection is ended.
-            self._fault_locked("id_disagreement", announce_complete=True)
+            self._fail_observation_locked(type(error).__name__)
             return
 
         self._observations_completed += 1
-        self._announce_complete_locked()
-        facts = response.facts if isinstance(response, ObservationEnvelope) else response
-        comparison = compute_observation_missing(self._baseline, facts)
+        comparison = compute_observation_missing(self._baseline, response)
         self._last_missing = comparison.missing
         LOGGER.info(
             "SCENE comparison=%s",
@@ -528,112 +474,73 @@ class ObservationRuntime:
                 separators=(",", ":"),
             ),
         )
-        if self._visual_intent is not None:
-            self._begin_comment_locked(response)
-            return
-        selected = _selected_comparison(comparison, self._should_narrate(comparison))
-        if selected is None:
-            self._finish_locked()
-            return
-
-        generation = self._generation
-        self._stage = ObservationStage.NARRATING
-        try:
-            narration_future = self._executor.submit(self._narrate, selected)
-        except Exception as error:
-            self._last_error = type(error).__name__
-            self._finish_locked()
-            return
-        self._future = narration_future
-        narration_future.add_done_callback(
-            lambda done, token=generation: self._queue(token, "narrate", done)
-        )
-
-    def _begin_comment_locked(self, response: ValidatedObservation) -> None:
-        """Run the approved fourth call only after fresh facts are committed."""
-
-        intent = self._visual_intent
-        commenter = self._scene_commenter
-        if intent is None or commenter is None:  # pragma: no cover - guarded caller
-            self._finish_locked()
+        origin = self._active_origin
+        if origin is None:
+            self._fault_locked("missing_active_origin", announce_complete=True)
             return
         generation = self._generation
-        self._stage = ObservationStage.COMMENTING
+        self._stage = ObservationStage.RESOLVING
         try:
-            comment_future = self._executor.submit(commenter, intent, response)
+            resolution_future = self._executor.submit(
+                self._resolver,
+                origin,
+                response,
+                comparison.missing,
+                self._origin_recent,
+            )
         except Exception as error:
             self._last_error = type(error).__name__
-            self._finish_locked()
+            self._fault_locked("resolver_submit_failed", announce_complete=True)
             return
-        self._future = comment_future
-        comment_future.add_done_callback(
-            lambda done, token=generation: self._queue(token, "comment", done)
+        self._future = resolution_future
+        resolution_future.add_done_callback(
+            lambda done, token=generation: self._queue(token, "resolve", done)
         )
 
-    def _apply_narrate_locked(self, future: Future[object]) -> None:
-        """Route one narration to speech and append its plan to the queue."""
-
-        try:
-            narration = future.result()
-            if not isinstance(narration, MissingNarration):
-                raise TypeError("narration must return a validated MissingNarration")
-        except Exception as error:
-            # The blocker is already released, so a failed narration costs the
-            # line and nothing else; the rest of the plan still runs.
-            self._last_error = type(error).__name__
-            self._finish_locked()
-            return
-
-        self._narrations += 1
-        self._last_missing = narration.comparison.missing
-        if narration.response.plan:
-            self._plans.submit(narration.response.plan)
-        try:
-            self._narration_callback(narration)
-        except Exception:
-            LOGGER.exception("narration callback failed")
-            self._last_error = "narration_callback_failed"
-        self._finish_locked()
-
-    def _apply_comment_locked(self, future: Future[object]) -> None:
-        """Route a grounded follow-up through the normal plan and speech owners."""
+    def _apply_resolve_locked(self, future: Future[object]) -> None:
+        """Stage one cloud resolution before releasing its observation blocker."""
 
         try:
             response = future.result()
             if not isinstance(response, PlanResponse):
-                raise TypeError("scene comment must return a validated PlanResponse")
+                raise TypeError("resolver must return a validated PlanResponse")
         except Exception as error:
             self._last_error = type(error).__name__
-            self._finish_locked()
+            self._fault_locked("resolve_failed", announce_complete=True)
             return
 
+        origin = self._active_origin
+        if origin is None:
+            self._fault_locked("missing_active_origin", announce_complete=True)
+            return
+        try:
+            accepted = self._resolution_callback(origin, response)
+        except Exception:
+            LOGGER.exception("observation resolution callback failed")
+            accepted = False
+        if not accepted:
+            self._fault_locked("resolution_speech_refused", announce_complete=True)
+            return
         if response.plan:
             self._plans.submit(response.plan)
-        callback = self._scene_comment_callback
-        if callback is not None:
-            try:
-                callback(response)
-            except Exception:
-                LOGGER.exception("scene comment callback failed")
-                self._last_error = "scene_comment_callback_failed"
+        request_id = self._request_id
+        try:
+            if request_id is None:
+                raise ObservationReleaseError("observation completed without a request id")
+            self._plans.release_observation(request_id)
+        except ObservationReleaseError:
+            self._fault_locked("id_disagreement", announce_complete=True)
+            return
+        self._resolutions += 1
+        self._inspecting = False
+        self._fsm.post_event(BehaviorEvent.OBSERVATION_RESPONSE)
         self._finish_locked()
 
-    def _retry_or_fault_locked(self, reason: str) -> None:
-        """Re-capture the same request, or clear both sides once exhausted.
-
-        No image bytes are retained anywhere, so a failed analysis is retried
-        by asking for a new frame rather than by replaying the old one. The
-        coordinator keeps the exact request pending after a failure, which is
-        what lets the retry keep the same id on both sides.
-        """
+    def _fail_observation_locked(self, reason: str) -> None:
+        """Fail the one-frame observation without sampling a different scene."""
 
         self._last_error = reason
-        if self._attempts >= MAX_CAPTURE_ATTEMPTS or not self._agreed_locked():
-            self._fault_locked("observe_failed", announce_complete=True)
-            return
-        self._stage = ObservationStage.REQUESTED
-        if not self._dispatch_capture_locked():
-            self._fault_locked("capture_dispatch_failed", announce_complete=True)
+        self._fault_locked("observe_failed", announce_complete=True)
 
     def _reject_locked(self, reason: FrameRejection) -> bool:
         """Refuse one frame and record why; the model is never given it."""
@@ -665,15 +572,10 @@ class ObservationRuntime:
             raise TypeError("baseline_labels must return a sequence of canonical labels")
         return tuple(labels)
 
-    def _analyze(self, request_id: str, jpeg: bytes) -> ValidatedObservation:
+    def _analyze(self, request_id: str, jpeg: bytes) -> ObservationResponse:
         """Blocking capture-to-memory work; this never runs on the tick."""
 
         return self._observations.complete(request_id, jpeg)
-
-    def _narrate(self, comparison: MissingComparison) -> MissingNarration:
-        """Call ``narrate`` with only the locally selected missing labels."""
-
-        return self._missing.narrate_comparison(comparison)
 
     def _announce_complete_locked(self) -> None:
         """Report that the inspection ended, never that memory changed."""
@@ -690,7 +592,9 @@ class ObservationRuntime:
         self._attempts = 0
         self._inspecting = False
         self._stale_frame_expected = False
-        self._visual_intent = None
+        self._pending_origin = None
+        self._active_origin = None
+        self._origin_recent = ()
 
     def _invalidate_locked(self, *, announce_complete: bool = False) -> None:
         """Abandon the observation, clearing both sides in one lock hold."""
@@ -712,7 +616,9 @@ class ObservationRuntime:
         self._baseline = ()
         self._attempts = 0
         self._inspecting = False
-        self._visual_intent = None
+        self._pending_origin = None
+        self._active_origin = None
+        self._origin_recent = ()
 
     def _fault_locked(self, reason: str, *, announce_complete: bool) -> None:
         LOGGER.error("observation runtime cleared both sides after %s", reason)
@@ -745,10 +651,8 @@ __all__ = [
     "DEFAULT_WORKERS",
     "FrameRejection",
     "MAX_CAPTURE_ATTEMPTS",
-    "NarrationCallback",
-    "NarratePolicy",
-    "SceneCommentCallback",
-    "SceneCommenter",
+    "ObservationResolver",
+    "ResolutionCallback",
     "ObservationRuntime",
     "ObservationStage",
     "ObservationStatus",

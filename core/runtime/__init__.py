@@ -17,6 +17,7 @@ from .interactions import (
     SPEECH_RETRY_BACKOFF_S,
     ConversationCoordinator,
     CoordinatorStatus,
+    ObservationOriginCallback,
     Stage,
 )
 from .observations import (
@@ -24,11 +25,11 @@ from .observations import (
     MAX_CAPTURE_ATTEMPTS,
     BaselineLabels,
     FrameRejection,
-    NarratePolicy,
-    NarrationCallback,
+    ObservationResolver,
     ObservationRuntime,
     ObservationStage,
     ObservationStatus,
+    ResolutionCallback,
 )
 
 __all__ = [
@@ -45,11 +46,12 @@ __all__ = [
     "FrameRejection",
     "MAX_CAPTURE_ATTEMPTS",
     "MAX_SPEECH_ATTEMPTS",
-    "NarratePolicy",
-    "NarrationCallback",
+    "ObservationOriginCallback",
+    "ObservationResolver",
     "ObservationRuntime",
     "ObservationStage",
     "ObservationStatus",
+    "ResolutionCallback",
     "ROUTED_OPS",
     "RouterStatus",
     "SPEECH_RETRY_BACKOFF_S",
