@@ -8,30 +8,17 @@ puppyish: it perks up when someone looks at it, leans in to inspect things, and
 droops when attention moves elsewhere. The supplied URDF under `robot/` is the
 body; everything else in this repository is the character built around it.
 
-## Status: not demo-ready
+## Current state
 
-Every claim in this README was checked against commit `aa9ba0a`.
+The character is assembled as one application. `core/main.py` constructs the
+speech, OpenRouter, memory, behaviour, observation, animation, and protocol
+boundaries; `run.sh` starts that core together with the Vite renderer. Live use
+still depends on the locally staged model assets, browser camera and microphone
+permissions, and a working OpenRouter key and model.
 
-The subsystems are built and unit-tested in isolation. They are **not assembled
-into a running character yet**, and this repository will not produce a
-demonstration today.
-
-- **`core/main.py` is a scaffold.** It parses arguments, loads configuration,
-  and serves the WebSocket protocol stream. It does not construct the behavior
-  FSM, the animation loop, the blackboard, the brain wiring, or scene memory.
-  Starting the core gives you a protocol server, not a character.
-- **`setup.sh` exists but has never been run end to end.** It was written and
-  its logic exercised offline, but no `apt` transaction, model download, or
-  whisper.cpp build has actually executed. A clean Ubuntu 24.04 box is the only
-  place that can settle whether it works.
-- **No model assets have been downloaded.** `python3 doctor.py` reports all
-  seven entries in `config/models.yaml` as missing.
-- **Four of those seven entries carry `sha256: UNVERIFIED`.** That is a
-  deliberate marker for assets whose publisher ships no SHA-256; each entry
-  records why and the exact command that closes the gap. `doctor.py` warns on an
-  unverified-but-present asset instead of failing, so the gap stays visible.
-- **No measurement has been taken.** `measurements/` contains no data, and this
-  README states no latency, throughput, or resource figure.
+The Python and renderer suites run offline. Camera, microphone, browser GPU,
+voice quality, OpenRouter latency, and the clean Ubuntu installation remain
+environment-dependent checks; use `doctor.py` and `/selftest` before a take.
 
 ## Architecture in brief
 
@@ -44,6 +31,12 @@ demonstration today.
 - Python owns speech-to-text, text-to-speech, the behavior state machine, the
   language model boundary, scene memory, and the animation layers that turn
   semantic intent into joint values.
+- OpenRouter owns language interpretation, relevance, wording, and semantic
+  plan selection. Python sends each conversation the transcript, recent turns,
+  compact memory, and a filtered snapshot of what is currently visible.
+- When the model selects `observe`, exactly one JPEG is captured. Vision returns
+  facts only; Python persists them and computes the deterministic missing-object
+  set, then asks OpenRouter to resolve the exact originating turn or scene event.
 - The protocol is defined once in `schema/messages.schema.json`. The renderer's
   TypeScript types are generated from it, and a check fails if the checked-in
   file has drifted.
@@ -67,13 +60,9 @@ README does not repeat it.
 whisper.cpp is built from source, CPU-only, and is not vendored here. Core-side
 model weights live outside the repository, in `~/.cache/luxo`. Browser-side
 assets are staged into `renderer/public/` at setup time. Neither set is
-committed — see the note under [Repository layout](#repository-layout) about a
-gap in `.gitignore` coverage.
+committed; the generated asset destinations are covered by `.gitignore`.
 
 ## Quickstart
-
-This is the intended sequence. It has not yet been run end to end on a clean
-machine — see [Status](#status-not-demo-ready).
 
 ```sh
 ./setup.sh                      # venv, pip, npm ci, models, whisper.cpp, espeak-ng
@@ -120,7 +109,7 @@ manifest, available memory, port 8765, the presence of the API key, and
 │   ├── models.yaml              model asset manifest: URLs, digests, licences
 │   └── poses.yaml               the five canonical postures
 ├── core/                        the mind: one Python process
-│   ├── main.py                  CLI entry point (a scaffold — see Status)
+│   ├── main.py                  assembles and launches the character core
 │   ├── config.py                immutable configuration loading
 │   ├── logging_setup.py         process-wide logging
 │   ├── blackboard.py            thread-safe exchange between workers and the tick
@@ -132,7 +121,9 @@ manifest, available memory, port 8765, the presence of the API key, and
 │   │   ├── messages.py          parsing and serialization for JSON and binary frames
 │   │   └── ws_server.py         reconnect-safe WebSocket transport
 │   ├── runtime/
-│   │   └── interactions.py      conversation staging: VAD → STT → brain → speech
+│   │   ├── app.py               assembled character and serialized tick wiring
+│   │   ├── interactions.py      conversation staging: VAD → STT → brain → speech
+│   │   └── observations.py      one-frame observation and cloud resolution flow
 │   ├── animation/               120 Hz motion, entirely body-owned
 │   │   ├── runtime.py           coordinates the additive layers
 │   │   ├── director.py          routes semantic intent to animation
@@ -176,23 +167,22 @@ manifest, available memory, port 8765, the presence of the API key, and
 │   └── check_generated.py       fails when the checked-in types have drifted
 ├── robot/                       supplied and unmodified: URDF, mesh, reference image
 ├── validation tooling/                       Python unit checks (validation)
-└── measurements/                where interaction CSVs will be written; empty today
+└── measurements/                ignored runtime CSV output, created as needed
 ```
 
-`setup.sh` will also create `.venv/`, `renderer/node_modules/`, and
-`renderer/public/`. The first two are gitignored, and so is any `models/`
-directory. `renderer/public/mediapipe/` and `renderer/public/onnxruntime/` are
-staged from `node_modules` but are **not** covered by `.gitignore` today; do not
-commit them.
+`setup.sh` also creates `.venv/`, `renderer/node_modules/`, and staged assets
+under `renderer/public/`. Those generated paths, model weights, recordings,
+environment files, and measurement outputs are gitignored and must not be
+committed.
 
 ## Development
 
-Python, from the repository root — 555 checks at `d61cdfd`:
+Python, from the repository root:
 
 ```sh
 ```
 
-Renderer, from `renderer/` — 113 checks at `d61cdfd`:
+Renderer, from `renderer/`:
 
 ```sh
 npm ci
@@ -200,8 +190,8 @@ npm run typecheck
 npm run build      # runs the typecheck, then the Vite build
 ```
 
-Both suites run offline. They cover subsystems in isolation, not the assembled
-character, and passing them is not evidence that the demonstration works.
+Both suites run offline. Passing them does not replace a live browser, sensor,
+audio, OpenRouter, or Linux smoke check.
 
 If you change `schema/messages.schema.json`, regenerate the renderer types and
 confirm they are current:
@@ -218,17 +208,24 @@ cannot drift apart silently.
 
 This is an architectural property of the split, not a policy statement.
 
-- **Gaze processing never leaves the browser.** Face landmarking runs locally.
-  The only gaze fields the protocol carries are presence, yaw, pitch, azimuth,
-  elevation, and a confidence scalar — no landmarks, no image data. No face ever
-  reaches the core or a cloud service.
-- **No camera frame is transmitted except on an explicit `observe`.** There is
-  no other code path that uploads a frame. The renderer validates every message
-  from the core before dispatch, so a malformed capture request cannot trigger a
-  capture.
+- **Continuous gaze processing stays local.** Face and hand landmarking run in
+  the browser. Only derived measurements cross the local WebSocket; landmarks
+  and the continuous camera stream do not.
+- **A camera frame leaves the machine only for an explicit `observe` action.**
+  Dialogue observations are selected by the cloud plan; the bounded hand-dwell
+  scene event can also issue one. The renderer captures one JPEG for the
+  validated request and no other code path uploads frames. That scene JPEG may
+  contain a person or face, so observation is not anonymous even though
+  continuous gaze stays local.
+- OpenRouter text calls receive the transcript, up to three recent exchanges,
+  compact memory, and filtered current scene facts. Post-observation resolution
+  also receives the typed origin, filtered fresh facts, and Python-computed
+  missing labels. Bounding boxes, timestamps, raw labels, gaze, telemetry, and
+  joint state are excluded from text payloads.
 - **Only one utterance of audio is sent per turn.** The browser detects
   end-of-speech locally and sends that single utterance as PCM. There is no open
-  microphone stream to the core.
+  microphone stream to the core, and OpenRouter receives the transcript rather
+  than the audio.
 - The interaction CSV written by `core/instrumentation.py` records timestamps,
   stage durations, model name, profile, and token counts. It cannot contain
   transcripts, prompts, model text, keys, audio, images, gaze, joint values, or
@@ -239,9 +236,6 @@ OpenRouter profile, are described in [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md)
 §5 and §9. Read that before recording anything you care about.
 
 ## Limitations
-
-Current status is covered under [Status](#status-not-demo-ready) above. Beyond
-that:
 
 - **The body has no roll degree of freedom**, so the classic sideways head-tilt
   is physically impossible. Curiosity is expressed as whole-body lean and crane
