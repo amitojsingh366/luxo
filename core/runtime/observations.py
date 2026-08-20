@@ -78,7 +78,12 @@ INSPECTION_FAILURE_SAY: Final = "I couldn't get a clear look—could you show me
 
 CaptureCallback = Callable[[CaptureFrameMessage], None]
 ObservationResolver = Callable[
-    [ObservationOrigin, ObservationResponse, tuple[str, ...], tuple[RecentExchange, ...]],
+    [
+        ObservationOrigin,
+        ObservationResponse,
+        tuple[ObservationPrior, ...],
+        tuple[RecentExchange, ...],
+    ],
     PlanResponse,
 ]
 ResolutionCallback = Callable[[ObservationOrigin, PlanResponse], bool]
@@ -527,7 +532,7 @@ class ObservationRuntime:
                 self._resolver,
                 origin,
                 response,
-                comparison.missing_labels,
+                comparison.missing,
                 self._origin_recent,
             )
         except Exception as error:

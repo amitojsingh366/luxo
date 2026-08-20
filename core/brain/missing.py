@@ -10,7 +10,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .schema import ObservationPrior, ObservationResponse, normalize_canonical_label
+from .schema import (
+    OBSERVATION_MAX_VISIBLE,
+    ObservationPrior,
+    ObservationResponse,
+    normalize_canonical_label,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,10 +31,25 @@ class MissingComparison:
 class ObservationMissingComparison:
     """Stable-id difference plus canonical labels safe for narration."""
 
-    baseline_ids: tuple[str, ...]
+    baseline: tuple[ObservationPrior, ...]
     present_ids: tuple[str, ...]
-    missing_ids: tuple[str, ...]
-    missing_labels: tuple[str, ...]
+
+    @property
+    def baseline_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self.baseline)
+
+    @property
+    def missing(self) -> tuple[ObservationPrior, ...]:
+        present = frozenset(self.present_ids)
+        return tuple(item for item in self.baseline if item.id not in present)
+
+    @property
+    def missing_ids(self) -> tuple[str, ...]:
+        return tuple(item.id for item in self.missing)
+
+    @property
+    def missing_labels(self) -> tuple[str, ...]:
+        return tuple(item.canonical for item in self.missing)
 
 
 def compute_missing(
@@ -72,21 +92,21 @@ def compute_observation_missing(
     priors = tuple(baseline)
     if not all(isinstance(item, ObservationPrior) for item in priors):
         raise TypeError("baseline must contain ObservationPrior values")
-    baseline_ids = tuple(dict.fromkeys(item.id for item in priors))
-    present_ids = tuple(
-        dict.fromkeys(
-            item.match for item in observation.visible if item.match is not None
-        )
+    baseline = tuple({item.id: item for item in priors}.values())
+    baseline_ids = frozenset(item.id for item in baseline)
+    retained = [item.match for item in observation.visible if item.match is not None]
+    evidence = observation.present_prior_ids
+    evidence_valid = evidence is not None and all(
+        value in baseline_ids for value in evidence
     )
-    present_set = frozenset(present_ids)
-    missing_ids = tuple(item for item in baseline_ids if item not in present_set)
-    by_id = {item.id: item.canonical for item in priors}
-    return ObservationMissingComparison(
-        baseline_ids,
-        present_ids,
-        missing_ids,
-        tuple(by_id[item] for item in missing_ids),
-    )
+    if evidence_valid:
+        retained.extend(evidence or ())
+    elif len(observation.visible) == OBSERVATION_MAX_VISIBLE:
+        # A saturated detail list may omit lower-priority objects that remain
+        # visible. Without trustworthy presence evidence, silence is safer
+        # than claiming that every omitted prior disappeared.
+        retained.extend(item.id for item in baseline)
+    return ObservationMissingComparison(baseline, tuple(dict.fromkeys(retained)))
 
 
 def _canonical_labels(values: Sequence[str], field: str) -> tuple[str, ...]:

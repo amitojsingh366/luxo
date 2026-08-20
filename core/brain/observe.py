@@ -172,7 +172,12 @@ class ObservationCoordinator:
             if observed_at is None:
                 raise AssertionError("validated observation is missing its timestamp")
             existing = self._store.load()
-            candidates = _memory_candidates(existing, response, observed_at)
+            candidates = _memory_candidates(
+                existing,
+                pending.request.prior,
+                response,
+                observed_at,
+            )
             published = tuple(self._store.update(candidates))
             LOGGER.info("SCENE memory saved=%s", _memory_log(published))
             response = ObservationResponse(
@@ -181,6 +186,7 @@ class ObservationCoordinator:
                     for index, item in enumerate(response.visible)
                 ),
                 focus=response.focus,
+                present_prior_ids=response.present_prior_ids,
             )
             self._pending = None
 
@@ -262,18 +268,22 @@ def _timestamp(value: object) -> float:
 
 def _memory_candidates(
     existing: tuple[SceneObject, ...],
+    request_prior: tuple[ObservationPrior, ...],
     response: ObservationResponse,
     observed_at: float,
 ) -> tuple[SceneObject, ...]:
     """Convert model facts to store candidates without model-owned metadata."""
 
-    prior_by_id = {record.id: record for record in existing}
+    request_ids = {item.id for item in request_prior}
+    prior_by_id = {
+        record.id: record for record in existing if record.id in request_ids
+    }
     prior_by_canonical: dict[str, list[SceneObject]] = {}
-    for record in existing:
+    for record in prior_by_id.values():
         prior_by_canonical.setdefault(record.canonical, []).append(record)
     unmatched_counts: dict[str, int] = {}
     for item in response.visible:
-        if item.match is None:
+        if item.match is None and not item.match_provided:
             unmatched_counts[item.canonical] = unmatched_counts.get(item.canonical, 0) + 1
     candidates: list[SceneObject] = []
     claimed: set[str] = set()
@@ -281,9 +291,18 @@ def _memory_candidates(
         if not isinstance(item, ObservedObject):
             raise TypeError("observation visible entries must be validated ObservedObject values")
         previous = None
-        if item.match is not None and item.match not in claimed:
+        if (
+            item.match is not None
+            and item.match in request_ids
+            and item.match not in claimed
+        ):
             previous = prior_by_id.get(item.match)
-        if previous is None and item.match is None and unmatched_counts[item.canonical] == 1:
+        if (
+            previous is None
+            and item.match is None
+            and not item.match_provided
+            and unmatched_counts[item.canonical] == 1
+        ):
             available = [
                 record
                 for record in prior_by_canonical.get(item.canonical, ())
@@ -311,6 +330,7 @@ def _observation_log(response: ObservationResponse) -> str:
                 for item in response.visible
             ],
             "focus": response.focus,
+            "present_prior_ids": response.present_prior_ids,
         },
         ensure_ascii=False,
         separators=(",", ":"),

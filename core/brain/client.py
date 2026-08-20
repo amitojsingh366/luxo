@@ -67,10 +67,11 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     ),
     "observe": (
         "Your observation response was invalid. Inspect the supplied image and return one "
-        "bare JSON object with exactly the top-level keys visible and focus. visible must be "
+        "bare JSON object with visible, focus, and present_prior_ids. visible must be "
         "an array of at most 10 objects ordered nearest-to-camera first. Each object needs "
         "match, label, canonical, attributes, and bbox_norm; match and bbox_norm may be null. "
-        "focus must be a visible array index or null. Do not return "
+        "focus must be a visible array index or null. present_prior_ids lists every supplied "
+        "prior id still visible anywhere in the image. Do not return "
         "say, plan, dialogue, or prose."
     ),
     "resolve_observation": (
@@ -200,7 +201,7 @@ class BrainClient(Protocol):
         self,
         origin: ObservationOrigin,
         observation: ObservationResponse,
-        missing: Sequence[str],
+        missing: Sequence[ObservationPrior],
         compact_memory: str,
         currently_visible: Sequence[CloudSceneObject],
         recent: Sequence[RecentExchange],
@@ -398,7 +399,11 @@ class OpenRouterBrainClient:
                 else:
                     claimed.add(match)
                 visible.append(replace(item, match=match))
-            return ObservationResponse(tuple(visible), response.focus)
+            presence = response.present_prior_ids
+            if presence is not None and any(value not in prior_ids for value in presence):
+                LOGGER.warning("dropping present_prior_ids with unknown prior ids")
+                presence = None
+            return ObservationResponse(tuple(visible), response.focus, presence)
 
         return self._run("observe", self._messages(content), parse_observation)
 
@@ -406,7 +411,7 @@ class OpenRouterBrainClient:
         self,
         origin: ObservationOrigin,
         observation: ObservationResponse,
-        missing: Sequence[str],
+        missing: Sequence[ObservationPrior],
         compact_memory: str,
         currently_visible: Sequence[CloudSceneObject],
         recent: Sequence[RecentExchange],
@@ -425,7 +430,7 @@ class OpenRouterBrainClient:
         self,
         origin: ObservationOrigin,
         observation: ObservationResponse,
-        missing: Sequence[str],
+        missing: Sequence[ObservationPrior],
         compact_memory: str,
         currently_visible: Sequence[CloudSceneObject],
         recent: Sequence[RecentExchange],

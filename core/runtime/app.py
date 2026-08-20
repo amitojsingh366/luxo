@@ -240,7 +240,7 @@ from ..brain.client import (
     ObservationOrigin,
     RecentExchange,
 )
-from ..brain.memory import SceneMemoryStore
+from ..brain.memory import SceneMemoryStore, cloud_safe_attributes
 from ..brain.observe import ObservationCoordinator
 from ..brain.schema import Action, ActionOp, ObservationPrior, PlanResponse
 from ..config import FrozenConfig, load_config
@@ -1115,7 +1115,11 @@ class LuxoApp:
         """
 
         return tuple(
-            ObservationPrior(record.id, record.canonical)
+            ObservationPrior(
+                record.id,
+                record.canonical,
+                cloud_safe_attributes(record.attributes),
+            )
             for record in self._blackboard.snapshot().scene_memory
             if record.present
         )

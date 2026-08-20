@@ -12,7 +12,7 @@ import logging
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TypeAlias
 
@@ -139,6 +139,7 @@ class ObservedObject:
     attributes: tuple[str, ...]
     bbox_norm: tuple[float, float, float, float] | None = None
     match: str | None = None
+    match_provided: bool = field(default=False, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,11 +148,23 @@ class ObservationPrior:
 
     id: str
     canonical: str
+    attributes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.id, str) or _SAFE_OBJECT_ID.fullmatch(self.id) is None:
             raise ValueError("observation prior id must be a safe object id")
+        if isinstance(self.attributes, (str, bytes)):
+            raise TypeError("observation prior attributes must be a tuple of strings")
+        try:
+            attributes = tuple(
+                dict.fromkeys(_plain_text(value, "attribute") for value in self.attributes)
+            )
+        except TypeError as error:
+            raise TypeError(
+                "observation prior attributes must be a tuple of strings"
+            ) from error
         object.__setattr__(self, "canonical", normalize_canonical_label(self.canonical))
+        object.__setattr__(self, "attributes", attributes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +173,7 @@ class ObservationResponse:
 
     visible: tuple[ObservedObject, ...]
     focus: int | None = None
+    present_prior_ids: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.visible, tuple) or not all(
@@ -174,6 +188,14 @@ class ObservationResponse:
             or not 0 <= self.focus < len(self.visible)
         ):
             raise ValueError("focus must be null or an index into visible")
+        if self.present_prior_ids is not None:
+            if not isinstance(self.present_prior_ids, tuple) or any(
+                not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
+                for value in self.present_prior_ids
+            ):
+                raise TypeError("present_prior_ids must be null or a tuple of safe ids")
+            if len(self.present_prior_ids) != len(set(self.present_prior_ids)):
+                raise ValueError("present_prior_ids must not contain duplicates")
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -250,7 +272,22 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
                 "dropping observation focus %d because its object was not retained",
                 raw_focus,
             )
-    return ObservationResponse(visible=visible, focus=focus)
+    raw_presence = root.get("present_prior_ids")
+    if raw_presence is None:
+        presence = None
+    elif not isinstance(raw_presence, list) or any(
+        not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
+        for value in raw_presence
+    ):
+        LOGGER.warning("dropping invalid present_prior_ids evidence")
+        presence = None
+    else:
+        presence = tuple(dict.fromkeys(raw_presence))
+    return ObservationResponse(
+        visible=visible,
+        focus=focus,
+        present_prior_ids=presence,
+    )
 
 
 def _observed_objects(
@@ -431,6 +468,7 @@ def _parse_observed_object(value: object) -> ObservedObject:
     if missing:
         raise ValueError(f"visible object is missing {sorted(missing)!r}")
 
+    match_provided = "match" in value
     match = value.get("match")
     if match is not None and (
         not isinstance(match, str) or _SAFE_OBJECT_ID.fullmatch(match) is None
@@ -460,6 +498,7 @@ def _parse_observed_object(value: object) -> ObservedObject:
         canonical=canonical,
         attributes=normalized_attributes,
         bbox_norm=bbox,
+        match_provided=match_provided,
     )
 
 
