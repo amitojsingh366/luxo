@@ -67,7 +67,7 @@ from ..brain.observe import (
     ObservationCoordinator,
     ObservationRequestError,
 )
-from ..brain.schema import ObservationResponse, normalize_canonical_label
+from ..brain.schema import ObservationResponse, PlanResponse, normalize_canonical_label
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..plan_executor import ObservationReleaseError, PlanExecutor
 from ..protocol.messages import CaptureFrameMessage
@@ -79,6 +79,8 @@ DEFAULT_WORKERS: Final = 1
 
 CaptureCallback = Callable[[CaptureFrameMessage], None]
 NarrationCallback = Callable[[MissingNarration], None]
+SceneCommenter = Callable[[str, ObservationResponse], PlanResponse]
+SceneCommentCallback = Callable[[PlanResponse], None]
 BaselineLabels = Callable[[], Sequence[str]]
 NarratePolicy = Callable[[MissingComparison], bool | Sequence[str] | None]
 
@@ -90,6 +92,7 @@ class ObservationStage(str, Enum):
     REQUESTED = "requested"
     ANALYZING = "analyzing"
     NARRATING = "narrating"
+    COMMENTING = "commenting"
 
 
 class FrameRejection(str, Enum):
@@ -193,6 +196,8 @@ class ObservationRuntime:
         baseline_labels: BaselineLabels,
         capture_callback: CaptureCallback,
         narration_callback: NarrationCallback,
+        scene_commenter: SceneCommenter | None = None,
+        scene_comment_callback: SceneCommentCallback | None = None,
         should_narrate: NarratePolicy | None = None,
         executor: Executor | None = None,
     ) -> None:
@@ -201,6 +206,12 @@ class ObservationRuntime:
             raise TypeError("observation runtime callbacks must be callable")
         if should_narrate is not None and not callable(should_narrate):
             raise TypeError("should_narrate must be callable")
+        if (scene_commenter is None) != (scene_comment_callback is None):
+            raise TypeError("scene comment worker and callback must be provided together")
+        if scene_commenter is not None and not callable(scene_commenter):
+            raise TypeError("scene_commenter must be callable")
+        if scene_comment_callback is not None and not callable(scene_comment_callback):
+            raise TypeError("scene_comment_callback must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._fsm = fsm
@@ -210,6 +221,8 @@ class ObservationRuntime:
         self._baseline_labels = baseline_labels
         self._capture_callback = capture_callback
         self._narration_callback = narration_callback
+        self._scene_commenter = scene_commenter
+        self._scene_comment_callback = scene_comment_callback
         self._should_narrate = should_narrate or _narrate_when_missing
         self._executor = executor or ThreadPoolExecutor(
             max_workers=DEFAULT_WORKERS, thread_name_prefix="luxo-observation"
@@ -234,6 +247,7 @@ class ObservationRuntime:
         self._last_missing: tuple[str, ...] = ()
         self._last_rejection: FrameRejection | None = None
         self._last_error: str | None = None
+        self._visual_intent: str | None = None
 
     @property
     def status(self) -> ObservationStatus:
@@ -328,6 +342,37 @@ class ObservationRuntime:
                 lambda done, token=generation: self._queue(token, "analyze", done)
             )
             return True
+
+    def request_visual_followup(self, intent: str) -> bool:
+        """Attach one dialogue intent to the next observation.
+
+        The intent contains no image or telemetry. It is held until a complete
+        JPEG has passed through perception and memory, then consumed by the
+        scene-comment worker. A second request is refused rather than replacing
+        the observation it belongs to.
+        """
+
+        if not isinstance(intent, str) or not intent.strip():
+            raise ValueError("visual intent must be non-empty text")
+        normalized = " ".join(intent.split())
+        with self._lock:
+            if (
+                self._closed
+                or self._stage is not ObservationStage.IDLE
+                or self._visual_intent is not None
+                or self._scene_commenter is None
+            ):
+                return False
+            self._visual_intent = normalized
+            return True
+
+    def cancel_visual_followup(self) -> bool:
+        """Forget an intent whose plan was cancelled; report whether one existed."""
+
+        with self._lock:
+            pending = self._visual_intent is not None
+            self._visual_intent = None
+            return pending
 
     def disengage(self) -> None:
         """Abandon the observation on gaze loss or an explicit runtime stop."""
@@ -426,7 +471,11 @@ class ObservationRuntime:
         expected = (
             ObservationStage.ANALYZING
             if completion.kind == "analyze"
-            else ObservationStage.NARRATING
+            else (
+                ObservationStage.NARRATING
+                if completion.kind == "narrate"
+                else ObservationStage.COMMENTING
+            )
         )
         if self._stage is not expected:
             self._last_error = "out_of_order_completion"
@@ -434,8 +483,10 @@ class ObservationRuntime:
         self._future = None
         if completion.kind == "analyze":
             self._apply_analyze_locked(completion.future)
-        else:
+        elif completion.kind == "narrate":
             self._apply_narrate_locked(completion.future)
+        else:
+            self._apply_comment_locked(completion.future)
 
     def _apply_analyze_locked(self, future: Future[object]) -> None:
         """Release the blocker, then compare locally before any narration."""
@@ -475,6 +526,9 @@ class ObservationRuntime:
                 separators=(",", ":"),
             ),
         )
+        if self._visual_intent is not None:
+            self._begin_comment_locked(response)
+            return
         selected = _selected_comparison(comparison, self._should_narrate(comparison))
         if selected is None:
             self._finish_locked()
@@ -491,6 +545,27 @@ class ObservationRuntime:
         self._future = narration_future
         narration_future.add_done_callback(
             lambda done, token=generation: self._queue(token, "narrate", done)
+        )
+
+    def _begin_comment_locked(self, response: ObservationResponse) -> None:
+        """Run the approved fourth call only after fresh facts are committed."""
+
+        intent = self._visual_intent
+        commenter = self._scene_commenter
+        if intent is None or commenter is None:  # pragma: no cover - guarded caller
+            self._finish_locked()
+            return
+        generation = self._generation
+        self._stage = ObservationStage.COMMENTING
+        try:
+            comment_future = self._executor.submit(commenter, intent, response)
+        except Exception as error:
+            self._last_error = type(error).__name__
+            self._finish_locked()
+            return
+        self._future = comment_future
+        comment_future.add_done_callback(
+            lambda done, token=generation: self._queue(token, "comment", done)
         )
 
     def _apply_narrate_locked(self, future: Future[object]) -> None:
@@ -516,6 +591,29 @@ class ObservationRuntime:
         except Exception:
             LOGGER.exception("narration callback failed")
             self._last_error = "narration_callback_failed"
+        self._finish_locked()
+
+    def _apply_comment_locked(self, future: Future[object]) -> None:
+        """Route a grounded follow-up through the normal plan and speech owners."""
+
+        try:
+            response = future.result()
+            if not isinstance(response, PlanResponse):
+                raise TypeError("scene comment must return a validated PlanResponse")
+        except Exception as error:
+            self._last_error = type(error).__name__
+            self._finish_locked()
+            return
+
+        if response.plan:
+            self._plans.submit(response.plan)
+        callback = self._scene_comment_callback
+        if callback is not None:
+            try:
+                callback(response)
+            except Exception:
+                LOGGER.exception("scene comment callback failed")
+                self._last_error = "scene_comment_callback_failed"
         self._finish_locked()
 
     def _retry_or_fault_locked(self, reason: str) -> None:
@@ -590,6 +688,7 @@ class ObservationRuntime:
         self._attempts = 0
         self._inspecting = False
         self._stale_frame_expected = False
+        self._visual_intent = None
 
     def _invalidate_locked(self, *, announce_complete: bool = False) -> None:
         """Abandon the observation, clearing both sides in one lock hold."""
@@ -611,6 +710,7 @@ class ObservationRuntime:
         self._baseline = ()
         self._attempts = 0
         self._inspecting = False
+        self._visual_intent = None
 
     def _fault_locked(self, reason: str, *, announce_complete: bool) -> None:
         LOGGER.error("observation runtime cleared both sides after %s", reason)
@@ -645,6 +745,8 @@ __all__ = [
     "MAX_CAPTURE_ATTEMPTS",
     "NarrationCallback",
     "NarratePolicy",
+    "SceneCommentCallback",
+    "SceneCommenter",
     "ObservationRuntime",
     "ObservationStage",
     "ObservationStatus",

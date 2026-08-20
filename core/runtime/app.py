@@ -144,10 +144,11 @@ Two things about it belong here, because they are wiring decisions:
 Speech ownership — one speaker, one ``tts_done``
 ------------------------------------------------
 
-Two things in this process produce a line to say: a brain reply, and the
-observation runtime's narration of what went missing from the desk (PRD 8.3).
-They are **not** two speakers. ``ConversationCoordinator.speak`` stages an
-unprompted line into the very slot a reply occupies, so both reach the browser
+Three paths in this process produce a line to say: a dialogue reply, a fresh
+visual follow-up, and the observation runtime's narration of what went missing
+from the desk (PRD 8.3). They are **not** separate speakers.
+``ConversationCoordinator.speak`` stages either observation-authored line into
+the very slot a reply occupies, so all reach the browser
 through one synthesis, one wire validation, one raw prefix-free PCM delivery,
 one ``speak_begin``/``speak_end`` pair, and one bounded retry.
 
@@ -250,7 +251,7 @@ from ..brain.client import BrainClient, CallMetrics
 from ..brain.memory import SceneMemoryStore
 from ..brain.missing import MissingComparison, MissingNarration, MissingObjectCoordinator
 from ..brain.observe import ObservationCoordinator
-from ..brain.schema import Action
+from ..brain.schema import Action, ActionOp, PlanResponse
 from ..config import FrozenConfig, load_config
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState, Transition
 from ..instrumentation import InteractionCSVLogger, InteractionTimeline, Milestone, TimelineError
@@ -357,6 +358,46 @@ def _asks_missing_scene_question(transcript: str) -> bool:
         return False
     normalized = " ".join(transcript.casefold().split())
     return bool(_MISSING_SCENE_QUERY.search(normalized))
+
+
+def _asks_current_visual_question(transcript: str) -> bool:
+    """Recognize present-tense visual detail requests, not memory recall."""
+
+    if not isinstance(transcript, str):
+        return False
+    normalized = " ".join(transcript.casefold().replace("’", "'").split())
+    historical = (
+        "remember",
+        "yesterday",
+        "earlier",
+        "before",
+        "last time",
+        "did you see",
+        "did it look",
+        "what color was",
+        "what colour was",
+    )
+    if any(phrase in normalized for phrase in historical):
+        return False
+    current = (
+        "what do you see",
+        "what can you see",
+        "what is in my hand",
+        "what's in my hand",
+        "what am i holding",
+        "what is this",
+        "what's this",
+        "what is that",
+        "what's that",
+        "what color",
+        "what colour",
+        "which color",
+        "which colour",
+        "what material",
+        "what is it made of",
+        "what does it look like",
+    )
+    return any(phrase in normalized for phrase in current)
 
 
 def _scene_focus_terms(transcript: str) -> frozenset[str]:
@@ -755,6 +796,12 @@ class LuxoApp:
             # The single owner of outbound capture_frame.
             capture_callback=self._send_capture_frame,
             narration_callback=self._on_narration,
+            scene_commenter=lambda intent, observation: brain.scene_comment(
+                intent,
+                observation,
+                self._memory.compact_line(),
+            ),
+            scene_comment_callback=self._on_scene_comment,
             should_narrate=self._should_narrate_scene,
             executor=observation_executor,
         )
@@ -1045,6 +1092,16 @@ class LuxoApp:
                 self._on_tts_done(message)
             elif isinstance(message, ErrorMessage):
                 LOGGER.warning("browser reported %s: %s", message.where, message.detail)
+                if message.where == "camera":
+                    pending_visual = self._observations.cancel_visual_followup()
+                    if (
+                        pending_visual
+                        or self._observations.stage is not ObservationStage.IDLE
+                        or self._plans.blocked_on_observation
+                    ):
+                        self._observations.disengage()
+                        with self._director_lock:
+                            self._router.cancel("camera_error")
         except Exception:
             LOGGER.exception("handling %r failed", getattr(message, "type", message))
 
@@ -1227,14 +1284,38 @@ class LuxoApp:
             self._narrations_dropped += 1
         LOGGER.info("narration dropped: the speech slot is already in use")
 
+    def _on_scene_comment(self, response: PlanResponse) -> None:
+        """Stage a fresh-fact comment through the one conversation speaker."""
+
+        say = response.say
+        if not say.strip():
+            LOGGER.debug("scene comment dropped: the model returned a blank line")
+            with self._lock:
+                self._narrations_dropped += 1
+            return
+        if self._conversation.speak(say):
+            with self._lock:
+                self._narrations_spoken += 1
+            return
+        with self._lock:
+            self._narrations_dropped += 1
+        LOGGER.info("scene comment dropped: the speech slot is already in use")
+
     def _on_scene_turn(self, transcript: str, observes: bool = True) -> None:
         """Keep short-lived object context and arm explicit absence reports."""
 
         requested = observes and _asks_missing_scene_question(transcript)
         if requested:
             self._scene_report_requested.set()
+            self._observations.cancel_visual_followup()
         else:
             self._scene_report_requested.clear()
+            if (
+                observes
+                and _asks_current_visual_question(transcript)
+                and not self._observations.request_visual_followup(transcript)
+            ):
+                LOGGER.info("SCENE visual follow-up dropped: observation already active")
 
         terms = _scene_focus_terms(transcript)
         scene_memory = self._blackboard.snapshot().scene_memory
@@ -1404,6 +1485,7 @@ class LuxoApp:
                     # the only way to avoid a blocker nobody will release.
                     LOGGER.exception("action routing failed; cancelling the plan")
                     self._router.cancel("routing_failed")
+                    self._observations.cancel_visual_followup()
 
         self._tick_observations(now)
         self._post_plan_drained()
@@ -1415,7 +1497,7 @@ class LuxoApp:
             self._arousal = AROUSAL_BY_STATE.get(self._state_name, 0.15)
 
     def _tick_hand_inquiry(self, now: float) -> None:
-        """Ask once after a quiet, continuous hand presentation."""
+        """Observe once after a quiet, continuous hand presentation."""
 
         with self._lock:
             last_seen = self._hands_last_seen
@@ -1436,9 +1518,11 @@ class LuxoApp:
             or self._observations.stage is not ObservationStage.IDLE
         ):
             return
-        if self._conversation.speak("Ooh—what are you working on?"):
-            with self._lock:
-                self._hand_inquiry_asked = True
+        if not self._observations.request_visual_followup("spontaneous_hand"):
+            return
+        self._plans.submit((Action(ActionOp.OBSERVE),))
+        with self._lock:
+            self._hand_inquiry_asked = True
 
     def _apply_transition(self, transition: Transition) -> None:
         """Apply one state beat to the body, cancelling everything it must.
