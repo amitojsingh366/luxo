@@ -1086,10 +1086,11 @@ class LuxoApp:
         self,
         origin: ObservationOrigin,
         recent: tuple[RecentExchange, ...],
+        presentation: ObservationPresentation,
     ) -> bool:
         """Bind the exact cloud-approved dialogue turn without interpreting it."""
 
-        return self._observations.bind_origin(origin, recent)
+        return self._observations.bind_origin(origin, recent, presentation)
 
     def _on_observation_resolution(
         self,
