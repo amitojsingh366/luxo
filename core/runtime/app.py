@@ -141,6 +141,37 @@ Two things about it belong here, because they are wiring decisions:
   ``_camera_ready``, so the connected browser keeps its page, its socket, and
   its camera and microphone permission across as many resets as a shoot needs.
 
+Speech ownership — one speaker, one ``tts_done``
+------------------------------------------------
+
+Two things in this process produce a line to say: a brain reply, and the
+observation runtime's narration of what went missing from the desk (PRD 8.3).
+They are **not** two speakers. ``ConversationCoordinator.speak`` stages an
+unprompted line into the very slot a reply occupies, so both reach the browser
+through one synthesis, one wire validation, one raw prefix-free PCM delivery,
+one ``speak_begin``/``speak_end`` pair, and one bounded retry.
+
+That matters here rather than there because this module is where a second owner
+would have to be built. It briefly had one. The cost of two owners is not
+duplicated code, it is a **split fact**: with two ``speaking`` flags,
+``body_state`` has to union them and an inbound ``tts_done`` has to be *routed*
+— and a router is a thing that can route wrong. A ``tts_done`` that lands on the
+component that was not speaking clears nothing and the FSM waits in ``SPEAKING``
+for a completion that has already been consumed. So:
+
+* ``body_state.audio.speaking`` is ``ConversationCoordinator.speaking``. Not a
+  union, not a maximum, not a fallback — the one field.
+* :meth:`LuxoApp._on_tts_done` calls ``ConversationCoordinator.on_tts_done`` and
+  nothing else. There is no branch to get wrong.
+* :meth:`LuxoApp._on_vad` no longer polices barge-in itself. ``on_vad_start``
+  already refuses whenever a line is staged or sounding, whoever authored it, so
+  the PRD 16 rule is enforced by the owner instead of alongside it.
+* :class:`UnpromptedSpeech` is a **read-only projection** of that one owner, for
+  diagnostics. It has no state and no mutator; that is what makes it a view
+  rather than a second owner.
+
+A narration is refused, never queued: see :meth:`LuxoApp._on_narration`.
+
 Outbound ownership
 ------------------
 
@@ -167,8 +198,8 @@ check cannot deadlock against each other.
 The animation tick and I/O
 --------------------------
 
-:meth:`tick_animation` calls only: a blackboard snapshot, two speech-envelope
-lookups, the director's fixed step, and ``publish_body_state``. It never
+:meth:`tick_animation` calls only: a blackboard snapshot, one speech-envelope
+lookup, the director's fixed step, and ``publish_body_state``. It never
 serializes a message, never touches the event loop, never opens a file, never
 submits a worker job, and never calls a model.
 
@@ -179,16 +210,23 @@ Being precise about the locks it does take, because "no I/O" is not the same as
   behaviour tick doing pure in-memory routing;
 * the **blackboard lock**, for one snapshot;
 * the **app state lock**, for counters and the cached state name;
-* the **conversation and narration locks**, for ``speaking`` and
-  ``speech_amplitude``. Both read two fields and return; the speech worker holds
-  the conversation lock only across a chunk enqueue, never across Piper
-  synthesis, which happens outside it.
+* the **conversation lock**, for ``speaking`` and ``speech_amplitude``. Each
+  reads two fields and returns; the speech worker holds that lock only across a
+  chunk enqueue, never across Piper synthesis, which happens outside it.
 
 Every one of those is a bounded in-memory critical section. It never takes the
 router, FSM, observation, or plan-executor lock at all. Telemetry it needs from
 the behaviour domain (state name, arousal, last latency) is cached as a plain
 attribute by the domain that owns it, so the 120 Hz tick never waits on the
 10 Hz one to read it.
+
+One lock edge elsewhere is worth naming, because it is not visible from the tick
+order. ``ObservationRuntime`` holds its own lock while it invokes
+``narration_callback``, so :meth:`LuxoApp._on_narration` takes the conversation
+lock *under* the observation lock. That is safe in exactly one direction, and it
+is the direction that holds: the coordinator, under its own lock, reaches only
+the FSM, the blackboard, the plan executor, and the outbound callbacks. It never
+reaches the observation runtime, so the two can never close a cycle.
 """
 
 from __future__ import annotations
@@ -239,12 +277,10 @@ from ..protocol.messages import (
     VadMessage,
 )
 from ..speech.stt import SpeechToText
-from ..speech.tts import DEFAULT_CHUNK_BYTES, ENVELOPE_HZ
-from ..speech.tts import SAMPLE_HZ as TTS_SAMPLE_HZ
-from ..speech.tts import SpeechAudio, TextToSpeech
+from ..speech.tts import TextToSpeech
 from ..wake_sequence import WakeSequenceCoordinator
 from .actions import CANCELLING_STATES, ActionRouter
-from .interactions import ConversationCoordinator
+from .interactions import ConversationCoordinator, Stage
 from .observations import ObservationRuntime, ObservationStage
 from .reset import DemoReset, ResetReport
 
@@ -369,229 +405,59 @@ class AppStatus:
     router_capture_signals: int
     observation_arm_timeouts: int
     narrations_spoken: int
+    narrations_dropped: int
     resets_applied: int
     last_latency_ms: float
     running: bool
 
 
-class NarrationSpeaker:
-    """Speak one observation narration over the PRD 8.4 wire contract.
+class UnpromptedSpeech:
+    """Read-only view of the one unprompted line the coordinator is holding.
 
-    ``ConversationCoordinator`` owns dialogue speech but exposes no public
-    "speak this text" entry point, and ``interactions.py`` is not owned by this
-    packet, so the observation runtime's ``narration_callback`` cannot be routed
-    into it. This class is the interim owner of that hop: it reuses the same
-    ``TextToSpeech`` instance, the same ``speak_begin``/PCM/``speak_end``
-    sequence, and the same browser ``tts_done`` authority, and it publishes its
-    own ``speaking`` flag and envelope so ``body_state`` stays truthful while a
-    narration plays.
+    Narration used to be spoken by a second component living here, which meant
+    two owners of ``speaking`` and an inbound ``tts_done`` that had to be routed
+    between them. ``ConversationCoordinator.speak`` removed the need for that:
+    an unprompted line now occupies the same staging slot as a brain reply.
 
-    It deliberately does not retry. ``ObservationRuntime`` has already released
-    the plan blocker by the time a narration is dispatched, so a failed line
-    costs the line and nothing else.
+    What is left is this — a projection, not a participant. It reads the
+    coordinator's own status and reports the part of it that is about an
+    unprompted line, for diagnostics and for the demo-reset checks that assert a
+    narration is not left sounding. It holds no state, synthesizes nothing,
+    owns no worker, and deliberately exposes **no mutator at all**: there is no
+    ``speak``, no ``on_tts_done``, no ``reset``. That absence is the proof it
+    cannot become a second owner by accident.
     """
 
-    def __init__(
-        self,
-        *,
-        tts: TextToSpeech,
-        speak_callback: Callable[[SpeakBeginMessage | SpeakEndMessage], None],
-        pcm_callback: Callable[[bytes], None],
-        clock: Callable[[], float] = time.time,
-        executor: Executor | None = None,
-    ) -> None:
-        if not all(callable(item) for item in (speak_callback, pcm_callback, clock)):
-            raise TypeError("narration callbacks must be callable")
-        self._tts = tts
-        self._speak_callback = speak_callback
-        self._pcm_callback = pcm_callback
-        self._clock = clock
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="luxo-narration"
-        )
-        self._owns_executor = executor is None
-        self._lock = threading.RLock()
-        self._generation = 0
-        self._closed = False
-        self._speaking = False
-        self._awaiting_done = False
-        self._envelope: tuple[float, ...] = ()
-        self._started_at: float | None = None
-        self._spoken = 0
-        self._failures = 0
-        self._last_error: str | None = None
+    __slots__ = ("_conversation",)
+
+    _AWAITING: Final = frozenset({Stage.AWAITING_DONE, Stage.STALLED})
+
+    def __init__(self, conversation: ConversationCoordinator) -> None:
+        self._conversation = conversation
 
     @property
     def speaking(self) -> bool:
-        """True from ``speak_begin`` until the browser reports ``tts_done``.
+        """True while the line the browser is playing is an unprompted one.
 
-        Deliberately identical in shape to ``ConversationCoordinator.speaking``:
-        the flag tracks audio the browser is still playing, not bytes the core
-        is still writing, so ``body_state.audio.speaking`` stays true for the
-        whole utterance and the music keeps ducking under it.
+        Narrower than ``ConversationCoordinator.speaking``, and deliberately so:
+        that property is the ``body_state`` fact and covers every line, whoever
+        authored it. This one answers the different question "is a *narration*
+        sounding", which is only ever asked by diagnostics.
         """
 
-        with self._lock:
-            return self._speaking
+        status = self._conversation.status
+        return status.speaking and status.unprompted
 
     @property
     def awaiting_done(self) -> bool:
-        with self._lock:
-            return self._awaiting_done
+        """True from a delivered unprompted line until the browser reports it.
 
-    @property
-    def spoken(self) -> int:
-        with self._lock:
-            return self._spoken
+        ``STALLED`` counts: a partial delivery already put audio in front of the
+        listener and is waiting on the same browser ``tts_done``.
+        """
 
-    @property
-    def last_error(self) -> str | None:
-        with self._lock:
-            return self._last_error
-
-    def speech_amplitude(self, now: float) -> float:
-        """Look up the 50 Hz envelope; pure and safe on the animation tick."""
-
-        with self._lock:
-            started, envelope = self._started_at, self._envelope
-        if started is None or now < started:
-            return 0.0
-        index = int((now - started) * ENVELOPE_HZ)
-        return envelope[index] if index < len(envelope) else 0.0
-
-    def speak(self, text: str) -> bool:
-        """Queue one narration line; returns whether a worker was armed."""
-
-        if not isinstance(text, str):
-            raise TypeError("narration text must be a string")
-        line = " ".join(text.split())
-        if not line:
-            return False
-        with self._lock:
-            if self._closed or self._speaking or self._awaiting_done:
-                return False
-            self._generation += 1
-            generation = self._generation
-            try:
-                self._executor.submit(self._deliver, generation, line)
-            except Exception as error:
-                self._last_error = type(error).__name__
-                self._failures += 1
-                return False
-            return True
-
-    def on_tts_done(self, t: float) -> bool:
-        """Accept the browser as the only authority for narration completion."""
-
-        with self._lock:
-            if self._closed or not self._awaiting_done:
-                return False
-            started = self._started_at
-            if started is not None and t < started:
-                return False
-            self._clear_locked()
-            return True
-
-    def disengage(self) -> None:
-        """Abandon narration audio on gaze loss or an explicit runtime stop."""
-
-        with self._lock:
-            if self._closed:
-                return
-            self._generation += 1
-            self._clear_locked()
-
-    def reset(self) -> None:
-        self.disengage()
-        with self._lock:
-            self._last_error = None
-
-    def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._generation += 1
-            self._clear_locked()
-            self._closed = True
-        if self._owns_executor:
-            self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def _clear_locked(self) -> None:
-        self._speaking = False
-        self._awaiting_done = False
-        self._envelope = ()
-        self._started_at = None
-
-    def _deliver(self, generation: int, text: str) -> None:
-        """Synthesize and stream one line; this never runs on a tick thread."""
-
-        try:
-            audio = self._synthesize(text)
-            chunks = self._chunks(audio)
-        except Exception as error:
-            with self._lock:
-                if generation == self._generation:
-                    self._last_error = type(error).__name__
-                    self._failures += 1
-            LOGGER.warning("narration synthesis failed (%s)", type(error).__name__)
-            return
-
-        try:
-            with self._lock:
-                if self._closed or generation != self._generation:
-                    return
-                self._envelope = tuple(audio.envelope)
-                self._started_at = self._clock()
-                self._speaking = True
-                self._awaiting_done = True
-                self._speak_callback(SpeakBeginMessage(ENVELOPE_HZ))
-            for chunk in chunks:
-                with self._lock:
-                    if self._closed or generation != self._generation:
-                        return
-                    self._pcm_callback(chunk)
-            with self._lock:
-                if self._closed or generation != self._generation:
-                    return
-                # ``speaking`` stays true: the browser is only now starting to
-                # play what was streamed. Only tts_done, disengage, or close
-                # clears it, so completion is never fabricated here.
-                self._speak_callback(SpeakEndMessage())
-                self._spoken += 1
-        except Exception as error:
-            with self._lock:
-                if generation != self._generation:
-                    return
-                self._last_error = type(error).__name__
-                self._failures += 1
-                if self._awaiting_done:
-                    # Audio already reached the browser. Send one best-effort
-                    # speak_end and then wait, exactly as the conversation
-                    # coordinator does after a partial delivery.
-                    try:
-                        self._speak_callback(SpeakEndMessage())
-                    except Exception:
-                        LOGGER.debug("speak_end after a partial narration failed")
-                else:
-                    self._clear_locked()
-            LOGGER.warning("narration delivery failed (%s)", type(error).__name__)
-
-    def _synthesize(self, text: str) -> SpeechAudio:
-        audio = self._tts.synthesize(text)
-        if not isinstance(audio, SpeechAudio):
-            raise TypeError("TTS must return SpeechAudio")
-        if audio.sample_hz != TTS_SAMPLE_HZ or audio.envelope_hz != ENVELOPE_HZ:
-            raise ValueError("TTS returned an incompatible audio contract")
-        return audio
-
-    def _chunks(self, audio: SpeechAudio) -> tuple[bytes, ...]:
-        chunks = tuple(self._tts.chunks(audio, max_bytes=DEFAULT_CHUNK_BYTES))
-        if not chunks or b"".join(chunks) != audio.pcm_int16:
-            raise ValueError("TTS chunks do not reconstruct the utterance")
-        for chunk in chunks:
-            if not chunk or len(chunk) % 2 or len(chunk) > DEFAULT_CHUNK_BYTES:
-                raise ValueError("TTS chunk is not even-sized PCM of at most 8 KiB")
-        return chunks
+        status = self._conversation.status
+        return status.unprompted and status.stage in self._AWAITING
 
 
 class LatencyRecorder:
@@ -743,7 +609,6 @@ class LuxoApp:
         sleep: Callable[[float], None] = time.sleep,
         conversation_executor: Executor | None = None,
         observation_executor: Executor | None = None,
-        narration_executor: Executor | None = None,
         warm_executor: Executor | None = None,
         latency_executor: Executor | None = None,
         reset_executor: Executor | None = None,
@@ -824,13 +689,9 @@ class LuxoApp:
             executor=observation_executor,
         )
 
-        self._narration = NarrationSpeaker(
-            tts=tts,
-            speak_callback=self._send_speak,
-            pcm_callback=self._protocol.publish_tts_pcm,
-            clock=clock,
-            executor=narration_executor,
-        )
+        # A projection of the coordinator, not a second speaker. Narration and
+        # dialogue share one staging slot, one worker pool, and one ``speaking``.
+        self._narration = UnpromptedSpeech(self._conversation)
 
         self._wake = WakeSequenceCoordinator(
             stt=stt,
@@ -863,6 +724,8 @@ class LuxoApp:
         self._router_capture_signals = 0
         self._capture_frames_sent = 0
         self._observation_arm_timeouts = 0
+        self._narrations_spoken = 0
+        self._narrations_dropped = 0
         self._cue_failures = 0
 
         self._camera = CameraGeometry()
@@ -877,11 +740,21 @@ class LuxoApp:
         # The between-takes reset. It is handed the same director lock every
         # other entry into the animation body takes, so its body step is
         # serialized against the 120 Hz tick like any other.
+        #
+        # ``conversation`` and ``narration`` are deliberately the same object.
+        # ``reset.py`` names them as two steps because there were once two
+        # components; there is now one, and the collapse is stated here rather
+        # than by quietly dropping a step the module still declares in
+        # ``STEP_NAMES``. ``ConversationCoordinator.reset`` is idempotent —
+        # it invalidates the generation, clears the staged line, the envelope
+        # and the ``speaking`` flag, and forgets recent turns — so running it
+        # twice in the sequence clears the same baseline twice and cannot
+        # regress the coverage either step used to provide.
         self._reset = DemoReset(
             fsm=self._fsm,
             blackboard=self._blackboard,
             conversation=self._conversation,
-            narration=self._narration,
+            narration=self._conversation,
             observations=self._observations,
             router=self._router,
             director_lock=self._director_lock,
@@ -917,7 +790,9 @@ class LuxoApp:
         return self._observations
 
     @property
-    def narration(self) -> NarrationSpeaker:
+    def narration(self) -> UnpromptedSpeech:
+        """Diagnostics only. A view of :attr:`conversation`, not a component."""
+
         return self._narration
 
     @property
@@ -939,7 +814,6 @@ class LuxoApp:
     def status(self) -> AppStatus:
         snapshot = self._blackboard.snapshot()
         state = self._fsm.state
-        narrations = self._narration.spoken
         resets = self._reset.status.applied
         with self._lock:
             return AppStatus(
@@ -953,7 +827,8 @@ class LuxoApp:
                 capture_frames_sent=self._capture_frames_sent,
                 router_capture_signals=self._router_capture_signals,
                 observation_arm_timeouts=self._observation_arm_timeouts,
-                narrations_spoken=narrations,
+                narrations_spoken=self._narrations_spoken,
+                narrations_dropped=self._narrations_dropped,
                 resets_applied=resets,
                 last_latency_ms=0.0 if self._latency is None else self._latency.last_latency_ms,
                 running=self._started and not self._stopping.is_set(),
@@ -1009,7 +884,6 @@ class LuxoApp:
             ("wake", self._wake.close),
             ("conversation", self._conversation.close),
             ("observations", self._observations.close),
-            ("narration", self._narration.close),
             ("reset", self._reset.close),
         ):
             try:
@@ -1117,9 +991,9 @@ class LuxoApp:
         if reconnect:
             # A new browser will never send tts_done for audio the previous one
             # was playing, and will never return a frame the previous one was
-            # asked for. Clear both so a reconnect cannot strand either.
+            # asked for. Clear both so a reconnect cannot strand either. One
+            # conversation reset covers a narration too: it is the same slot.
             self._conversation.reset()
-            self._narration.reset()
             self._observations.reset()
             LOGGER.info("browser reconnected; speech and observation staging reset")
         self._wake.mark_browser_hello()
@@ -1145,18 +1019,27 @@ class LuxoApp:
             self._wake.mark_camera_ready()
 
     def _on_vad(self, message: VadMessage) -> None:
-        if self._narration.speaking or self._narration.awaiting_done:
-            # PRD 16: no barge-in. The browser also suppresses VAD during
-            # playback, but narration audio is not coordinator speech, so the
-            # core enforces the same rule on its own side.
-            LOGGER.debug("ignoring VAD start during narration playback")
-            return
+        """Hand a VAD start straight to the one owner of the staging slot.
+
+        PRD 16 forbids barge-in, and this method used to enforce that for
+        narration on its own because narration audio was not coordinator
+        speech. It is now, so ``on_vad_start`` refuses on its own whenever a
+        line is staged or sounding, whoever authored it. Keeping a second check
+        here would be a copy of a rule the owner already applies, and copies of
+        rules drift.
+        """
+
         self._conversation.on_vad_start(message.t)
 
     def _on_tts_done(self, message: TtsDoneMessage) -> None:
-        if self._narration.awaiting_done:
-            self._narration.on_tts_done(message.t)
-            return
+        """The browser's completion has exactly one destination and no branch.
+
+        This is the whole point of collapsing the two speakers. A routed
+        ``tts_done`` is a ``tts_done`` that can be routed to the component that
+        was not speaking, which consumes the browser's only completion signal
+        and leaves the FSM waiting in ``SPEAKING`` for one that never comes.
+        """
+
         self._conversation.on_tts_done(message.t)
 
     # ------------------------------------------------------ protocol outbound
@@ -1196,16 +1079,52 @@ class LuxoApp:
             self._capture_armed_id = message.req_id
 
     def _on_narration(self, narration: MissingNarration) -> None:
-        """Route the observation runtime's narration into the speech path."""
+        """Stage the observation runtime's narration as an unprompted line.
+
+        ``ConversationCoordinator.speak`` is the whole hop: the line is put in
+        the same slot a brain reply occupies and the next behaviour tick
+        dispatches it through the same worker, synthesis, wire validation, raw
+        prefix-free PCM delivery and ``speak_begin``/``speak_end`` pair. Nothing
+        about narration reaches the transport from here.
+
+        **A blank line is dropped before it reaches the coordinator.** That is
+        not a redundant guard: ``PlanResponse`` caps ``say`` at a length but
+        does not require it to be non-empty, and ``speak`` substitutes the
+        in-character *dialogue* fallback for a blank line, which is right for a
+        reply that failed and wrong for a narration — the lamp would answer an
+        observation nobody prompted with "my thoughts got tangled".
+
+        **A refused narration is dropped with a log, never retried or queued.**
+        Three reasons, in order of weight:
+
+        * Nothing is stranded by dropping it. ``ObservationRuntime`` releases
+          the plan blocker before it narrates, so the line is the entire cost;
+          the rest of the plan runs either way.
+        * Retrying needs somewhere to hold the line until the slot frees, and
+          that place is a second staging slot — which is a second owner of the
+          spoken line under another name, and is exactly what this wiring
+          exists to remove.
+        * A narration is a remark about a moment. Deferring it behind a reply
+          means saying "your keys wandered off" after the conversation has
+          moved on, which is worse than not saying it.
+
+        The refusal is counted rather than swallowed, so ``status()`` can still
+        show that a line was lost.
+        """
 
         say = narration.response.say
         if not say.strip():
+            LOGGER.debug("narration dropped: the model returned a blank line")
+            with self._lock:
+                self._narrations_dropped += 1
             return
-        if self._conversation.speaking:
-            # Dialogue speech is already using the browser's one audio graph.
-            LOGGER.info("narration dropped: dialogue speech is already playing")
+        if self._conversation.speak(say):
+            with self._lock:
+                self._narrations_spoken += 1
             return
-        self._narration.speak(say)
+        with self._lock:
+            self._narrations_dropped += 1
+        LOGGER.info("narration dropped: the speech slot is already in use")
 
     def _emit_wake_action(self, action: Action) -> None:
         """Submit one PRD 10.4 waking beat through the normal plan path.
@@ -1321,8 +1240,9 @@ class LuxoApp:
         steps: list[tuple[str, Callable[[], object]]] = [("director", apply_to_body)]
         if cancelling:
             steps += [
+                # One disengage covers dialogue and narration alike: they are
+                # the same staged line in the same component.
                 ("conversation", self._conversation.disengage),
-                ("narration", self._narration.disengage),
                 ("observation", self._observations.disengage),
                 ("plan", cancel_plan),
             ]
@@ -1437,13 +1357,18 @@ class LuxoApp:
         """Advance one 120 Hz step and publish ``body_state`` on every second.
 
         This is the tick that must never block on I/O. It reads one blackboard
-        snapshot, looks up two pure speech envelopes, runs the director's fixed
+        snapshot, looks up one pure speech envelope, runs the director's fixed
         step, and swaps an immutable body-state snapshot into the transport.
         Nothing here serializes, opens a file, touches the event loop, or takes
         the router, FSM, or conversation staging lock.
+
+        ``speaking`` is read from the coordinator and from nowhere else. It is
+        one field, not a union of two, because there is one component that can
+        be speaking. The head bob and the published flag therefore cannot
+        disagree, and neither can outlive the other.
         """
 
-        speaking = self._conversation.speaking or self._narration.speaking
+        speaking = self._conversation.speaking
         snapshot = self._blackboard.snapshot()
 
         with self._director_lock:
@@ -1454,11 +1379,9 @@ class LuxoApp:
                 now = self._animation_anchor + self._animation_step * FIXED_DT
 
             if speaking:
-                amplitude = max(
-                    self._conversation.speech_amplitude(now),
-                    self._narration.speech_amplitude(now),
+                self._animation.set_speech_amplitude(
+                    self._conversation.speech_amplitude(now)
                 )
-                self._animation.set_speech_amplitude(amplitude)
             else:
                 self._animation.clear_speech_amplitude()
 
@@ -1594,10 +1517,10 @@ __all__ = [
     "CameraGeometry",
     "LatencyRecorder",
     "LuxoApp",
-    "NarrationSpeaker",
     "OBSERVATION_ARM_TIMEOUT_S",
     "PLAN_HELD_STATES",
     "ProtocolPort",
+    "UnpromptedSpeech",
     "build_app",
     "target_angles",
 ]
