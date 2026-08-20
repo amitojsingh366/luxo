@@ -172,6 +172,12 @@ class AnimationDirector:
             self._runtime.start_posture(PostureName.REST)
             self._set_light(LightPreset.WARM_IDLE)
         elif state is BehaviorState.NOTICING:
+            # First turn the body toward the detected viewer. The look-at lock
+            # is deliberately delayed until the anticipation beat completes,
+            # so engagement reads as rotate, then make direct eye contact.
+            self._desired_target = None
+            self._runtime.clear_look_at_target()
+            self._runtime.start_gesture(GestureName.REGARD)
             self._notice_due = transition.t + NOTICE_FREEZE_S
         elif state is BehaviorState.ENGAGED:
             self._desired_target = "person"
@@ -275,7 +281,6 @@ class AnimationDirector:
         if self._notice_due is not None and now >= self._notice_due:
             self._notice_due = None
             self._desired_target = "person"
-            self._runtime.start_gesture(GestureName.REGARD)
             self._set_light(LightPreset.WARM_BRIGHT)
             self._effects.append(SfxCue(SfxName.CHIRP_UP))
         if self._droop_due is not None and now >= self._droop_due:

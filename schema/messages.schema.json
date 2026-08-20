@@ -90,7 +90,11 @@
         "pitch_deg": { "type": "number" },
         "az": { "type": "number" },
         "el": { "type": "number" },
-        "conf": { "type": "number", "minimum": 0, "maximum": 1 }
+        "conf": { "type": "number", "minimum": 0, "maximum": 1 },
+        "hands_present": { "type": "boolean" },
+        "hand_az": { "type": "number" },
+        "hand_el": { "type": "number" },
+        "hand_conf": { "type": "number", "minimum": 0, "maximum": 1 }
       }
     },
     "VadMessage": {

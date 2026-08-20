@@ -37,6 +37,7 @@ browser's sole authority over completion are all shared, not duplicated.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -50,7 +51,7 @@ from typing import Final
 
 from ..blackboard import Blackboard, UtteranceFact
 from ..brain.client import BrainClient, RecentExchange
-from ..brain.schema import PlanResponse
+from ..brain.schema import Action, ActionOp, PlanResponse
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..instrumentation import Milestone
 from ..plan_executor import PlanExecutor
@@ -73,6 +74,26 @@ DEFAULT_WORKERS: Final = 2
 SpeakCallback = Callable[[SpeakBeginMessage | SpeakEndMessage], None]
 PcmCallback = Callable[[bytes], None]
 MilestoneCallback = Callable[[Milestone, float], None]
+SceneTurnCallback = Callable[[str, bool], None]
+
+
+def _log_text(value: str) -> str:
+    """Keep terminal logs readable without allowing control characters."""
+
+    return "".join(character if character.isprintable() else "�" for character in value)
+
+
+def _plan_log(plan: tuple[Action, ...]) -> str:
+    actions: list[dict[str, object]] = []
+    for action in plan:
+        item: dict[str, object] = {"op": action.op.value}
+        for field in ("name", "target", "preset", "pattern", "arc", "speed", "ms"):
+            value = getattr(action, field, None)
+            if value is None:
+                continue
+            item[field] = value.value if isinstance(value, Enum) else value
+        actions.append(item)
+    return json.dumps(actions, ensure_ascii=False, separators=(",", ":"))
 
 
 class Stage(str, Enum):
@@ -155,6 +176,7 @@ class ConversationCoordinator:
         speak_callback: SpeakCallback,
         pcm_callback: PcmCallback,
         milestone_callback: MilestoneCallback | None = None,
+        scene_turn_callback: SceneTurnCallback | None = None,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         executor: Executor | None = None,
@@ -164,6 +186,8 @@ class ConversationCoordinator:
             raise TypeError("coordinator callbacks must be callable")
         if milestone_callback is not None and not callable(milestone_callback):
             raise TypeError("milestone_callback must be callable")
+        if scene_turn_callback is not None and not callable(scene_turn_callback):
+            raise TypeError("scene_turn_callback must be callable")
         if executor is not None and not callable(getattr(executor, "submit", None)):
             raise TypeError("executor must provide submit()")
         self._blackboard = blackboard
@@ -176,6 +200,7 @@ class ConversationCoordinator:
         self._speak_callback = speak_callback
         self._pcm_callback = pcm_callback
         self._milestone_callback = milestone_callback
+        self._scene_turn_callback = scene_turn_callback
         self._clock = clock
         self._sleep = sleep
         self._executor = executor or ThreadPoolExecutor(
@@ -329,6 +354,7 @@ class ConversationCoordinator:
             self._unprompted = True
             self._stage = Stage.REPLIED
             self._last_error = "blank_say" if blank else None
+            LOGGER.info("CHAT Luxo (scene): %s", _log_text(self._reply))
             return True
 
     def tick(self) -> None:
@@ -493,6 +519,7 @@ class ConversationCoordinator:
             return
         now = self._now()
         self._transcript = _line(result.text)
+        LOGGER.info("CHAT human: %s", _log_text(self._transcript))
         self._stage = Stage.TRANSCRIBED
         self._blackboard.publish_utterance(UtteranceFact(now, self._transcript))
         self._fsm.post_event(BehaviorEvent.TRANSCRIPT_READY)
@@ -514,6 +541,18 @@ class ConversationCoordinator:
             say = FALLBACK_SAY
             self._last_error = "blank_say"
         fallback = say == FALLBACK_SAY and not reply.plan
+        LOGGER.info("CHAT Luxo: %s", _log_text(say))
+        LOGGER.info("CHAT plan: %s", _plan_log(reply.plan))
+        if self._scene_turn_callback is not None:
+            try:
+                self._scene_turn_callback(
+                    self._transcript or "",
+                    any(action.op is ActionOp.OBSERVE for action in reply.plan),
+                )
+            except Exception:
+                # A policy failure must suppress follow-up speech, never
+                # invalidate an otherwise valid dialogue reply and plan.
+                LOGGER.exception("observation speech policy callback failed")
         now = self._now()
         with self._blackboard.lock:
             self._plans.submit(reply.plan)
@@ -555,6 +594,19 @@ class ConversationCoordinator:
         memory = self._compact_memory()
         if not isinstance(memory, str) or "\n" in memory or "\r" in memory:
             raise ValueError("compact memory must be a single line")
+        context = [
+            {
+                "human": _log_text(exchange.human_say),
+                "luxo": _log_text(exchange.lamp_say),
+            }
+            for exchange in recent[-MAX_RECENT:]
+        ]
+        LOGGER.info(
+            "BRAIN request current=%s memory=%s recent=%s",
+            json.dumps(_log_text(transcript), ensure_ascii=False),
+            json.dumps(_log_text(memory), ensure_ascii=False),
+            json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+        )
         return self._brain.converse(transcript, memory, recent[-MAX_RECENT:])
 
     def _deliver(self, generation: int, text: str, unprompted: bool = False) -> None:

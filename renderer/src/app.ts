@@ -110,10 +110,10 @@ function addStudio(scene: Scene): void {
   plinth.receiveShadow = true;
   scene.add(plinth);
 
-  const ambient = new AmbientLight(0x8190aa, 0.62);
+  const ambient = new AmbientLight(0x8190aa, 0.42);
   scene.add(ambient);
 
-  const key = new DirectionalLight(0xffe0b8, 3.6);
+  const key = new DirectionalLight(0xffe0b8, 1.65);
   key.position.set(-1.25, -1.4, 2.2);
   key.castShadow = true;
   key.shadow.mapSize.set(2048, 2048);
@@ -126,7 +126,7 @@ function addStudio(scene: Scene): void {
   key.shadow.bias = -0.0002;
   scene.add(key);
 
-  const rim = new DirectionalLight(0x8ba9d6, 1.75);
+  const rim = new DirectionalLight(0x8ba9d6, 0.9);
   rim.position.set(1.25, 0.8, 1.35);
   scene.add(rim);
 }
@@ -149,7 +149,7 @@ export async function mountRenderer(root: HTMLElement): Promise<RendererHandle> 
   });
   renderer.outputColorSpace = SRGBColorSpace;
   renderer.toneMapping = ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  renderer.toneMappingExposure = 0.78;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = PCFSoftShadowMap;
 

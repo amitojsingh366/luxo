@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, Protocol, TypeVar
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .prompts import FixedPromptBuilder, PromptBuilder
@@ -28,10 +30,37 @@ from .schema import (
 LOGGER = logging.getLogger(__name__)
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RESPONSE_BYTES = 8 * 1024
-REPAIR_INSTRUCTION = "Your prior response was invalid. Return corrected bare JSON only."
 PRIVATE_PROVIDER = {"zdr": True, "data_collection": "deny", "allow_fallbacks": False}
 CallType = Literal["converse", "observe", "narrate"]
 T = TypeVar("T", PlanResponse, ObservationResponse)
+
+REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
+    "converse": (
+        "Your conversation response was invalid. Return one bare JSON object with exactly "
+        "the top-level keys say and plan. Every plan item needs an op from gesture, "
+        "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
+        "perk_up belongs in name with op set to gesture; it is never itself an op. Do not "
+        "copy the current transcript into say. Answer it from memory when the requested "
+        "object fact is present; otherwise say that you do not know."
+    ),
+    "narrate": (
+        "Your narration response was invalid. Return one bare JSON object with exactly "
+        "the top-level keys say and plan. Every plan item needs an op from gesture, "
+        "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
+        "perk_up belongs in name with op set to gesture; it is never itself an op."
+    ),
+    "observe": (
+        "Your observation response was invalid. Inspect the supplied image and return one "
+        "bare JSON object with exactly the top-level keys present and new. present must be "
+        "an array containing only supplied prior_canonical labels that remain visible. new "
+        "must describe every salient visible object not in prior_canonical using label, "
+        "canonical, attributes, and bbox_norm. If prior_canonical is empty, present must be "
+        "empty and visible objects must go in new. bbox_norm must contain decimal x, y, width, "
+        "and height values between 0 and 1, not pixel or corner coordinates. Always include "
+        "both arrays. Do not return "
+        "say, plan, dialogue, or prose."
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +106,24 @@ class ResponseTooLarge(RuntimeError):
 class OpenRouterTransportError(RuntimeError):
     """The endpoint returned an unusable streaming response."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_s = retry_after_s
+
 
 class BrainWarmError(RuntimeError):
     """Warm-up exhausted its repair attempt without a validated response."""
+
+
+class ObservationUnavailableError(RuntimeError):
+    """An observation exhausted repair without producing validated facts."""
 
 
 class CompletionTransport(Protocol):
@@ -133,7 +177,27 @@ class StdlibOpenRouterTransport:
         byte_count = 0
         model: str | None = None
         tokens_in = tokens_out = 0
-        with urlopen(http_request, timeout=self.timeout_s) as response:
+        try:
+            response_context = urlopen(http_request, timeout=self.timeout_s)
+        except HTTPError as error:
+            retry_after = _retry_after_seconds(
+                error.headers.get("Retry-After") if error.headers is not None else None
+            )
+            detail = f"OpenRouter returned HTTP {error.code}"
+            payload = _read_error_payload(error)
+            explanation = _openrouter_error_explanation(payload, api_key)
+            if explanation:
+                detail += f": {explanation}"
+            if retry_after is not None:
+                detail += f"; retry after {retry_after:g}s"
+            raise OpenRouterTransportError(
+                detail,
+                status_code=error.code,
+                retry_after_s=retry_after,
+            ) from error
+        except URLError as error:
+            raise OpenRouterTransportError("OpenRouter connection failed") from error
+        with response_context as response:
             for raw_line in response:
                 if not raw_line.startswith(b"data:"):
                     continue
@@ -144,8 +208,19 @@ class StdlibOpenRouterTransport:
                     event = json.loads(data)
                 except (UnicodeDecodeError, json.JSONDecodeError) as error:
                     raise OpenRouterTransportError("invalid SSE event") from error
-                if not isinstance(event, dict) or "error" in event:
-                    raise OpenRouterTransportError("OpenRouter returned an error event")
+                if not isinstance(event, dict):
+                    raise OpenRouterTransportError("OpenRouter returned an invalid SSE event")
+                if "error" in event:
+                    error_payload = event.get("error")
+                    raw_code = error_payload.get("code") if isinstance(error_payload, dict) else None
+                    status_code = raw_code if isinstance(raw_code, int) else None
+                    detail = "OpenRouter returned a streaming error"
+                    if status_code is not None:
+                        detail += f" {status_code}"
+                    explanation = _openrouter_error_explanation(event, api_key)
+                    if explanation:
+                        detail += f": {explanation}"
+                    raise OpenRouterTransportError(detail, status_code=status_code)
                 model = event.get("model") if isinstance(event.get("model"), str) else model
                 usage = event.get("usage")
                 if isinstance(usage, dict):
@@ -200,12 +275,18 @@ class OpenRouterBrainClient:
         self._clock = clock
         self._warm_lock = threading.Lock()
         self._warmed = False
+        LOGGER.info("OpenRouter configured model=%s profile=%s", self.model, self.profile)
 
     def warm(self) -> None:
         """Warm once through the existing narrate call from a startup worker."""
 
         with self._warm_lock:
             if self._warmed:
+                return
+            if self.profile == "free":
+                # OpenRouter is remote and a free request is quota, not a local
+                # model warm-up. Readiness is exercised by the first real turn.
+                self._warmed = True
                 return
             self._narrate((), strict=True)
             self._warmed = True
@@ -217,7 +298,14 @@ class OpenRouterBrainClient:
         recent: Sequence[RecentExchange],
     ) -> PlanResponse:
         payload = self._prompts.converse_payload(transcript, compact_memory, recent)
-        return self._run("converse", self._text_messages(payload), parse_plan_response)
+
+        def parse_conversation(raw: str) -> PlanResponse:
+            response = parse_plan_response(raw)
+            if response.say.strip().casefold() == transcript.strip().casefold():
+                raise ResponseSchemaError("conversation response echoed current transcript")
+            return response
+
+        return self._run("converse", self._text_messages(payload), parse_conversation)
 
     def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ObservationResponse:
         payload = self._prompts.observe_payload(jpeg, prior_canonical)
@@ -254,9 +342,15 @@ class OpenRouterBrainClient:
         *,
         strict: bool = False,
     ) -> T:
+        structured_output = True
+        rate_limit: OpenRouterTransportError | None = None
         for attempt in range(2):
-            repair = [{"role": "user", "content": REPAIR_INSTRUCTION}] if attempt else []
-            request = self._request(messages + repair)
+            repair = (
+                [{"role": "user", "content": REPAIR_INSTRUCTIONS[call_type]}]
+                if attempt
+                else []
+            )
+            request = self._request(messages + repair, structured_output=structured_output)
             started = self._clock()
             try:
                 response = self._transport.complete(request, self._api_key, MAX_RESPONSE_BYTES)
@@ -266,8 +360,19 @@ class OpenRouterBrainClient:
                 self._emit_metrics(call_type, attempt, latency_ms, None, "invalid")
             except Exception as error:
                 latency_ms = (self._clock() - started) * 1000.0
-                LOGGER.warning("%s transport failed (%s)", call_type, type(error).__name__)
+                if isinstance(error, OpenRouterTransportError):
+                    LOGGER.warning("%s transport failed (%s)", call_type, error)
+                else:
+                    LOGGER.warning("%s transport failed (%s)", call_type, type(error).__name__)
                 self._emit_metrics(call_type, attempt, latency_ms, None, "transport_error")
+                if isinstance(error, OpenRouterTransportError):
+                    if error.status_code == 429:
+                        rate_limit = error
+                        break
+                    # A pinned endpoint may accept JSON text while rejecting
+                    # response_format. The fixed prompt and parser still own
+                    # the schema, so retry once without that optional hint.
+                    structured_output = False
             else:
                 latency_ms = (self._clock() - started) * 1000.0
                 try:
@@ -281,19 +386,38 @@ class OpenRouterBrainClient:
         if strict:
             raise BrainWarmError("OpenRouter warm-up failed after its repair attempt")
         if call_type == "observe":
-            return ObservationResponse((), ())  # type: ignore[return-value]
+            raise ObservationUnavailableError(
+                "OpenRouter observation failed after its repair attempt"
+            )
+        if rate_limit is not None:
+            if call_type == "narrate":
+                return PlanResponse("", ())  # type: ignore[return-value]
+            wait = rate_limit.retry_after_s
+            if wait is not None:
+                seconds = max(1, int(math.ceil(wait)))
+                say = f"OpenRouter is rate-limiting me—please try again in {seconds} seconds."
+            else:
+                say = "OpenRouter is rate-limiting me—please try again later."
+            return PlanResponse(say, ())  # type: ignore[return-value]
         return PlanResponse("Oops—my thoughts got tangled! Can we try that again?", ())  # type: ignore[return-value]
 
-    def _request(self, messages: list[dict[str, object]]) -> dict[str, object]:
-        return {
+    def _request(
+        self,
+        messages: list[dict[str, object]],
+        *,
+        structured_output: bool = True,
+    ) -> dict[str, object]:
+        request: dict[str, object] = {
             "model": self.model,
             "messages": messages,
             "provider": dict(self.provider),
             "reasoning": {"effort": "none"},
-            "response_format": {"type": "json_object"},
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if structured_output:
+            request["response_format"] = {"type": "json_object"}
+        return request
 
     def _log_invalid(self, call_type: CallType, raw: str, reason: str) -> None:
         safe_raw = raw.replace(self._api_key, "[REDACTED]")
@@ -330,6 +454,61 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _retry_after_seconds(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0.0 else None
+
+
+def _read_error_payload(error: HTTPError) -> object:
+    """Read only a bounded OpenRouter error envelope, never a success body."""
+
+    try:
+        raw = error.read(MAX_RESPONSE_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_RESPONSE_BYTES:
+        return None
+    try:
+        return json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _openrouter_error_explanation(payload: object, api_key: str) -> str:
+    """Return bounded allow-listed diagnostics from an OpenRouter error."""
+
+    if not isinstance(payload, dict):
+        return ""
+    error_payload = payload.get("error")
+    if not isinstance(error_payload, dict):
+        return ""
+
+    fragments: list[str] = []
+    message = _safe_error_text(error_payload.get("message"), api_key)
+    if message:
+        fragments.append(message)
+
+    metadata = error_payload.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("error_type", "provider_code", "provider_name", "model_slug"):
+            value = _safe_error_text(metadata.get(key), api_key)
+            if value:
+                fragments.append(f"{key}={value}")
+    return "; ".join(fragments)
+
+
+def _safe_error_text(value: object, api_key: str) -> str:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return ""
+    text = " ".join(str(value).split()).replace(api_key, "[REDACTED]")
+    return text[:240]
+
+
 def _token_count(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
@@ -342,6 +521,8 @@ __all__ = [
     "MAX_RESPONSE_BYTES",
     "OPENROUTER_URL",
     "OpenRouterBrainClient",
+    "OpenRouterTransportError",
+    "ObservationUnavailableError",
     "PRIVATE_PROVIDER",
     "RecentExchange",
     "ResponseTooLarge",

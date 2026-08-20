@@ -258,6 +258,7 @@ export class LuxoBrowserRuntime {
       });
       this.gaze = this.dependencies.createGaze({
         camera: this.camera as CameraSensor,
+        enableHandTracking: true,
         publish: ({ type: _type, ...fact }) => this.route(generation, "gaze", () => { protocol.sendGaze(fact); }),
         onError: (error) => this.route(generation, "gaze", () => this.report("gaze", error)),
       });

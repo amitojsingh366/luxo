@@ -47,6 +47,7 @@ Comparison. The model performs perception (``observe``) and narration
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Sequence
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
@@ -59,14 +60,14 @@ from ..brain.missing import (
     MissingComparison,
     MissingNarration,
     MissingObjectCoordinator,
-    compute_missing,
+    compute_observation_missing,
 )
 from ..brain.observe import (
     ObservationBusyError,
     ObservationCoordinator,
     ObservationRequestError,
 )
-from ..brain.schema import ObservationResponse
+from ..brain.schema import ObservationResponse, normalize_canonical_label
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..plan_executor import ObservationReleaseError, PlanExecutor
 from ..protocol.messages import CaptureFrameMessage
@@ -79,7 +80,7 @@ DEFAULT_WORKERS: Final = 1
 CaptureCallback = Callable[[CaptureFrameMessage], None]
 NarrationCallback = Callable[[MissingNarration], None]
 BaselineLabels = Callable[[], Sequence[str]]
-NarratePolicy = Callable[[MissingComparison], bool]
+NarratePolicy = Callable[[MissingComparison], bool | Sequence[str] | None]
 
 
 class ObservationStage(str, Enum):
@@ -143,6 +144,29 @@ def _narrate_when_missing(comparison: MissingComparison) -> bool:
     """Narrate only a real absence; a plain inspection has nothing to report."""
 
     return bool(comparison.missing)
+
+
+def _selected_comparison(
+    comparison: MissingComparison,
+    decision: bool | Sequence[str] | None,
+) -> MissingComparison | None:
+    """Turn policy output into a safe subset; ``None`` means stay silent."""
+
+    if decision is True:
+        selected = comparison.missing
+    elif decision is False or decision is None:
+        return None
+    else:
+        if isinstance(decision, (str, bytes, bytearray)) or not isinstance(
+            decision, Sequence
+        ):
+            raise TypeError("narration policy must return bool, labels, or None")
+        selected = tuple(
+            dict.fromkeys(normalize_canonical_label(label) for label in decision)
+        )
+        if not set(selected).issubset(comparison.missing):
+            raise ValueError("narration policy selected an object that is not missing")
+    return MissingComparison(comparison.baseline, comparison.present, selected)
 
 
 class ObservationRuntime:
@@ -437,17 +461,29 @@ class ObservationRuntime:
 
         self._observations_completed += 1
         self._announce_complete_locked()
-        comparison = compute_missing(self._baseline, response.present)
+        comparison = compute_observation_missing(self._baseline, response)
         self._last_missing = comparison.missing
-        if not self._should_narrate(comparison):
+        LOGGER.info(
+            "SCENE comparison=%s",
+            json.dumps(
+                {
+                    "baseline": comparison.baseline,
+                    "visible": comparison.present,
+                    "missing": comparison.missing,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        selected = _selected_comparison(comparison, self._should_narrate(comparison))
+        if selected is None:
             self._finish_locked()
             return
 
         generation = self._generation
-        baseline = self._baseline
         self._stage = ObservationStage.NARRATING
         try:
-            narration_future = self._executor.submit(self._narrate, baseline, response)
+            narration_future = self._executor.submit(self._narrate, selected)
         except Exception as error:
             self._last_error = type(error).__name__
             self._finish_locked()
@@ -534,12 +570,10 @@ class ObservationRuntime:
 
         return self._observations.complete(request_id, jpeg)
 
-    def _narrate(
-        self, baseline: tuple[str, ...], response: ObservationResponse
-    ) -> MissingNarration:
-        """Compare in Python, then call ``narrate`` with missing labels only."""
+    def _narrate(self, comparison: MissingComparison) -> MissingNarration:
+        """Call ``narrate`` with only the locally selected missing labels."""
 
-        return self._missing.compare_and_narrate(baseline, response)
+        return self._missing.narrate_comparison(comparison)
 
     def _announce_complete_locked(self) -> None:
         """Report that the inspection ended, never that memory changed."""

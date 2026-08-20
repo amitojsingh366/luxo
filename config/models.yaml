@@ -136,6 +136,32 @@
       "notes": "Object generation 1683136941916318, last modified 2023-05-03. Requires the MediaPipe WASM bundle below."
     },
     {
+      "name": "mediapipe_hand_landmarker",
+      "kind": "file",
+      "consumers": ["renderer/src/sensors/gaze.ts"],
+      "consumer_detail": "DEFAULT_HAND_MODEL_PATH. Loaded by HandLandmarker to prefer the midpoint of visible hands over the face as Luxo's attention target.",
+      "destination": {
+        "layout": "browser_public",
+        "path": "renderer/public/models/hand_landmarker.task",
+        "served_at": "/models/hand_landmarker.task"
+      },
+      "url": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      "url_canonical": true,
+      "url_note": "Google's versioned MediaPipe model bucket. The float16/1 path is used instead of the movable latest alias.",
+      "sha256": "UNVERIFIED",
+      "sha256_source": "Google publishes CRC32C and MD5 response metadata for this model bundle but no SHA-256. The exact versioned object is integrity-checked with the publisher MD5 below and remains explicitly unpinned until the owner reviews and records a locally computed SHA-256.",
+      "size_bytes": 7819105,
+      "size_note": "7.5 MiB, from x-goog-stored-content-length and Content-Length on the versioned object.",
+      "license": "Apache-2.0",
+      "license_source": "UNCONFIRMED. MediaPipe Solutions model bundles are generally published under Apache-2.0, but the model download does not carry a separate license document; confirm before redistribution.",
+      "verify_command": "curl -fsSL 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task' -o renderer/public/models/hand_landmarker.task && sha256sum renderer/public/models/hand_landmarker.task   # macOS: shasum -a 256; paste the reviewed digest over UNVERIFIED in this file",
+      "additional_digests": {
+        "md5": "15318430ea3851670fe9914116a9cfad",
+        "md5_source": "x-goog-hash: md5=FTGEMOo4UWcP6ZFBFqnPrQ== on a HEAD of the pinned URL, base64-decoded to hex; it also matches the ETag. This detects corruption but is not a supply-chain pin."
+      },
+      "notes": "Object generation 1682480004222387, last modified 2023-04-26. Uses the existing pinned MediaPipe Tasks Vision WASM runtime."
+    },
+    {
       "name": "silero_vad",
       "kind": "file",
       "consumers": ["renderer/src/sensors/vad.ts"],

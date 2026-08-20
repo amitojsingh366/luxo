@@ -8,6 +8,8 @@ thread, never from an animation or behaviour tick.
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import math
 import threading
 import time
@@ -21,6 +23,8 @@ from .schema import (
     ObservedObject,
     normalize_canonical_label,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 
 class ObservationError(RuntimeError):
@@ -126,9 +130,18 @@ class ObservationCoordinator:
         with self._lock:
             pending = self._matching_pending(request_id)
             if pending.response is None:
+                LOGGER.info(
+                    "SCENE observe prior=%s",
+                    json.dumps(
+                        pending.request.prior_canonical,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
                 response = self._brain.observe(frame, pending.request.prior_canonical)
                 if not isinstance(response, ObservationResponse):
                     raise TypeError("brain.observe must return a validated ObservationResponse")
+                LOGGER.info("SCENE noticed=%s", _observation_log(response))
                 observed_at = _timestamp(self._clock())
                 pending.response = response
                 pending.observed_at = observed_at
@@ -146,6 +159,7 @@ class ObservationCoordinator:
             existing = self._store.load()
             candidates = _memory_candidates(existing, response, observed_at)
             published = tuple(self._store.update(candidates))
+            LOGGER.info("SCENE memory saved=%s", _memory_log(published))
             self._pending = None
 
         if self._publish is not None:
@@ -226,6 +240,45 @@ def _memory_candidates(
         claimed.add(item.canonical)
         candidates.append(_new_candidate(item, index, observed_at, prior))
     return tuple(candidates)
+
+
+def _observation_log(response: ObservationResponse) -> str:
+    return json.dumps(
+        {
+            "present": list(response.present),
+            "new": [
+                {
+                    "label": item.label,
+                    "canonical": item.canonical,
+                    "attributes": list(item.attributes),
+                    "bbox_norm": list(item.bbox_norm),
+                }
+                for item in response.new
+            ],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _memory_log(records: tuple[SceneObject, ...]) -> str:
+    return json.dumps(
+        [
+            {
+                "id": record.id,
+                "label": record.label,
+                "canonical": record.canonical,
+                "attributes": list(record.attributes),
+                "bbox_norm": list(record.bbox_norm),
+                "first_seen": record.first_seen,
+                "last_seen": record.last_seen,
+                "present": record.present,
+            }
+            for record in records
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _new_candidate(

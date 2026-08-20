@@ -62,7 +62,7 @@ README does not repeat it.
 | Node.js `^20.19 \|\| >=22.12` | The `engines` requirement of the pinned Vite 8. |
 | Chromium or Firefox, recent | Needs WebGL2, `getUserMedia`, Web Audio, and WebAssembly. `localhost` is a secure context, so no TLS is involved. |
 | `espeak-ng` | A system package, not a Python one. `sudo apt-get install -y espeak-ng` on Ubuntu, `brew install espeak-ng` on macOS. It is Piper's phonemizer. |
-| An OpenRouter API key | Exported as `OPENROUTER_API_KEY` in the shell that launches the core. `doctor.py` probes for presence only and never reads, prints, or transmits the value. |
+| OpenRouter configuration | Put `OPENROUTER_API_KEY` and, optionally, `OPENROUTER_MODEL` in the root `.env`. `run.sh` parses that file as data without executing or printing its contents. `doctor.py` probes only for key presence. |
 
 whisper.cpp is built from source, CPU-only, and is not vendored here. Core-side
 model weights live outside the repository, in `~/.cache/luxo`. Browser-side
@@ -77,9 +77,9 @@ machine — see [Status](#status-not-demo-ready).
 
 ```sh
 ./setup.sh                      # venv, pip, npm ci, models, whisper.cpp, espeak-ng
-export OPENROUTER_API_KEY=...   # run.sh does not read .env; export it yourself
+# In .env: OPENROUTER_API_KEY=... and OPENROUTER_MODEL=provider/model:free
 python3 doctor.py               # core-side preflight; non-zero exit means stop
-./run.sh                        # starts the Python core and the Vite dev server
+./run.sh                        # safely loads .env, then starts core and renderer
 ```
 
 Then open two pages:
@@ -251,8 +251,8 @@ that:
 - One subject at a time, no wake word (gaze is the signal), no barge-in, and no
   cross-frame tracking — `observe` is discrete.
 - Localhost only. There is no LAN bind and no TLS path.
-- `doctor.py`'s remediation text says `run.sh` loads a root `.env`. It does not;
-  export `OPENROUTER_API_KEY` yourself.
+- `run.sh` safely loads the root `.env` as data. A non-empty value already
+  exported in the parent shell takes precedence over the value in `.env`.
 - No Linux smoke check has been run. The target is Ubuntu 24.04, but everything
   so far has been exercised on macOS.
 

@@ -53,6 +53,24 @@ def compute_missing(
     return MissingComparison(normalized_baseline, normalized_present, missing)
 
 
+def compute_observation_missing(
+    baseline: Sequence[str],
+    observation: ObservationResponse,
+) -> MissingComparison:
+    """Compare against every object the observation says is visible.
+
+    Vision models sometimes repeat an already-known canonical in ``new``
+    instead of ``present``. Scene memory correctly treats either location as
+    visible, so missing-object narration must do the same or it will announce
+    objects that are plainly still in frame.
+    """
+
+    if not isinstance(observation, ObservationResponse):
+        raise TypeError("observation must be a validated ObservationResponse")
+    visible = observation.present + tuple(item.canonical for item in observation.new)
+    return compute_missing(baseline, visible)
+
+
 class MissingObjectCoordinator:
     """Serialize minimal narration calls without retaining observation data.
 
@@ -76,7 +94,15 @@ class MissingObjectCoordinator:
 
         if not isinstance(observation, ObservationResponse):
             raise TypeError("observation must be a validated ObservationResponse")
-        comparison = compute_missing(baseline, observation.present)
+        comparison = compute_observation_missing(baseline, observation)
+
+        return self.narrate_comparison(comparison)
+
+    def narrate_comparison(self, comparison: MissingComparison) -> MissingNarration:
+        """Narrate an already-computed, policy-filtered comparison once."""
+
+        if not isinstance(comparison, MissingComparison):
+            raise TypeError("comparison must be a MissingComparison")
 
         # Brain clients need not be re-entrant. Serialization also makes the
         # one-call boundary deterministic when worker tasks race.
@@ -108,5 +134,6 @@ __all__ = [
     "MissingComparison",
     "MissingNarration",
     "MissingObjectCoordinator",
+    "compute_observation_missing",
     "compute_missing",
 ]

@@ -70,6 +70,10 @@ class GazeMessage:
     az: float
     el: float
     conf: float
+    hands_present: bool = False
+    hand_az: float = 0.0
+    hand_el: float = 0.0
+    hand_conf: float = 0.0
     type: Literal["gaze"] = field(default="gaze", init=False)
 
 

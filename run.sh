@@ -124,8 +124,8 @@ fi
 # .env
 # ---------------------------------------------------------------------------
 
-# The root .env carries OPENROUTER_API_KEY. It is gitignored, it is a secret,
-# and it is DATA — so it is treated as data here.
+# The root .env carries OPENROUTER_API_KEY and may carry OPENROUTER_MODEL. It is
+# gitignored, contains secrets, and is DATA — so it is treated as data here.
 #
 # Why not `source .env`, `. .env`, or `eval`:
 #   each of those hands the file to the shell parser, which means every line

@@ -1,6 +1,8 @@
 import type {
   FaceLandmarkerOptions,
   FaceLandmarkerResult,
+  HandLandmarkerOptions,
+  HandLandmarkerResult,
   Matrix,
   NormalizedLandmark,
 } from '@mediapipe/tasks-vision';
@@ -14,6 +16,7 @@ export const GAZE_EMA_ALPHA = 0.4;
 export const GAZE_INPUT_SIZE = Object.freeze({ width: 320, height: 240 });
 export const DEFAULT_WASM_PATH = '/mediapipe/wasm';
 export const DEFAULT_MODEL_PATH = '/models/face_landmarker.task';
+export const DEFAULT_HAND_MODEL_PATH = '/models/hand_landmarker.task';
 
 export type GazeLandmarkerResult = Pick<
   FaceLandmarkerResult,
@@ -28,9 +31,24 @@ export interface GazeLandmarker {
   close(): void;
 }
 
+export type HandTrackingResult = Pick<HandLandmarkerResult, 'landmarks' | 'handedness'>;
+
+export interface HandTrackingLandmarker {
+  detectForVideo(
+    frame: HTMLCanvasElement,
+    timestampMs: number,
+  ): HandTrackingResult | Promise<HandTrackingResult>;
+  close(): void;
+}
+
 export interface FaceLandmarkerConfiguration {
   readonly wasmBasePath: string;
   readonly options: FaceLandmarkerOptions;
+}
+
+export interface HandLandmarkerConfiguration {
+  readonly wasmBasePath: string;
+  readonly options: HandLandmarkerOptions;
 }
 
 export interface GazeClock {
@@ -54,10 +72,15 @@ export interface GazeSensorOptions {
   readonly createLandmarker?: (
     configuration: FaceLandmarkerConfiguration,
   ) => Promise<GazeLandmarker>;
+  readonly enableHandTracking?: boolean;
+  readonly createHandLandmarker?: (
+    configuration: HandLandmarkerConfiguration,
+  ) => Promise<HandTrackingLandmarker>;
   readonly clock?: GazeClock;
   readonly scheduler?: GazeScheduler;
   readonly wasmBasePath?: string;
   readonly modelAssetPath?: string;
+  readonly handModelAssetPath?: string;
   readonly onError?: (error: Error) => void;
 }
 
@@ -98,8 +121,30 @@ export function createFaceLandmarkerConfiguration(
   };
 }
 
+export function createHandLandmarkerConfiguration(
+  modelAssetPath = DEFAULT_HAND_MODEL_PATH,
+  wasmBasePath = DEFAULT_WASM_PATH,
+): HandLandmarkerConfiguration {
+  requireLocalAssetPath(modelAssetPath, 'handModelAssetPath');
+  requireLocalAssetPath(wasmBasePath, 'wasmBasePath');
+  return {
+    wasmBasePath,
+    options: {
+      baseOptions: { modelAssetPath, delegate: 'GPU' },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: 0.55,
+      minHandPresenceConfidence: 0.55,
+      minTrackingConfidence: 0.5,
+    },
+  };
+}
+
 export const DEFAULT_FACE_LANDMARKER_CONFIGURATION = Object.freeze(
   createFaceLandmarkerConfiguration(),
+);
+export const DEFAULT_HAND_LANDMARKER_CONFIGURATION = Object.freeze(
+  createHandLandmarkerConfiguration(),
 );
 
 /**
@@ -158,7 +203,7 @@ export function verticalFovRadians(
   return 2 * Math.atan(Math.tan(hfov / 2) / aspect);
 }
 
-/** Image-right maps to positive azimuth; image-down maps to positive elevation. */
+/** The selfie view mirrors horizontal motion; image-down remains positive elevation. */
 export function targetAnglesFromCentroid(
   centroid: FaceCentroid,
   horizontalFovDegrees: number,
@@ -170,11 +215,30 @@ export function targetAnglesFromCentroid(
   const hfov = degreesToRadians(validHorizontalFov(horizontalFovDegrees));
   const vfov = verticalFovRadians(horizontalFovDegrees, width, height);
   return {
-    az: Math.atan(2 * (x - 0.5) * Math.tan(hfov / 2)),
+    // Luxo faces the person across the desk, so their image-right is Luxo's
+    // left. This is the opposite sign from a camera mounted on Luxo itself.
+    az: -Math.atan(2 * (x - 0.5) * Math.tan(hfov / 2)),
     // Luxo's positive head pitch looks down, so image-down must stay positive.
     el: Math.atan(2 * (y - 0.5) * Math.tan(vfov / 2)),
     vfovRad: vfov,
   };
+}
+
+export function handsCentroid(
+  hands: readonly (readonly Pick<NormalizedLandmark, 'x' | 'y'>[])[],
+): FaceCentroid | null {
+  const landmarks = hands.flat();
+  if (landmarks.length === 0) return null;
+  return faceCentroid(landmarks);
+}
+
+export function acceptedHandConfidence(result: HandTrackingResult | null): number {
+  const values = (result?.handedness ?? [])
+    .flat()
+    .map((category) => category.score)
+    .filter((value): value is number => Number.isFinite(value));
+  if (values.length === 0) return result?.landmarks.length ? 0.55 : 0;
+  return clamp(Math.max(...values), 0.55, 1);
 }
 
 export function acceptedFaceConfidence(
@@ -229,16 +293,21 @@ export class GazeSensor {
   private readonly camera: GazeCamera;
   private readonly publish: (message: GazeMessage) => void;
   private readonly createLandmarker: NonNullable<GazeSensorOptions['createLandmarker']>;
+  private readonly createHandLandmarker: NonNullable<GazeSensorOptions['createHandLandmarker']>;
   private readonly clock: GazeClock;
   private readonly scheduler: GazeScheduler;
   private readonly configuration: FaceLandmarkerConfiguration;
+  private readonly handConfiguration: HandLandmarkerConfiguration;
+  private readonly handTrackingEnabled: boolean;
   private readonly onError?: (error: Error) => void;
   private readonly ema = new GazeEma();
   private landmarker: GazeLandmarker | null = null;
+  private handLandmarker: HandTrackingLandmarker | null = null;
   private timer: unknown = null;
   private startPromise: Promise<void> | null = null;
   private inFlight = false;
   private completed: GazeLandmarkerResult | null = null;
+  private completedHands: HandTrackingResult | null = null;
   private completedReady = false;
   private generation = 0;
   private disposed = false;
@@ -248,6 +317,8 @@ export class GazeSensor {
     this.camera = options.camera;
     this.publish = options.publish;
     this.createLandmarker = options.createLandmarker ?? createDefaultLandmarker;
+    this.createHandLandmarker = options.createHandLandmarker ?? createDefaultHandLandmarker;
+    this.handTrackingEnabled = options.enableHandTracking === true;
     this.clock = options.clock ?? {
       nowMs: () => performance.now(),
       nowSeconds: () => Date.now() / 1_000,
@@ -258,6 +329,10 @@ export class GazeSensor {
     };
     this.configuration = createFaceLandmarkerConfiguration(
       options.modelAssetPath,
+      options.wasmBasePath,
+    );
+    this.handConfiguration = createHandLandmarkerConfiguration(
+      options.handModelAssetPath,
       options.wasmBasePath,
     );
     this.onError = options.onError;
@@ -273,13 +348,15 @@ export class GazeSensor {
     if (this.running) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
     const generation = ++this.generation;
-    const pending = this.createLandmarker(this.configuration)
-      .then((landmarker) => {
+    const pending = this.createTrackingModels()
+      .then(({ face, hands }) => {
         if (generation !== this.generation || this.disposed || !this.camera.live) {
-          landmarker.close();
+          face.close();
+          hands?.close();
           throw new Error('Gaze start was cancelled');
         }
-        this.landmarker = landmarker;
+        this.landmarker = face;
+        this.handLandmarker = hands;
         this.timer = this.scheduler.setInterval(
           () => this.tick(generation),
           GAZE_INTERVAL_MS,
@@ -305,8 +382,12 @@ export class GazeSensor {
     const landmarker = this.landmarker;
     this.landmarker = null;
     if (landmarker) landmarker.close();
+    const handLandmarker = this.handLandmarker;
+    this.handLandmarker = null;
+    if (handLandmarker) handLandmarker.close();
     this.inFlight = false;
     this.completed = null;
+    this.completedHands = null;
     this.completedReady = false;
     this.lastMediaTimestampMs = -Infinity;
     this.ema.reset();
@@ -323,12 +404,14 @@ export class GazeSensor {
     const t = safeProtocolSeconds(this.clock.nowSeconds());
     if (this.completedReady) {
       const result = this.completed;
+      const hands = this.completedHands;
       this.completed = null;
+      this.completedHands = null;
       this.completedReady = false;
-      this.publishResult(result, t);
+      this.publishResult(result, hands, t);
     } else {
       this.ema.reset();
-      this.publish(absentGazeMessage(t));
+      this.publish(this.withHandFact(absentGazeMessage(t), null));
     }
     if (this.inFlight) return;
     this.beginDetection(generation);
@@ -348,13 +431,14 @@ export class GazeSensor {
       }
       const timestampMs = this.nextMediaTimestamp();
       const result = landmarker.detectForVideo(frame, timestampMs);
-      if (isPromiseLike(result)) {
-        void result.then(
-          (value) => this.completeDetection(value, generation, landmarker),
+      const hands = this.handLandmarker?.detectForVideo(frame, timestampMs) ?? null;
+      if (isPromiseLike(result) || isPromiseLike(hands)) {
+        void Promise.all([result, hands]).then(
+          ([faceValue, handValue]) => this.completeDetection(faceValue, handValue, generation, landmarker),
           (value: unknown) => this.failDetection(value, generation, landmarker),
         );
       } else {
-        this.completeDetection(result, generation, landmarker);
+        this.completeDetection(result, hands, generation, landmarker);
       }
     } catch (value) {
       this.failDetection(value, generation, landmarker);
@@ -363,11 +447,13 @@ export class GazeSensor {
 
   private completeDetection(
     result: GazeLandmarkerResult,
+    hands: HandTrackingResult | null,
     generation: number,
     landmarker: GazeLandmarker,
   ): void {
     if (generation !== this.generation || landmarker !== this.landmarker) return;
     this.completed = result;
+    this.completedHands = hands;
     this.completedReady = true;
     this.inFlight = false;
   }
@@ -379,17 +465,22 @@ export class GazeSensor {
   ): void {
     if (generation !== this.generation || landmarker !== this.landmarker) return;
     this.completed = null;
+    this.completedHands = null;
     this.completedReady = true;
     this.inFlight = false;
     this.reportError(toError(value));
   }
 
-  private publishResult(result: GazeLandmarkerResult | null, t: number): void {
+  private publishResult(
+    result: GazeLandmarkerResult | null,
+    hands: HandTrackingResult | null,
+    t: number,
+  ): void {
     const landmarks = result?.faceLandmarks[0];
     const matrix = result?.facialTransformationMatrixes[0];
     if (!landmarks || landmarks.length === 0 || !matrix) {
       this.ema.reset();
-      this.publish(absentGazeMessage(t));
+      this.publish(this.withHandFact(absentGazeMessage(t), hands));
       return;
     }
     try {
@@ -397,7 +488,7 @@ export class GazeSensor {
       const centroid = faceCentroid(landmarks);
       const spec = this.camera.cameraSpec;
       const target = targetAnglesFromCentroid(centroid, spec.hfov_deg, spec.w, spec.h);
-      this.publish({
+      this.publish(this.withHandFact({
         type: 'gaze',
         t,
         present: true,
@@ -406,12 +497,44 @@ export class GazeSensor {
         az: clamp(target.az, -Math.PI, Math.PI),
         el: clamp(target.el, -Math.PI / 2, Math.PI / 2),
         conf: acceptedFaceConfidence(landmarks),
-      });
+      }, hands));
     } catch (value) {
       this.ema.reset();
-      this.publish(absentGazeMessage(t));
+      this.publish(this.withHandFact(absentGazeMessage(t), hands));
       this.reportError(toError(value));
     }
+  }
+
+  private async createTrackingModels(): Promise<{
+    face: GazeLandmarker;
+    hands: HandTrackingLandmarker | null;
+  }> {
+    const face = await this.createLandmarker(this.configuration);
+    if (!this.handTrackingEnabled) return { face, hands: null };
+    try {
+      const hands = await this.createHandLandmarker(this.handConfiguration);
+      return { face, hands };
+    } catch (error) {
+      face.close();
+      throw error;
+    }
+  }
+
+  private withHandFact(message: GazeMessage, result: HandTrackingResult | null): GazeMessage {
+    if (!this.handTrackingEnabled) return message;
+    const centroid = handsCentroid(result?.landmarks ?? []);
+    if (!centroid) {
+      return { ...message, hands_present: false, hand_az: 0, hand_el: 0, hand_conf: 0 };
+    }
+    const spec = this.camera.cameraSpec;
+    const target = targetAnglesFromCentroid(centroid, spec.hfov_deg, spec.w, spec.h);
+    return {
+      ...message,
+      hands_present: true,
+      hand_az: clamp(target.az, -Math.PI, Math.PI),
+      hand_el: clamp(target.el, -Math.PI / 2, Math.PI / 2),
+      hand_conf: acceptedHandConfidence(result),
+    };
   }
 
   private nextMediaTimestamp(): number {
@@ -437,6 +560,18 @@ async function createDefaultLandmarker(
   return {
     detectForVideo: (frame, timestampMs) =>
       landmarker.detectForVideo(frame, timestampMs),
+    close: () => landmarker.close(),
+  };
+}
+
+async function createDefaultHandLandmarker(
+  configuration: HandLandmarkerConfiguration,
+): Promise<HandTrackingLandmarker> {
+  const { HandLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
+  const fileset = await FilesetResolver.forVisionTasks(configuration.wasmBasePath);
+  const landmarker = await HandLandmarker.createFromOptions(fileset, configuration.options);
+  return {
+    detectForVideo: (frame, timestampMs) => landmarker.detectForVideo(frame, timestampMs),
     close: () => landmarker.close(),
   };
 }

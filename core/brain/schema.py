@@ -253,6 +253,8 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
             new.append(_parse_observed_object(raw_object))
         except (TypeError, ValueError) as error:
             LOGGER.warning("dropping invalid new object at index %d: %s", index, error)
+    if raw_new and not new:
+        raise ResponseSchemaError("observation contained no valid new objects")
     return ObservationResponse(present=tuple(present), new=tuple(new))
 
 
@@ -425,8 +427,24 @@ def _bbox(value: object) -> tuple[float, float, float, float]:
         raise ValueError("bbox_norm must contain x, y, width, and height")
     numbers = tuple(_required_finite_number(part, "bbox_norm") for part in value)
     x, y, width, height = numbers
+    if (
+        any(part > 1.0 for part in numbers)
+        and all(0.0 <= part <= 1000.0 for part in numbers)
+        and numbers[2] > numbers[0]
+        and numbers[3] > numbers[1]
+    ):
+        # Vision models commonly emit 0..1000 corner coordinates even when
+        # asked for normalized x/y/width/height. Convert that unambiguous form
+        # at the trust boundary instead of silently losing a correctly seen
+        # object (for example [596,668,705,738] for a held USB drive).
+        left, top, right, bottom = numbers
+        x = left / 1000.0
+        y = top / 1000.0
+        width = (right - left) / 1000.0
+        height = (bottom - top) / 1000.0
     if not all(0.0 <= part <= 1.0 for part in numbers):
-        raise ValueError("bbox_norm values must be between 0 and 1")
+        if (x, y, width, height) == numbers:
+            raise ValueError("bbox_norm values must be between 0 and 1")
     if width <= 0 or height <= 0 or x + width > 1.0 or y + height > 1.0:
         raise ValueError("bbox_norm must describe a positive box inside the frame")
     return x, y, width, height

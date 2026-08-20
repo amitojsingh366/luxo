@@ -7,6 +7,7 @@ events. No joint value, animation duration, easing, or light number exists here.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
@@ -25,6 +26,9 @@ from .brain.schema import (
 from .fsm import BehaviorEvent
 from .speech.stt import SpeechToText
 from .speech.tts import TextToSpeech
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 WAKE_ACTIONS = (
@@ -124,13 +128,19 @@ class WakeSequenceCoordinator:
     def mark_browser_hello(self) -> None:
         with self._lock:
             self._ensure_open()
+            first = not self._browser_hello
             self._browser_hello = True
+            if first:
+                LOGGER.info("startup browser hello received")
             self._publish_browser_ready_locked()
 
     def mark_camera_ready(self) -> None:
         with self._lock:
             self._ensure_open()
+            first = not self._camera_ready
             self._camera_ready = True
+            if first:
+                LOGGER.info("startup camera gaze stream ready")
             self._publish_browser_ready_locked()
 
     def warm(self) -> Future[None]:
@@ -218,9 +228,24 @@ class WakeSequenceCoordinator:
             aggregate = self._attempt_future
             if aggregate is None or aggregate.done():
                 return
-            if self._failures:
+            blocking_failures = {
+                name: error
+                for name, error in self._failures.items()
+                if name != "brain"
+            }
+            if blocking_failures:
                 aggregate.set_exception(WakeSequenceError(self._failures))
                 return
+            if "brain" in self._failures:
+                # Remote inference may be temporarily unavailable or a pinned
+                # model may reject the warm request. STT and TTS are local
+                # readiness requirements; the brain already has per-request
+                # repair/fallback behavior, so it must not strand the body in
+                # BOOT before a viewer can engage with it.
+                LOGGER.warning(
+                    "brain warm-up failed (%s); continuing in degraded mode",
+                    type(self._failures["brain"]).__name__,
+                )
             try:
                 if not self._rest_action_sent:
                     self._emit_action(WAKE_ACTIONS[-1])
@@ -235,6 +260,10 @@ class WakeSequenceCoordinator:
                 aggregate.set_exception(WakeSequenceError(self._failures))
                 return
             self._models_warm = True
+            LOGGER.info(
+                "startup model boundaries ready%s",
+                " (brain degraded)" if "brain" in self._failures else "",
+            )
             aggregate.set_result(None)
 
     def _emit_opening_actions_locked(self, generation: int) -> None:

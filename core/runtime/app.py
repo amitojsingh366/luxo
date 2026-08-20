@@ -233,6 +233,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -247,7 +248,7 @@ from ..animation.poses import PoseLibrary, load_pose_library
 from ..blackboard import Blackboard, BlackboardSnapshot, GazeFact, Telemetry
 from ..brain.client import BrainClient, CallMetrics
 from ..brain.memory import SceneMemoryStore
-from ..brain.missing import MissingNarration, MissingObjectCoordinator
+from ..brain.missing import MissingComparison, MissingNarration, MissingObjectCoordinator
 from ..brain.observe import ObservationCoordinator
 from ..brain.schema import Action
 from ..config import FrozenConfig, load_config
@@ -321,6 +322,56 @@ which is already degenerate.
 SCENE_LOOK_ELEVATION_RAD: Final = 0.15
 """Slightly downward, matching the director's own scan elevation."""
 
+VIEWER_AZIMUTH_RAD: Final = math.atan2(1.18, 1.28)
+"""Neutral aim toward the studio camera at ``(-1.28, -1.18, 0.96)``.
+
+Camera-derived face, hand, and object azimuths are deviations within the
+webcam image. Adding this bearing aligns the webcam's image centre with the
+actual viewer used by ``renderer/src/scene/camera.ts`` instead of world ``-x``.
+The positive sign follows the URDF's post-yaw pi head flip: positive joint yaw
+turns the emitter from world ``-x`` toward world ``-y``.
+"""
+
+HAND_INQUIRY_DELAY_S: Final = 4.0
+"""Continuous hand visibility before Luxo asks what the person is doing."""
+
+HAND_LOST_GRACE_S: Final = 0.6
+"""Brief landmark dropouts do not restart the hand-attention dwell."""
+
+_MISSING_SCENE_QUERY = re.compile(
+    r"\b(missing|gone|disappear(?:ed)?|vanish(?:ed)?|removed|still\s+(?:there|visible)|"
+    r"still\s+in\s+(?:the\s+)?(?:view|scene)|what\s+changed|where\s+did\b)"
+)
+_SCENE_FOCUS_STOP_WORDS: Final = frozenset(
+    {
+        "about", "ask", "can", "color", "could", "did", "for", "from", "have",
+        "here", "identify", "into", "just", "look", "me", "my", "object", "of",
+        "please", "remember", "scene", "see", "show", "something", "tell", "that",
+        "the", "this", "to", "was", "what", "where", "with", "you", "your",
+    }
+)
+
+
+def _asks_missing_scene_question(transcript: str) -> bool:
+    if not isinstance(transcript, str):
+        return False
+    normalized = " ".join(transcript.casefold().split())
+    return bool(_MISSING_SCENE_QUERY.search(normalized))
+
+
+def _scene_focus_terms(transcript: str) -> frozenset[str]:
+    if not isinstance(transcript, str):
+        return frozenset()
+    return frozenset(
+        token
+        for token in re.findall(r"[a-z0-9]+", transcript.casefold())
+        if len(token) >= 3 and token not in _SCENE_FOCUS_STOP_WORDS
+    )
+
+
+def _label_terms(label: str) -> frozenset[str]:
+    return frozenset(re.findall(r"[a-z0-9]+", label.casefold()))
+
 MAX_TICK_BACKSTEP_S: Final = 1.0
 """A wall-clock step back larger than this re-anchors instead of being clamped."""
 
@@ -375,17 +426,17 @@ def target_angles(
 ) -> tuple[float, float]:
     """Map a normalized frame point to emitter azimuth and elevation.
 
-    Byte-for-byte the same projection the renderer applies to the face centroid
-    (``renderer/src/sensors/gaze.ts``: image-right is positive azimuth,
-    image-down is positive elevation, which is the direction Luxo's flipped
-    head pitch calls down). Reusing it means an ``obj:<id>`` target and a
-    ``person`` target arrive in the solver on one convention.
+    The angular deviation is byte-for-byte the projection the renderer applies
+    to face and hand centroids. It is added to the studio viewer's world-space
+    bearing so the image centre points directly at the rendered camera.
     """
 
     hfov = math.radians(camera.hfov_deg)
     x = min(1.0, max(0.0, centre_x))
     y = min(1.0, max(0.0, centre_y))
-    azimuth = math.atan(2.0 * (x - 0.5) * math.tan(hfov / 2.0))
+    azimuth = VIEWER_AZIMUTH_RAD - math.atan(
+        2.0 * (x - 0.5) * math.tan(hfov / 2.0)
+    )
     elevation = math.atan(2.0 * (y - 0.5) * math.tan(camera.vfov_rad / 2.0))
     return azimuth, elevation
 
@@ -666,6 +717,12 @@ class LuxoApp:
         else:
             self._latency = None
 
+        # Explicit absence questions are one-shot. Object focus lasts only a
+        # few dialogue turns so incidental background never becomes a topic.
+        self._scene_report_requested = threading.Event()
+        self._scene_focus_lock = threading.Lock()
+        self._scene_focus: set[str] = set()
+        self._scene_focus_turns = 0
         self._conversation = ConversationCoordinator(
             blackboard=self._blackboard,
             fsm=self._fsm,
@@ -677,6 +734,7 @@ class LuxoApp:
             speak_callback=self._send_speak,
             pcm_callback=self._protocol.publish_tts_pcm,
             milestone_callback=None if self._latency is None else self._latency.on_milestone,
+            scene_turn_callback=self._on_scene_turn,
             clock=clock,
             sleep=sleep,
             executor=conversation_executor,
@@ -697,6 +755,7 @@ class LuxoApp:
             # The single owner of outbound capture_frame.
             capture_callback=self._send_capture_frame,
             narration_callback=self._on_narration,
+            should_narrate=self._should_narrate_scene,
             executor=observation_executor,
         )
 
@@ -738,6 +797,12 @@ class LuxoApp:
         self._narrations_spoken = 0
         self._narrations_dropped = 0
         self._cue_failures = 0
+
+        # Hand attention is a measured browser fact. The behavior tick owns
+        # the one-shot social response so sensor jitter can never speak.
+        self._hands_seen_since: float | None = None
+        self._hands_last_seen: float | None = None
+        self._hand_inquiry_asked = False
 
         self._camera = CameraGeometry()
         self._hellos = 0
@@ -940,10 +1005,17 @@ class LuxoApp:
         bound. Every counter above them is cumulative telemetry and is kept.
         """
 
+        self._scene_report_requested.clear()
+        with self._scene_focus_lock:
+            self._scene_focus.clear()
+            self._scene_focus_turns = 0
         with self._lock:
             self._capture_armed_id = None
             self._pending_blocker_id = None
             self._pending_blocker_since = None
+            self._hands_seen_since = None
+            self._hands_last_seen = None
+            self._hand_inquiry_asked = False
             self._state_name = BehaviorState.DORMANT
             self._arousal = AROUSAL_BY_STATE[BehaviorState.DORMANT]
 
@@ -1006,6 +1078,10 @@ class LuxoApp:
             # conversation reset covers a narration too: it is the same slot.
             self._conversation.reset()
             self._observations.reset()
+            with self._lock:
+                self._hands_seen_since = None
+                self._hands_last_seen = None
+                self._hand_inquiry_asked = False
             LOGGER.info("browser reconnected; speech and observation staging reset")
         self._wake.mark_browser_hello()
 
@@ -1019,8 +1095,17 @@ class LuxoApp:
                 az=message.az,
                 el=message.el,
                 conf=message.conf,
+                hands_present=message.hands_present,
+                hand_az=message.hand_az,
+                hand_el=message.hand_el,
+                hand_conf=message.hand_conf,
             )
         )
+        if message.hands_present and message.hand_conf >= 0.5:
+            with self._lock:
+                if self._hands_seen_since is None:
+                    self._hands_seen_since = message.t
+                self._hands_last_seen = message.t
         # The renderer refuses to start the gaze sensor until the camera track
         # is live, so any gaze frame at all is proof of camera permission.
         with self._lock:
@@ -1040,7 +1125,12 @@ class LuxoApp:
         rules drift.
         """
 
-        self._conversation.on_vad_start(message.t)
+        accepted = self._conversation.on_vad_start(message.t)
+        if accepted:
+            # A person who starts speaking while showing something has already
+            # initiated the interaction; do not interrupt with the idle prompt.
+            with self._lock:
+                self._hand_inquiry_asked = True
 
     def _on_tts_done(self, message: TtsDoneMessage) -> None:
         """The browser's completion has exactly one destination and no branch.
@@ -1137,6 +1227,76 @@ class LuxoApp:
             self._narrations_dropped += 1
         LOGGER.info("narration dropped: the speech slot is already in use")
 
+    def _on_scene_turn(self, transcript: str, observes: bool = True) -> None:
+        """Keep short-lived object context and arm explicit absence reports."""
+
+        requested = observes and _asks_missing_scene_question(transcript)
+        if requested:
+            self._scene_report_requested.set()
+        else:
+            self._scene_report_requested.clear()
+
+        terms = _scene_focus_terms(transcript)
+        scene_memory = self._blackboard.snapshot().scene_memory
+        known_terms = (
+            frozenset().union(
+                *(_label_terms(record.canonical) for record in scene_memory)
+            )
+            if scene_memory
+            else frozenset()
+        )
+        matched = terms & known_terms
+        normalized = " ".join(transcript.casefold().split())
+        pointing = bool(
+            re.search(r"\b(remember|show(?:ing|ed)?|look\s+at|this\s+is)\b", normalized)
+        )
+        candidate = matched or (terms if pointing else frozenset())
+        with self._scene_focus_lock:
+            if candidate:
+                self._scene_focus = set(candidate)
+                self._scene_focus_turns = 3
+            elif self._scene_focus_turns > 0:
+                self._scene_focus_turns -= 1
+                if self._scene_focus_turns == 0:
+                    self._scene_focus.clear()
+            focus_log = sorted(self._scene_focus)
+        LOGGER.info(
+            "SCENE speech requested=%s observes=%s focus=%s",
+            str(requested).lower(),
+            str(observes).lower(),
+            focus_log,
+        )
+
+    def _should_narrate_scene(
+        self, comparison: MissingComparison
+    ) -> tuple[str, ...] | None:
+        """Select explicit or context-relevant absences; suppress background."""
+
+        requested = self._scene_report_requested.is_set()
+        self._scene_report_requested.clear()
+        with self._scene_focus_lock:
+            focus = frozenset(self._scene_focus)
+        contextual = tuple(
+            label for label in comparison.missing if _label_terms(label) & focus
+        )
+        selected = comparison.missing if requested else contextual
+        if selected:
+            consumed = frozenset().union(*(_label_terms(label) for label in selected))
+            with self._scene_focus_lock:
+                self._scene_focus.difference_update(consumed)
+                if not self._scene_focus:
+                    self._scene_focus_turns = 0
+        LOGGER.info(
+            "SCENE speech decision requested=%s missing=%s contextual=%s speak=%s",
+            str(requested).lower(),
+            len(comparison.missing),
+            list(contextual),
+            str(requested or bool(contextual)).lower(),
+        )
+        # An explicitly requested empty report must still say that nothing is
+        # missing; ``None`` alone means no speech.
+        return tuple(selected) if requested or contextual else None
+
     def _emit_wake_action(self, action: Action) -> None:
         """Submit one PRD 10.4 waking beat through the normal plan path.
 
@@ -1149,10 +1309,18 @@ class LuxoApp:
         self._plans.submit((action,))
 
     def _baseline_labels(self) -> tuple[str, ...]:
-        """Cheap tick-safe baseline: the mirrored memory, never a disk load."""
+        """Return objects visible on the prior frame, never stale history.
+
+        Missing-object narration compares one scene snapshot with the next.
+        Records already marked absent stay in memory for recall, but including
+        them in every later baseline would make Luxo repeatedly announce the
+        same disappearance after unrelated observations.
+        """
 
         return tuple(
-            record.canonical for record in self._blackboard.snapshot().scene_memory
+            record.canonical
+            for record in self._blackboard.snapshot().scene_memory
+            if record.present
         )
 
     def _resolve_look_target(
@@ -1170,7 +1338,21 @@ class LuxoApp:
             gaze = snapshot.gaze
             if not gaze.present:
                 return None
-            return LookAtTarget("person", float(gaze.az), float(gaze.el))
+            if gaze.hands_present and gaze.hand_conf >= 0.5:
+                # ``person`` is the director's stable semantic target. Hands
+                # change where on that person Luxo attends, not the identity of
+                # the requested target; renaming it would violate the
+                # director's resolver contract and abort every animation tick.
+                return LookAtTarget(
+                    "person",
+                    VIEWER_AZIMUTH_RAD + float(gaze.hand_az),
+                    float(gaze.hand_el),
+                )
+            return LookAtTarget(
+                "person",
+                VIEWER_AZIMUTH_RAD + float(gaze.az),
+                float(gaze.el),
+            )
         if name == "scene":
             return LookAtTarget("scene", 0.0, SCENE_LOOK_ELEVATION_RAD)
         if not name.startswith("obj:"):
@@ -1208,6 +1390,8 @@ class LuxoApp:
 
         self._conversation.tick()
 
+        self._tick_hand_inquiry(now)
+
         # The coordinator may have submitted a plan and re-mirrored its depth,
         # so the router must route against the fresh view, not the stale one.
         snapshot = self._blackboard.snapshot()
@@ -1229,6 +1413,32 @@ class LuxoApp:
             self._behavior_ticks += 1
             self._state_name = self._fsm.state
             self._arousal = AROUSAL_BY_STATE.get(self._state_name, 0.15)
+
+    def _tick_hand_inquiry(self, now: float) -> None:
+        """Ask once after a quiet, continuous hand presentation."""
+
+        with self._lock:
+            last_seen = self._hands_last_seen
+            if last_seen is None or now - last_seen > HAND_LOST_GRACE_S:
+                self._hands_seen_since = None
+                self._hands_last_seen = None
+                self._hand_inquiry_asked = False
+                return
+            seen_since = self._hands_seen_since
+            already_asked = self._hand_inquiry_asked
+        if (
+            already_asked
+            or seen_since is None
+            or now - seen_since < HAND_INQUIRY_DELAY_S
+            or self._fsm.state is not BehaviorState.ENGAGED
+            or self._conversation.status.stage is not Stage.IDLE
+            or self._plans.state.depth > 0
+            or self._observations.stage is not ObservationStage.IDLE
+        ):
+            return
+        if self._conversation.speak("Ooh—what are you working on?"):
+            with self._lock:
+                self._hand_inquiry_asked = True
 
     def _apply_transition(self, transition: Transition) -> None:
         """Apply one state beat to the body, cancelling everything it must.
@@ -1534,4 +1744,5 @@ __all__ = [
     "UnpromptedSpeech",
     "build_app",
     "target_angles",
+    "VIEWER_AZIMUTH_RAD",
 ]

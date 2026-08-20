@@ -24,6 +24,10 @@ class GazeFact:
     az: float
     el: float
     conf: float
+    hands_present: bool = False
+    hand_az: float = 0.0
+    hand_el: float = 0.0
+    hand_conf: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

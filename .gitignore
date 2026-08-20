@@ -11,5 +11,6 @@ models/
 renderer/public/mediapipe/
 renderer/public/onnxruntime/
 recordings/
+measurements/
 *.wav
 *.pcm

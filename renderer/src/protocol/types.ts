@@ -21,6 +21,10 @@ export interface GazeMessage {
   readonly az: number;
   readonly el: number;
   readonly conf: number;
+  readonly hands_present?: boolean;
+  readonly hand_az?: number;
+  readonly hand_el?: number;
+  readonly hand_conf?: number;
 }
 
 export interface VadMessage {

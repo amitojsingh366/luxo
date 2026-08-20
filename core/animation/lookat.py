@@ -1,10 +1,10 @@
 """Stateful analytic aiming for Luxo's light emitter.
 
-The URDF's head-frame pi flip makes world -x the body's front. Input azimuths
-are consequently measured from -x toward +y, and positive head pitch looks
-down. The target angles describe the direction from ``light_emitter_link`` to
-the render camera or another world target; ``camera_link`` is not the aiming
-frame.
+The URDF's head-frame pi flip makes world -x the body's front. Because yaw is
+applied before that flip, positive input azimuth rotates the emitter from -x
+toward -y; positive head pitch looks down. The target angles describe the
+direction from ``light_emitter_link`` to the render camera or another world
+target; ``camera_link`` is not the aiming frame.
 
 This is deliberately not inverse kinematics. Base and neck share azimuth while
 the neck leads and exponentially recentres. Unreachable elevation asks the
