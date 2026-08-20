@@ -14,7 +14,7 @@ import tempfile
 import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Final, Iterable
+from typing import Any, Final, Iterable, Sequence
 
 from .schema import is_durable_scene_canonical, normalize_canonical_label
 
@@ -247,17 +247,27 @@ def _durable_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, .
     eligible = _eligible_records(records)
     if len(eligible) <= MAX_SCENE_OBJECTS:
         return eligible
+    return _ranked_selection(eligible)
+
+
+def _ranked_selection(records: tuple[SceneObject, ...]) -> tuple[SceneObject, ...]:
     return tuple(
         sorted(
-            eligible,
-            key=lambda record: (
-                record.priority != "requested",
-                -(record.requested_at or 0.0),
-                not record.present,
-                -record.last_seen,
-                _id_key(record),
-            ),
+            records,
+            key=_retention_key,
         )[:MAX_SCENE_OBJECTS]
+    )
+
+
+def _retention_key(record: SceneObject) -> tuple[bool, float, bool, float, object]:
+    """Rank requested facts ahead of incidental visual background."""
+
+    return (
+        record.priority != "requested",
+        -(record.requested_at or 0.0),
+        not record.present,
+        -record.last_seen,
+        _id_key(record),
     )
 
 
@@ -483,6 +493,60 @@ class SceneMemoryStore:
             )
         )
         self._save(result, next_id)
+        return result
+
+    def touch_requested(
+        self,
+        object_ids: Sequence[str],
+        requested_at: float,
+    ) -> tuple[SceneObject, ...]:
+        """Promote direct historical references without changing scene facts.
+
+        The cloud may refer only to ids already supplied in its memory context.
+        Touching those ids records user interest for retention, but deliberately
+        does not claim that an absent object became visible or alter its saved
+        visual attributes.
+        """
+
+        if isinstance(object_ids, (str, bytes)):
+            raise SceneMemoryError("object_ids must be a sequence of strings")
+        timestamp = _number(requested_at, "requested_at")
+        if timestamp < 0.0:
+            raise SceneMemoryError("requested_at must be nonnegative")
+        identifiers: list[str] = []
+        seen: set[str] = set()
+        try:
+            values = tuple(object_ids)
+        except TypeError as exc:
+            raise SceneMemoryError("object_ids must be a sequence of strings") from exc
+        for value in values:
+            identifier = _text(value, "object id", compact_safe=True)
+            if _SAFE_ID.fullmatch(identifier) is None:
+                raise SceneMemoryError(
+                    "object id must contain only letters, digits, '.', '_', or '-'"
+                )
+            if identifier not in seen:
+                seen.add(identifier)
+                identifiers.append(identifier)
+
+        existing = self.load()
+        if not identifiers:
+            return existing
+        selected = frozenset(identifiers)
+        touched = tuple(
+            replace(
+                record,
+                priority="requested",
+                requested_at=max(record.requested_at or 0.0, timestamp),
+            )
+            if record.id in selected
+            else record
+            for record in existing
+        )
+        if touched == existing:
+            return existing
+        result = _ranked_selection(touched)
+        self._save(result, self._stored_next_id())
         return result
 
     def compact_line(self) -> str:

@@ -648,6 +648,7 @@ class LuxoApp:
             pcm_callback=self._protocol.publish_tts_pcm,
             milestone_callback=None if self._latency is None else self._latency.on_milestone,
             observation_origin_callback=self._bind_dialogue_origin,
+            memory_reference_callback=self._touch_memory_references,
             clock=clock,
             sleep=sleep,
             executor=conversation_executor,
@@ -924,6 +925,14 @@ class LuxoApp:
         except Exception:
             LOGGER.exception("scene memory could not be loaded; starting empty")
             return
+        self._blackboard.set_scene_memory(objects)
+
+    def _touch_memory_references(
+        self, object_ids: tuple[str, ...], requested_at: float
+    ) -> None:
+        """Refresh retention priority for validated cloud memory references."""
+
+        objects = self._memory.touch_requested(object_ids, requested_at)
         self._blackboard.set_scene_memory(objects)
 
     # ------------------------------------------------------- protocol inbound
