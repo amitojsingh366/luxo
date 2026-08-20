@@ -32,12 +32,11 @@ it is claimed by the active blocker. Rejection covers every case the protocol
 makes decidable, and inventing a wire-level request id to cover the rest is out
 of scope by design.
 
-Identity. ``PlanExecutor.pending_observation_id`` and
-``ObservationCoordinator.pending`` mint their ids independently, so the runtime
-treats their agreement as an invariant to be checked, never assumed. It is
-re-verified before every capture dispatch and again before any frame is handed
-to a worker. A disagreement is a bug: it is logged, counted, and resolved by
-clearing both sides together so neither is left stranded.
+Identity. ``PlanExecutor.pending_observation_id`` is the sole request-id owner.
+The runtime passes that exact value into ``ObservationCoordinator.begin`` and
+re-verifies agreement before capture dispatch and before handing any frame to a
+worker. A disagreement is a bug: it is logged, counted, and resolved by clearing
+both sides together so neither is left stranded.
 
 Resolution. The vision call returns facts only. ``missing`` is computed here in
 Python against the baseline captured *before* the observation. The runtime then
@@ -379,7 +378,7 @@ class ObservationRuntime:
             return
 
         try:
-            request = self._observations.begin(baseline)
+            request = self._observations.begin(pending_id, baseline)
         except ObservationBusyError:
             existing = self._observations.pending
             if existing is None or existing.request_id != pending_id:

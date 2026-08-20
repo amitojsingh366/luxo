@@ -83,7 +83,6 @@ class ObservationCoordinator:
         self._clock = clock
         self._publish = publish
         self._lock = threading.RLock()
-        self._next_request = 1
         self._pending: _PendingObservation | None = None
 
     @property
@@ -98,9 +97,14 @@ class ObservationCoordinator:
         with self._lock:
             return self._pending is not None
 
-    def begin(self, prior_canonical: Sequence[str]) -> ObservationRequest:
-        """Reserve one capture request without invoking the model."""
+    def begin(
+        self,
+        request_id: str,
+        prior_canonical: Sequence[str],
+    ) -> ObservationRequest:
+        """Adopt the plan blocker's exact id without invoking the model."""
 
+        identifier = _request_id(request_id)
         labels = _canonical_labels(prior_canonical)
         with self._lock:
             if self._pending is not None:
@@ -108,10 +112,9 @@ class ObservationCoordinator:
                     f"observation {self._pending.request.request_id} is already pending"
                 )
             request = ObservationRequest(
-                request_id=f"obs_{self._next_request}",
+                request_id=identifier,
                 prior_canonical=labels,
             )
-            self._next_request += 1
             self._pending = _PendingObservation(request=request)
             return request
 
@@ -174,18 +177,31 @@ class ObservationCoordinator:
             self._pending = None
 
     def _matching_pending(self, request_id: str) -> _PendingObservation:
-        if not isinstance(request_id, str) or not request_id:
-            raise ObservationRequestError("request id must be a non-empty string")
+        identifier = _request_id(request_id)
         if self._pending is None:
             raise ObservationRequestError(
-                f"observation {request_id} is stale; no request is pending"
+                f"observation {identifier} is stale; no request is pending"
             )
         expected = self._pending.request.request_id
-        if request_id != expected:
+        if identifier != expected:
             raise ObservationRequestError(
-                f"observation {request_id} does not match pending {expected}"
+                f"observation {identifier} does not match pending {expected}"
             )
         return self._pending
+
+
+def _request_id(value: object) -> str:
+    """Validate an opaque executor-owned id without minting or interpreting it."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ObservationRequestError("request id must be a non-empty single-line string")
+    return value
 
 
 def _canonical_labels(values: Sequence[str]) -> tuple[str, ...]:
