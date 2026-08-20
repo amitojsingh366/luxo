@@ -67,6 +67,7 @@ from ..brain.observe import (
     ObservationCoordinator,
     ObservationRequestError,
 )
+from ..brain.client import ObservationEnvelope, ValidatedObservation
 from ..brain.schema import ObservationResponse, PlanResponse, normalize_canonical_label
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState
 from ..plan_executor import ObservationReleaseError, PlanExecutor
@@ -79,7 +80,7 @@ DEFAULT_WORKERS: Final = 1
 
 CaptureCallback = Callable[[CaptureFrameMessage], None]
 NarrationCallback = Callable[[MissingNarration], None]
-SceneCommenter = Callable[[str, ObservationResponse], PlanResponse]
+SceneCommenter = Callable[[str, ValidatedObservation], PlanResponse]
 SceneCommentCallback = Callable[[PlanResponse], None]
 BaselineLabels = Callable[[], Sequence[str]]
 NarratePolicy = Callable[[MissingComparison], bool | Sequence[str] | None]
@@ -493,8 +494,8 @@ class ObservationRuntime:
 
         try:
             response = future.result()
-            if not isinstance(response, ObservationResponse):
-                raise TypeError("observation must return a validated ObservationResponse")
+            if not isinstance(response, (ObservationResponse, ObservationEnvelope)):
+                raise TypeError("observation must return validated observation facts")
         except Exception as error:
             self._retry_or_fault_locked(type(error).__name__)
             return
@@ -512,7 +513,8 @@ class ObservationRuntime:
 
         self._observations_completed += 1
         self._announce_complete_locked()
-        comparison = compute_observation_missing(self._baseline, response)
+        facts = response.facts if isinstance(response, ObservationEnvelope) else response
+        comparison = compute_observation_missing(self._baseline, facts)
         self._last_missing = comparison.missing
         LOGGER.info(
             "SCENE comparison=%s",
@@ -547,7 +549,7 @@ class ObservationRuntime:
             lambda done, token=generation: self._queue(token, "narrate", done)
         )
 
-    def _begin_comment_locked(self, response: ObservationResponse) -> None:
+    def _begin_comment_locked(self, response: ValidatedObservation) -> None:
         """Run the approved fourth call only after fresh facts are committed."""
 
         intent = self._visual_intent
@@ -663,7 +665,7 @@ class ObservationRuntime:
             raise TypeError("baseline_labels must return a sequence of canonical labels")
         return tuple(labels)
 
-    def _analyze(self, request_id: str, jpeg: bytes) -> ObservationResponse:
+    def _analyze(self, request_id: str, jpeg: bytes) -> ValidatedObservation:
         """Blocking capture-to-memory work; this never runs on the tick."""
 
         return self._observations.complete(request_id, jpeg)

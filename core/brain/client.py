@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -22,8 +23,10 @@ from .prompts import FixedPromptBuilder, PromptBuilder
 from .schema import (
     ActionOp,
     ObservationResponse,
+    ObservedObject,
     PlanResponse,
     ResponseSchemaError,
+    extract_json_object,
     parse_observation_response,
     parse_plan_response,
 )
@@ -33,7 +36,23 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MAX_RESPONSE_BYTES = 8 * 1024
 PRIVATE_PROVIDER = {"zdr": True, "data_collection": "deny", "allow_fallbacks": False}
 CallType = Literal["converse", "observe", "narrate", "scene_comment"]
-T = TypeVar("T", PlanResponse, ObservationResponse)
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationEnvelope:
+    """Validated facts plus quarantined dialogue from the same JPEG request.
+
+    PRD §8.1.1 normally permits facts only from ``observe``. The owner-approved
+    exception preserves a bounded accidental ``say`` only across that call's
+    repair attempt. It is never part of the fact schema and carries no plan.
+    """
+
+    facts: ObservationResponse
+    quarantined_say: str
+
+
+ValidatedObservation = ObservationResponse | ObservationEnvelope
+T = TypeVar("T", PlanResponse, ObservationResponse, ObservationEnvelope)
 
 REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
     "converse": (
@@ -160,14 +179,14 @@ class BrainClient(Protocol):
         self,
         jpeg: bytes,
         prior_canonical: Sequence[str],
-    ) -> ObservationResponse: ...
+    ) -> ValidatedObservation: ...
 
     def narrate(self, missing: Sequence[str]) -> PlanResponse: ...
 
     def scene_comment(
         self,
         visual_intent: str,
-        observation: ObservationResponse,
+        observation: ValidatedObservation,
         compact_memory: str,
     ) -> PlanResponse: ...
 
@@ -338,7 +357,7 @@ class OpenRouterBrainClient:
 
         return self._run("converse", self._text_messages(payload), parse_conversation)
 
-    def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ObservationResponse:
+    def observe(self, jpeg: bytes, prior_canonical: Sequence[str]) -> ValidatedObservation:
         payload = self._prompts.observe_payload(jpeg, prior_canonical)
         prior = payload["prior_canonical"]
         labels = {"prior_canonical": prior}
@@ -347,7 +366,12 @@ class OpenRouterBrainClient:
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
 
-        def parse_observation(raw: str) -> ObservationResponse:
+        quarantined_say: str | None = None
+
+        def parse_observation(raw: str) -> ValidatedObservation:
+            nonlocal quarantined_say
+            if quarantined_say is None:
+                quarantined_say = _dialogue_candidate(raw)
             response = parse_observation_response(raw, require_known=True)
             prior_set = frozenset(prior)
             if any(label not in prior_set for label in response.present):
@@ -366,6 +390,12 @@ class OpenRouterBrainClient:
                 raise ResponseSchemaError(
                     "observation new repeats an object from prior_canonical"
                 )
+            if quarantined_say is not None and _grounded_scene_say(
+                quarantined_say,
+                response,
+                allow_uncertainty=False,
+            ):
+                return ObservationEnvelope(response, quarantined_say)
             return response
 
         return self._run("observe", self._messages(content), parse_observation)
@@ -376,12 +406,13 @@ class OpenRouterBrainClient:
     def scene_comment(
         self,
         visual_intent: str,
-        observation: ObservationResponse,
+        observation: ValidatedObservation,
         compact_memory: str,
     ) -> PlanResponse:
+        facts = _observation_facts(observation)
         payload = self._prompts.scene_comment_payload(
             visual_intent,
-            observation,
+            facts,
             compact_memory,
         )
         fresh_objects = payload["fresh_objects"]
@@ -402,21 +433,25 @@ class OpenRouterBrainClient:
         )
         spontaneous = visual_intent == "spontaneous_hand"
 
+        candidate = (
+            observation.quarantined_say
+            if isinstance(observation, ObservationEnvelope)
+            else None
+        )
+        if candidate is not None and _grounded_scene_say(
+            candidate, facts, allow_uncertainty=False
+        ) and _candidate_matches_visual_intent(candidate, facts, visual_intent):
+            # Perception dialogue is never trusted on its own. At this point a
+            # separate repair has produced validated facts, memory has been
+            # committed, and the candidate names one of those fresh objects.
+            # Its model-authored plan is deliberately unavailable here.
+            return PlanResponse(candidate, ())
+
         def parse_comment(raw: str) -> PlanResponse:
             response = parse_plan_response(raw)
             normalized = " ".join(response.say.casefold().replace("’", "'").split())
-            generic = (
-                "what are you working on",
-                "what are you doing",
-                "what are you holding",
-                "what is in your hand",
-                "what's in your hand",
-                "anything in your hand",
-            )
-            if any(phrase in normalized for phrase in generic):
+            if any(phrase in normalized for phrase in _GENERIC_SCENE_PHRASES):
                 raise ResponseSchemaError("scene comment used a forbidden generic question")
-            if spontaneous and "?" not in response.say:
-                raise ResponseSchemaError("spontaneous hand comment must ask a question")
             uncertainty = ("not sure", "can't tell", "cannot tell", "don't know")
             grounding_terms = object_terms if spontaneous else object_terms + attribute_terms
             grounded = any(term in normalized for term in grounding_terms)
@@ -573,6 +608,153 @@ class OpenRouterBrainClient:
 
 def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+_GENERIC_SCENE_PHRASES = (
+    "what are you working on",
+    "what are you doing",
+    "what are you holding",
+    "what is in your hand",
+    "what's in your hand",
+    "anything in your hand",
+)
+_HUMAN_CANONICALS = frozenset(("person", "human", "man", "woman", "boy", "girl"))
+_COLOR_WORDS = frozenset(
+    (
+        "black",
+        "blue",
+        "brown",
+        "cyan",
+        "gold",
+        "gray",
+        "green",
+        "grey",
+        "magenta",
+        "orange",
+        "pink",
+        "purple",
+        "red",
+        "silver",
+        "teal",
+        "white",
+        "yellow",
+    )
+)
+
+
+def _dialogue_candidate(raw: str) -> str | None:
+    """Extract only bounded dialogue from a dialogue-shaped observe failure."""
+
+    try:
+        root = extract_json_object(raw)
+        if "say" not in root or "plan" not in root:
+            return None
+        return parse_plan_response(root).say or None
+    except (ResponseSchemaError, TypeError, ValueError):
+        return None
+
+
+def _grounded_scene_say(
+    say: str,
+    observation: ObservationResponse,
+    *,
+    allow_uncertainty: bool,
+) -> bool:
+    """Approve a scene line only when fresh validated facts support it."""
+
+    normalized = " ".join(say.casefold().replace("’", "'").split())
+    if not normalized or any(
+        phrase in normalized for phrase in _GENERIC_SCENE_PHRASES
+    ):
+        return False
+    objects = (*observation.known, *observation.new)
+    object_terms = tuple(
+        term
+        for item in objects
+        for term in (item.canonical.casefold(), item.label.casefold())
+        if term
+    )
+    if any(term in normalized for term in object_terms):
+        return True
+    return allow_uncertainty and any(
+        phrase in normalized
+        for phrase in ("not sure", "can't tell", "cannot tell", "don't know")
+    )
+
+
+def _candidate_matches_visual_intent(
+    say: str,
+    observation: ObservationResponse,
+    visual_intent: str,
+) -> bool:
+    """Require the quarantined line to identify the intent's supported object."""
+
+    objects = (*observation.known, *observation.new)
+    if _is_hand_intent(visual_intent):
+        held = tuple(item for item in objects if _is_explicitly_held(item.attributes))
+        if held:
+            focused = held
+        else:
+            non_person = tuple(
+                item for item in objects if item.canonical not in _HUMAN_CANONICALS
+            )
+            if len(non_person) != 1:
+                return False
+            focused = non_person
+    else:
+        focused = objects
+
+    normalized = " ".join(say.casefold().replace("’", "'").split())
+    named = tuple(
+        item
+        for item in focused
+        if any(
+            term and term in normalized
+            for term in (item.canonical.casefold(), item.label.casefold())
+        )
+    )
+    if len(named) != 1:
+        return False
+    return not _contradicts_visible_colors(say, named[0])
+
+
+def _is_hand_intent(visual_intent: str) -> bool:
+    normalized = " ".join(visual_intent.casefold().replace("_", " ").split())
+    return normalized == "spontaneous hand" or "holding" in normalized or "hand" in normalized
+
+
+def _is_explicitly_held(attributes: Sequence[str]) -> bool:
+    for attribute in attributes:
+        normalized = " ".join(attribute.casefold().replace("_", " ").split())
+        if "held" in normalized and "hand" in normalized:
+            return True
+        if normalized in ("held", "holding", "in hand", "in hands"):
+            return True
+    return False
+
+
+def _contradicts_visible_colors(say: str, item: ObservedObject) -> bool:
+    claimed = _colors_in(say)
+    if not claimed:
+        return False
+    supported = _colors_in(" ".join((item.label, *item.attributes)))
+    return not claimed <= supported
+
+
+def _colors_in(value: str) -> frozenset[str]:
+    colors = {word for word in re.findall(r"[a-z]+", value.casefold()) if word in _COLOR_WORDS}
+    if "grey" in colors:
+        colors.remove("grey")
+        colors.add("gray")
+    return frozenset(colors)
+
+
+def _observation_facts(observation: ValidatedObservation) -> ObservationResponse:
+    if isinstance(observation, ObservationEnvelope):
+        return observation.facts
+    if isinstance(observation, ObservationResponse):
+        return observation
+    raise TypeError("observation must contain validated facts")
 
 
 def _requires_fresh_visual(transcript: str) -> bool:
