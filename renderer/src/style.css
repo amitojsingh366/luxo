@@ -188,6 +188,145 @@ canvas {
   text-align: center;
 }
 
+.luxo-sensor-view {
+  display: grid;
+  gap: 0.42rem;
+  margin-top: 0.72rem;
+  padding-top: 0.68rem;
+  border-top: 1px solid rgb(255 255 255 / 10%);
+}
+
+.luxo-sensor-view[hidden] {
+  display: none;
+}
+
+.luxo-sensor-view__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: rgb(244 239 231 / 70%);
+  font-size: 0.58rem;
+  letter-spacing: 0.1em;
+}
+
+.luxo-sensor-view__scope {
+  color: rgb(142 205 219 / 78%);
+  font-size: 0.52rem;
+}
+
+.luxo-sensor-view__viewport {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 0.45rem;
+  background: #020407;
+}
+
+.luxo-sensor-view__video,
+.luxo-sensor-view__annotations {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.luxo-sensor-view__video {
+  display: block;
+  object-fit: fill;
+  opacity: 0.82;
+}
+
+.luxo-sensor-view__annotations {
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.luxo-sensor-view__region {
+  position: absolute;
+  min-width: 0.2rem;
+  min-height: 0.2rem;
+  border: 1px solid currentcolor;
+  box-shadow: 0 0 0.75rem color-mix(in srgb, currentcolor 38%, transparent);
+}
+
+.luxo-sensor-view__region--face {
+  color: #8ecddb;
+}
+
+.luxo-sensor-view__region--hand {
+  color: #f3b96b;
+}
+
+.luxo-sensor-view__region-label {
+  position: absolute;
+  top: -1px;
+  left: -1px;
+  padding: 0.13rem 0.24rem;
+  color: #05070b;
+  background: currentcolor;
+  font-size: 0.46rem;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.luxo-sensor-view__target {
+  position: absolute;
+  width: 0.48rem;
+  height: 0.48rem;
+  border: 1px solid currentcolor;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.luxo-sensor-view__target::before,
+.luxo-sensor-view__target::after {
+  position: absolute;
+  content: "";
+  background: currentcolor;
+}
+
+.luxo-sensor-view__target::before {
+  top: 50%;
+  left: -0.2rem;
+  width: 0.78rem;
+  height: 1px;
+}
+
+.luxo-sensor-view__target::after {
+  top: -0.2rem;
+  left: 50%;
+  width: 1px;
+  height: 0.78rem;
+}
+
+.luxo-sensor-view__target--face {
+  color: #8ecddb;
+}
+
+.luxo-sensor-view__target--hands {
+  color: #f3b96b;
+}
+
+.luxo-sensor-view__facts,
+.luxo-sensor-view__capture {
+  margin: 0;
+  font-size: 0.52rem;
+  letter-spacing: 0.07em;
+}
+
+.luxo-sensor-view__facts {
+  color: rgb(244 239 231 / 64%);
+}
+
+.luxo-sensor-view__capture {
+  color: rgb(243 185 107 / 78%);
+}
+
+.luxo-sensor-view[data-capture="error"] .luxo-sensor-view__capture {
+  color: #ff8b7d;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .boot-mark {
     animation: luxo-breathe 1.6s ease-in-out infinite;

@@ -14,6 +14,7 @@ type MaybePromise = void | Promise<void>;
 interface RuntimeCamera {
   readonly cameraSpec: CameraSpec;
   readonly live: boolean;
+  readonly video: HTMLVideoElement;
   start(): Promise<CameraSpec>;
   stop(): void;
   drawAnalysisFrame(): HTMLCanvasElement;
@@ -124,13 +125,20 @@ export class LuxoBrowserRuntime {
     private readonly renderer: RendererHandle,
     private readonly dependencies: LuxoRuntimeDependencies,
   ) {
-    this.camera = dependencies.createCamera({ onError: (error) => this.report("camera", error) });
+    let sensorOverlay: TelemetryOverlayHandle | null = null;
+    this.camera = dependencies.createCamera({
+      onError: (error) => {
+        sensorOverlay?.setCameraUnavailable();
+        this.report("camera", error);
+      },
+    });
     this.mixer = dependencies.createMixer({
       setVadSuppressed: (active) => this.guard("tts", () => this.microphone?.setTtsPlaying(active)),
       onTtsDone: () => this.completeTts(),
     });
     this.fallback = dependencies.createFallback();
     this.overlay = dependencies.createOverlay(root);
+    sensorOverlay = this.overlay;
     this.overlay.setConnectionStatus("connecting");
     const documentRef = root.ownerDocument;
     this.prompt = documentRef.createElement("section");
@@ -260,6 +268,11 @@ export class LuxoBrowserRuntime {
         camera: this.camera as CameraSensor,
         enableHandTracking: true,
         publish: ({ type: _type, ...fact }) => this.route(generation, "gaze", () => { protocol.sendGaze(fact); }),
+        onDebugFrame: (frame) => this.route(
+          generation,
+          "gaze_debug",
+          () => this.overlay.updateLocalVision(frame),
+        ),
         onError: (error) => this.route(generation, "gaze", () => this.report("gaze", error)),
       });
       const sensorResults = await Promise.allSettled([this.gaze.start(), this.microphone.start()]);
@@ -270,6 +283,7 @@ export class LuxoBrowserRuntime {
       if (generation !== this.generation || this.destroyed) {
         throw new Error("Luxo startup was cancelled");
       }
+      this.overlay.attachCameraPreview(this.camera.video);
       this.started = true;
       this.clearPrompt();
     } catch (error) {
@@ -281,6 +295,7 @@ export class LuxoBrowserRuntime {
         catch (cleanupError) { this.report("startup_cleanup", errorOf(cleanupError)); }
       }
       if (!this.destroyed) {
+        this.overlay.setCameraUnavailable();
         try { this.camera.stop(); }
         catch (cleanupError) { this.report("startup_cleanup", errorOf(cleanupError)); }
       }
@@ -360,11 +375,18 @@ export class LuxoBrowserRuntime {
   private captureFrame(): void {
     if (this.captureBusy) { this.report("camera", new Error("Camera capture already in progress")); return; }
     this.captureBusy = true;
+    this.overlay.setObservationCaptureStatus("capturing");
     const generation = this.generation;
     void this.camera.captureJpeg()
       .then((blob) => blob.arrayBuffer())
-      .then((jpeg) => { if (!this.destroyed && generation === this.generation) this.protocol?.sendCapturedJpeg(jpeg); })
-      .catch((error: unknown) => this.route(generation, "camera", () => this.report("camera", errorOf(error))))
+      .then((jpeg) => this.route(generation, "camera", () => {
+        const sent = this.protocol?.sendCapturedJpeg(jpeg) ?? false;
+        this.overlay.setObservationCaptureStatus(sent ? "sent" : "error");
+      }))
+      .catch((error: unknown) => this.route(generation, "camera", () => {
+        this.overlay.setObservationCaptureStatus("error");
+        this.report("camera", errorOf(error));
+      }))
       .finally(() => { this.captureBusy = false; });
   }
 
