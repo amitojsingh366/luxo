@@ -166,13 +166,11 @@ manifest, available memory, port 8765, the presence of the API key, and
 │   │   ├── sensors/             camera.ts, gaze.ts, mic.ts, vad.ts
 │   │   ├── audio/               mixer.ts, music.ts, sfx.ts, ttsPlayer.ts
 │   │   └── ui/overlay.ts        on-screen status and telemetry
-│   └── validation tooling/                   Node validation suites
 ├── schema/
 │   ├── messages.schema.json     the single source of truth for the protocol
 │   ├── generate_types.py        emits renderer/src/protocol/types.ts
 │   └── check_generated.py       fails when the checked-in types have drifted
 ├── robot/                       supplied and unmodified: URDF, mesh, reference image
-├── validation tooling/                       Python unit checks (validation)
 └── measurements/                ignored runtime CSV output, created as needed
 ```
 
@@ -183,11 +181,6 @@ committed.
 
 ## Development
 
-Python, from the repository root:
-
-```sh
-```
-
 Renderer, from `renderer/`:
 
 ```sh
@@ -196,8 +189,8 @@ npm run typecheck
 npm run build      # runs the typecheck, then the Vite build
 ```
 
-Both suites run offline. Passing them does not replace a live browser, sensor,
-audio, OpenRouter, or Linux smoke check.
+These checks do not replace a live browser, sensor, audio, OpenRouter, or Linux
+smoke check.
 
 If you change `schema/messages.schema.json`, regenerate the renderer types and
 confirm they are current:
@@ -206,9 +199,6 @@ confirm they are current:
 python3 schema/generate_types.py
 python3 schema/check_generated.py
 ```
-
-`the validation tooling` asserts the same thing, so core and renderer
-cannot drift apart silently.
 
 ## Privacy
 

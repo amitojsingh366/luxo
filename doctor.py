@@ -504,8 +504,7 @@ MANIFEST_VERIFY_KEY = "verify_command"
 # An asset is a single file unless it declares otherwise. A directory asset has
 # no single digest, so it carries a required_files table instead: one record per
 # file, each path relative to that entry's own destination directory. That
-# rooting is stated in the manifest's about block and enforced by
-# the validation tooling
+# rooting is stated in the manifest's about block and enforced here.
 MANIFEST_KIND_KEYS = ("kind", "type")
 MANIFEST_REQUIRED_FILES_KEY = "required_files"
 FILE_KIND = "file"

@@ -38,9 +38,8 @@ npm run typecheck
 npm run build
 ```
 
-`npm run build` also runs the typecheck. All renderer checks are offline; camera,
-microphone, WebGL, audio output, and the live loopback socket still require a
-browser check.
+`npm run build` also runs the typecheck. Camera, microphone, WebGL, audio output,
+and the live loopback socket still require a browser check.
 
 ## Exact browser verification
 

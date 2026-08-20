@@ -7,7 +7,7 @@
     "JSON is a strict YAML subset, so the repo needs no YAML dependency. JSON has",
     "no comment syntax, so every provenance note that would have been a comment is",
     "an explicit field instead - sha256_source, license_source, verify_command and",
-    "notes. Those fields are greppable and are asserted by the validation tooling",
+    "notes. Those fields remain explicit and greppable.",
     "RULE: sha256 is either a 64-character lowercase hex digest or the literal",
     "marker UNVERIFIED. Never write a guessed digest. An UNVERIFIED entry is a known",
     "gap with a recorded reason and the exact command that closes it.",
@@ -18,8 +18,7 @@
     "is the whole path, and a leading wasm/ on an entry whose destination already ends",
     "in wasm would duplicate that segment. A directory entry's own sha256 is",
     "UNVERIFIED by construction, because a directory has no single digest, so",
-    "required_files is how that entry is verified at all. the validation tooling",
-    "asserts this rooting and doctor.py depends on it."
+    "required_files is how that entry is verified at all; doctor.py depends on this rooting."
   ],
   "unverified_marker": "UNVERIFIED",
   "destinations": {
