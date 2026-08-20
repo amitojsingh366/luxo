@@ -34,9 +34,15 @@ environment-dependent checks; use `doctor.py` and `/selftest` before a take.
 - OpenRouter owns language interpretation, relevance, wording, and semantic
   plan selection. Python sends each conversation the transcript, recent turns,
   compact memory, and a filtered snapshot of what is currently visible.
-- When the model selects `observe`, exactly one JPEG is captured. Vision returns
-  facts only; Python persists them and computes the deterministic missing-object
-  set, then asks OpenRouter to resolve the exact originating turn or scene event.
+- A visual dialogue turn has exactly three successful cloud calls:
+  `converse` selects one terminal `observe`, `observe` receives one JPEG, and
+  `resolve_observation` produces the grounded reply and plan. There is no
+  fourth semantic call.
+- Vision returns at most 10 meaningful objects nearest-to-camera first, plus
+  stable prior matches, a focused-object index, and presence evidence for
+  lower-priority prior objects. Python keeps the current nearest objects first,
+  fills remaining memory slots from recent history, and computes missing
+  objects by stable ID.
 - The protocol is defined once in `schema/messages.schema.json`. The renderer's
   TypeScript types are generated from it, and a check fails if the checked-in
   file has drifted.
@@ -138,7 +144,7 @@ manifest, available memory, port 8765, the presence of the API key, and
 │   │   ├── prompts.py           fixed instructions and privacy-limited payloads
 │   │   ├── schema.py            validated plans over the closed verb enum
 │   │   ├── observe.py           the only path from a captured frame to the model
-│   │   ├── memory.py            flat scene memory
+│   │   ├── memory.py            bounded v2 scene memory and stable ID allocator
 │   │   └── missing.py           the Python-side missing-object comparison
 │   └── speech/
 │       ├── stt.py               whisper.cpp transcription boundary
@@ -220,8 +226,9 @@ This is an architectural property of the split, not a policy statement.
 - OpenRouter text calls receive the transcript, up to three recent exchanges,
   compact memory, and filtered current scene facts. Post-observation resolution
   also receives the typed origin, filtered fresh facts, and Python-computed
-  missing labels. Bounding boxes, timestamps, raw labels, gaze, telemetry, and
-  joint state are excluded from text payloads.
+  missing objects as stable IDs with canonical names. Bounding boxes,
+  timestamps, raw labels, gaze, telemetry, and joint state are excluded from
+  text payloads.
 - **Only one utterance of audio is sent per turn.** The browser detects
   end-of-speech locally and sends that single utterance as PCM. There is no open
   microphone stream to the core, and OpenRouter receives the transcript rather
