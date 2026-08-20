@@ -323,7 +323,7 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
     sensorView.dataset.capture = "waiting";
     sensorView.setAttribute("aria-label", "Local camera analysis preview");
     sensorView.setAttribute("aria-live", "off");
-    sensorViewport.setAttribute("aria-label", "Unmirrored camera frame with local detections");
+    sensorViewport.setAttribute("aria-label", "Mirrored camera frame with local detections");
 
     header.append(title, connectionValue);
     sensorHeader.append(sensorTitle, sensorScope);
@@ -384,7 +384,7 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
     video.hidden = false;
     video.muted = true;
     video.playsInline = true;
-    video.setAttribute("aria-label", "Live unmirrored local camera input");
+    video.setAttribute("aria-label", "Live mirrored local camera preview");
     const width = video.videoWidth;
     const height = video.videoHeight;
     this.sensorViewport.style.aspectRatio =
