@@ -64,7 +64,7 @@ const PANEL_STYLE = [
   "z-index:20",
   "top:clamp(1rem,3vw,2rem)",
   "right:clamp(1rem,3vw,2rem)",
-  "width:min(19rem,calc(100% - 2rem))",
+  "width:min(26rem,calc(100vw - 2rem))",
   "padding:0.8rem",
   "border:1px solid rgba(255,255,255,0.12)",
   "border-radius:0.8rem",
@@ -385,6 +385,12 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
     video.muted = true;
     video.playsInline = true;
     video.setAttribute("aria-label", "Live unmirrored local camera input");
+    const width = video.videoWidth;
+    const height = video.videoHeight;
+    this.sensorViewport.style.aspectRatio =
+      Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+        ? `${width} / ${height}`
+        : "";
     this.sensorViewport.prepend(video);
     this.sensorView.hidden = false;
     this.sensorView.dataset.camera = "live";
