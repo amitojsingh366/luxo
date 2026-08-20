@@ -18,10 +18,10 @@ Three domains run in one process (PRD 4.4):
   body snapshot is always exactly one animation sample old and never
   interpolated (PRD 10.2).
 
-Blocking work — whisper, Piper, OpenRouter, scene-memory persistence, latency
-CSV appends — runs only on worker pools. Workers deliver results by setting
-blackboard fields and by enqueueing generation-tagged completions that the
-serialized ticks drain.
+Blocking work — whisper, Piper, OpenRouter, scene-memory persistence, and all
+measurement CSV appends — runs only on worker pools or the resource monitor.
+Workers deliver results by setting blackboard fields and by enqueueing
+generation-tagged completions that the serialized ticks drain.
 
 Clock domains
 -------------
@@ -253,6 +253,7 @@ from ..brain.schema import Action, ObservationPrior, PlanResponse
 from ..config import FrozenConfig, load_config
 from ..fsm import BehaviorEvent, BehaviorFSM, BehaviorState, Transition
 from ..instrumentation import InteractionCSVLogger, InteractionTimeline, Milestone, TimelineError
+from ..measurements import EngagementRecorder, ResourceRecorder
 from ..plan_executor import PlanExecutor
 from ..protocol.messages import (
     AudioState,
@@ -577,6 +578,8 @@ class LuxoApp:
         poses: PoseLibrary | None = None,
         latency_logger: InteractionCSVLogger | None = None,
         latency_recorder: LatencyRecorder | None = None,
+        engagement_recorder: EngagementRecorder | None = None,
+        resource_recorder: ResourceRecorder | None = None,
         brain_model: str = "unknown",
         brain_profile: str = "free",
         clock: Callable[[], float] = time.time,
@@ -629,6 +632,8 @@ class LuxoApp:
             )
         else:
             self._latency = None
+        self._engagement = engagement_recorder
+        self._resources = resource_recorder
 
         self._conversation = ConversationCoordinator(
             blackboard=self._blackboard,
@@ -776,6 +781,14 @@ class LuxoApp:
         return self._latency
 
     @property
+    def engagement_recorder(self) -> EngagementRecorder | None:
+        return self._engagement
+
+    @property
+    def resource_recorder(self) -> ResourceRecorder | None:
+        return self._resources
+
+    @property
     def demo_reset(self) -> DemoReset:
         return self._reset
 
@@ -833,6 +846,8 @@ class LuxoApp:
                 return
             self._started = True
         self.prepare()
+        if self._resources is not None:
+            self._resources.start()
         self._threads = [
             threading.Thread(target=self._behavior_loop, name="luxo-behavior", daemon=True),
             threading.Thread(target=self._animation_loop, name="luxo-animation", daemon=True),
@@ -860,6 +875,10 @@ class LuxoApp:
                 LOGGER.exception("shutting down %s failed", name)
         if self._latency is not None:
             self._latency.close()
+        if self._engagement is not None:
+            self._engagement.close(self._clock())
+        if self._resources is not None:
+            self._resources.close(timeout)
         with self._lock:
             self._started = False
         LOGGER.info("character core stopped")
@@ -1242,10 +1261,14 @@ class LuxoApp:
         snapshot is read, so the whole beat runs on exactly one baseline.
         """
 
-        self._drain_reset(now)
+        reset = self._drain_reset(now)
+        if reset is not None and self._engagement is not None:
+            self._engagement.cancel(now, "reset")
         snapshot = self._blackboard.snapshot()
 
         transition = self._fsm.tick(snapshot, now)
+        if self._engagement is not None:
+            self._engagement.observe(snapshot, self._fsm.status(), transition, now)
         if transition is not None:
             self._apply_transition(transition)
 

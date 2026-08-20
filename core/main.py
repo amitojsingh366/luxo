@@ -45,6 +45,10 @@ DEFAULT_PIPER_MODEL = DEFAULT_CACHE_DIR / "en_US-lessac-medium.onnx"
 DEFAULT_PIPER_CONFIG = DEFAULT_CACHE_DIR / "en_US-lessac-medium.onnx.json"
 DEFAULT_MEMORY_PATH = DEFAULT_CACHE_DIR / "scene_memory.json"
 DEFAULT_LATENCY_CSV = Path(__file__).resolve().parents[1] / "measurements" / "latency.csv"
+DEFAULT_ENGAGEMENT_CSV = (
+    Path(__file__).resolve().parents[1] / "measurements" / "engagement.csv"
+)
+DEFAULT_RESOURCE_CSV = Path(__file__).resolve().parents[1] / "measurements" / "resources.csv"
 
 FREE_PROFILE_MODEL = "openrouter/free"
 """Placeholder model id for profile ``free``; ``config`` leaves the id unset."""
@@ -160,13 +164,15 @@ def build_models(config: FrozenConfig, metrics_callback: object = None) -> dict[
 def build_app(config: FrozenConfig, server: object):
     """Assemble one :class:`LuxoApp` around an already-built server.
 
-    The latency recorder is built before the models so the brain can report
-    its token counts into the same recorder the conversation milestones land
-    in; otherwise every CSV row would carry zero tokens.
+    Measurement recorders are built before the models. The brain reports token
+    counts into the same latency recorder the conversation milestones land in;
+    otherwise every latency row would carry zero tokens. Engagement outcomes
+    and one-second core resource samples use their own CSV contracts.
     """
 
     from .brain.memory import SceneMemoryStore
     from .instrumentation import InteractionCSVLogger
+    from .measurements import EngagementRecorder, ResourceRecorder
     from .runtime.app import LatencyRecorder, LuxoApp
 
     profile = str(config.brain.profile)
@@ -174,6 +180,12 @@ def build_app(config: FrozenConfig, server: object):
         InteractionCSVLogger(_env_path("LUXO_LATENCY_CSV", DEFAULT_LATENCY_CSV)),
         model=os.environ.get("OPENROUTER_MODEL") or FREE_PROFILE_MODEL,
         profile=profile,
+    )
+    engagement_recorder = EngagementRecorder(
+        _env_path("LUXO_ENGAGEMENT_CSV", DEFAULT_ENGAGEMENT_CSV)
+    )
+    resource_recorder = ResourceRecorder(
+        _env_path("LUXO_RESOURCE_CSV", DEFAULT_RESOURCE_CSV)
     )
     models = build_models(config, recorder.on_call_metrics)
     return LuxoApp(
@@ -184,6 +196,8 @@ def build_app(config: FrozenConfig, server: object):
         memory_store=SceneMemoryStore(_env_path("LUXO_MEMORY_PATH", DEFAULT_MEMORY_PATH)),
         config=config,
         latency_recorder=recorder,
+        engagement_recorder=engagement_recorder,
+        resource_recorder=resource_recorder,
         brain_model=str(models["model"]),
         brain_profile=str(models["profile"]),
     )
