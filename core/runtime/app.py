@@ -220,6 +220,29 @@ BODY_STATE_EVERY_N_TICKS: Final = 2
 OBSERVATION_ARM_TIMEOUT_S: Final = 2.0
 """Upper bound on how long a blocker may wait for the director's capture beat."""
 
+PLAN_HELD_STATES: Final = frozenset(
+    {BehaviorState.LISTENING, BehaviorState.THINKING, BehaviorState.SPEAKING}
+)
+"""States in which the plan queue waits instead of advancing.
+
+PRD 6.1 lists ``SPEAKING -> ACTING | plan queue non-empty after speech`` and
+``ACTING -> INSPECTING | observe op reached``. Both are unreachable if the
+router drains the plan as soon as the brain submits it: a three-action plan
+empties in 0.3 s of behaviour ticks while a two-second utterance is still
+playing, so ``SPEECH_DONE`` would always find an empty queue and take
+``speech_done_without_plan``, and an ``observe`` would fire mid-sentence in a
+state where the FSM does not handle ``OBSERVE_START`` at all. Holding the plan
+across the three staging states is what keeps the model's plan an accompaniment
+to the utterance rather than a race against it.
+
+The router is still ticked in every other state, including ``BOOT`` for the
+waking sequence and ``INSPECTING`` where the executor is blocked but the
+director's effects must still drain. The one cost is that an effect raised on
+the animation tick during a held state waits for the next unheld tick; the only
+producer of such an effect is a notice-freeze beat that outlived its own state,
+which is already degenerate.
+"""
+
 SCENE_LOOK_ELEVATION_RAD: Final = 0.15
 """Slightly downward, matching the director's own scan elevation."""
 
@@ -360,6 +383,14 @@ class NarrationSpeaker:
 
     @property
     def speaking(self) -> bool:
+        """True from ``speak_begin`` until the browser reports ``tts_done``.
+
+        Deliberately identical in shape to ``ConversationCoordinator.speaking``:
+        the flag tracks audio the browser is still playing, not bytes the core
+        is still writing, so ``body_state.audio.speaking`` stays true for the
+        whole utterance and the music keeps ducking under it.
+        """
+
         with self._lock:
             return self._speaking
 
@@ -482,17 +513,27 @@ class NarrationSpeaker:
             with self._lock:
                 if self._closed or generation != self._generation:
                     return
-                self._speaking = False
+                # ``speaking`` stays true: the browser is only now starting to
+                # play what was streamed. Only tts_done, disengage, or close
+                # clears it, so completion is never fabricated here.
                 self._speak_callback(SpeakEndMessage())
                 self._spoken += 1
         except Exception as error:
             with self._lock:
-                if generation == self._generation:
-                    self._last_error = type(error).__name__
-                    self._failures += 1
-                    # Audio may already have reached the browser, so completion
-                    # is never fabricated; tts_done, disengage, or close clears.
-                    self._speaking = False
+                if generation != self._generation:
+                    return
+                self._last_error = type(error).__name__
+                self._failures += 1
+                if self._awaiting_done:
+                    # Audio already reached the browser. Send one best-effort
+                    # speak_end and then wait, exactly as the conversation
+                    # coordinator does after a partial delivery.
+                    try:
+                        self._speak_callback(SpeakEndMessage())
+                    except Exception:
+                        LOGGER.debug("speak_end after a partial narration failed")
+                else:
+                    self._clear_locked()
             LOGGER.warning("narration delivery failed (%s)", type(error).__name__)
 
     def _synthesize(self, text: str) -> SpeechAudio:
@@ -757,6 +798,7 @@ class LumenApp:
         self._lock = threading.RLock()
         self._stopping = threading.Event()
         self._threads: list[threading.Thread] = []
+        self._prepared = False
         self._started = False
 
         self._animation_anchor: float | None = None
@@ -845,22 +887,35 @@ class LumenApp:
 
     # ------------------------------------------------------------- lifecycle
 
-    def start(self) -> None:
-        """Load memory, warm the models, and start the two tick threads.
+    def prepare(self) -> None:
+        """Do everything :meth:`start` does except own a thread.
 
-        Model warm-up runs on its own pool and reports back through the FSM, so
-        this returns as soon as the character is animating; the lamp performs
-        the PRD 10.4 waking sequence while whisper and Piper load.
+        Splitting this out is what makes the whole assembly driveable offline:
+        a caller runs ``prepare`` and then paces :meth:`tick_behavior` and
+        :meth:`tick_animation` itself, with no thread and no real clock.
+
+        Model warm-up is submitted to its own pool and reports back through the
+        FSM, so this returns immediately; the lamp performs the PRD 10.4 waking
+        sequence while whisper and Piper are still loading.
         """
+
+        with self._lock:
+            if self._prepared:
+                return
+            self._prepared = True
+            self._animation_anchor = self._clock()
+            self._animation_step = 0
+        self._load_memory()
+        self._wake.warm()
+
+    def start(self) -> None:
+        """Prepare the character, then start the behaviour and animation threads."""
 
         with self._lock:
             if self._started:
                 return
             self._started = True
-        self._load_memory()
-        self._animation_anchor = self._clock()
-        self._animation_step = 0
-        self._wake.warm()
+        self.prepare()
         self._threads = [
             threading.Thread(target=self._behavior_loop, name="luxo-behavior", daemon=True),
             threading.Thread(target=self._animation_loop, name="luxo-animation", daemon=True),
@@ -975,7 +1030,7 @@ class LumenApp:
             self._wake.mark_camera_ready()
 
     def _on_vad(self, message: VadMessage) -> None:
-        if self._narration.speaking:
+        if self._narration.speaking or self._narration.awaiting_done:
             # PRD 16: no barge-in. The browser also suppresses VAD during
             # playback, but narration audio is not coordinator speech, so the
             # core enforces the same rule on its own side.
@@ -1107,14 +1162,15 @@ class LumenApp:
         # The coordinator may have submitted a plan and re-mirrored its depth,
         # so the router must route against the fresh view, not the stale one.
         snapshot = self._blackboard.snapshot()
-        with self._director_lock:
-            try:
-                self._router.tick(snapshot, now)
-            except Exception:
-                # The director rejected the action. Dropping the plan is the
-                # only way to avoid a blocker nobody will ever release.
-                LOGGER.exception("action routing failed; cancelling the plan")
-                self._router.cancel("routing_failed")
+        if self._fsm.state not in PLAN_HELD_STATES:
+            with self._director_lock:
+                try:
+                    self._router.tick(snapshot, now)
+                except Exception:
+                    # The director rejected the action. Dropping the plan is
+                    # the only way to avoid a blocker nobody will release.
+                    LOGGER.exception("action routing failed; cancelling the plan")
+                    self._router.cancel("routing_failed")
 
         self._tick_observations(now)
         self._post_plan_drained()
@@ -1414,6 +1470,7 @@ __all__ = [
     "LumenApp",
     "NarrationSpeaker",
     "OBSERVATION_ARM_TIMEOUT_S",
+    "PLAN_HELD_STATES",
     "ProtocolPort",
     "build_app",
     "target_angles",
