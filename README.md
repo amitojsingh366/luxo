@@ -85,3 +85,11 @@ The required submission documents are in the repository root:
 | [TECHNICAL_NOTE.md](TECHNICAL_NOTE.md) | Architecture and data flow, protocol, model-to-action design, simulation, deployment, measurements, trade-offs, and known limitations |
 | [SUBMISSION.md](SUBMISSION.md) | Submission requirements, expected deliverables, and evaluation criteria |
 | [CHALLENGE.md](CHALLENGE.md) | The original challenge brief, constraints, and demonstration requirements |
+
+## License
+
+Copyright (C) 2026 Amitoj Singh.
+
+Luxo is free software licensed under the [GNU General Public License,
+version 3](LICENSE) (GPL-3.0-only). You may redistribute and modify it under
+that license.
