@@ -21,6 +21,18 @@ binary prefix (PRD 8.4, 10.2).
 delivery that never reached ``speak_begin`` retries a bounded number of times
 and then waits for explicit recovery; a partial delivery sends one best-effort
 ``speak_end`` and then waits for the browser, a reset, or a disengage.
+
+A line usually arrives as a brain reply, but :meth:`ConversationCoordinator.speak`
+stages an *unprompted* one — an observation narration, say — into that same
+machinery instead of standing up a parallel speaker. The coordinator therefore
+stays the single owner of the ``speaking`` fact and the single destination for
+``tts_done``. An unprompted line differs from a reply in exactly two ways, both
+because it is not a dialogue turn: it drives no FSM transition, because the
+character never entered ``SPEAKING`` for it and leaving a state it never entered
+would be an invented transition, and it records no latency milestone, because
+PRD 11.1 times the VAD-to-audio dialogue path. Synthesis, wire validation, raw
+PCM delivery, the ``speaking`` fact, the envelope, the bounded retry, and the
+browser's sole authority over completion are all shared, not duplicated.
 """
 
 from __future__ import annotations
@@ -84,6 +96,7 @@ class CoordinatorStatus:
     generation: int
     stage: Stage
     speaking: bool
+    unprompted: bool
     speech_attempts: int
     recent: tuple[RecentExchange, ...]
     last_error: str | None
@@ -183,6 +196,7 @@ class ConversationCoordinator:
         self._speech_started_at: float | None = None
         self._speech_attempts = 0
         self._speaking = False
+        self._unprompted = False
         self._last_error: str | None = None
 
     @property
@@ -192,6 +206,7 @@ class ConversationCoordinator:
                 generation=self._generation,
                 stage=self._stage,
                 speaking=self._speaking,
+                unprompted=self._unprompted,
                 speech_attempts=self._speech_attempts,
                 recent=tuple(self._recent),
                 last_error=self._last_error,
@@ -266,6 +281,56 @@ class ConversationCoordinator:
             self._emit(Milestone.PCM_RECEIVED, self._now())
             return self._start_locked("stt", self._stt.transcribe, pcm, STT_SAMPLE_HZ)
 
+    def speak(self, text: str) -> bool:
+        """Stage one line the brain never produced; returns whether it staged.
+
+        This is the public entry point for narration and any other unprompted
+        speech. It stages ``text`` into the very slot a brain reply occupies,
+        so the next tick dispatches it through the same worker, the same
+        synthesis and wire validation, the same raw prefix-free PCM delivery,
+        the same ``speak_begin``/``speak_end`` pair, and the same bounded
+        retry. There is no second speaker and no second owner of ``speaking``,
+        so a browser ``tts_done`` has exactly one place to land.
+
+        A blank or whitespace-only line takes the in-character fallback rather
+        than reaching Piper, which rejects empty text.
+
+        **A line already in flight is refused, not queued and not superseded.**
+        The browser has one audio graph, so speech is a serial resource: the
+        only way to supersede a line the browser has already begun playing is
+        to invent an end for audio that is still sounding, and this module's
+        governing rule is that completion is the browser's to declare. Queueing
+        would need a second staging slot, which is a second owner of the line
+        by another name. Refusing keeps one line, one owner, one ``tts_done``,
+        and hands the caller a truthful ``False`` to log or drop on.
+
+        Unlike ``on_vad_start`` this does not require ``ENGAGED``; it only
+        requires a state in which the tick would not invalidate the
+        interaction, because narration is dispatched from ``ACTING`` and
+        ``INSPECTING``. It leaves the plan queue alone — an observation has
+        already submitted its plan by the time it narrates — and it does not
+        append to ``recent``, because an unprompted line is not a dialogue
+        turn and must not enter the brain's context as one.
+        """
+
+        say = _line(text)
+        blank = not say
+        with self._lock:
+            if (
+                self._closed
+                or self._stage is not Stage.IDLE
+                or self._speaking
+                or self._fsm.state in _INACTIVE
+            ):
+                return False
+            self._generation += 1
+            self._completions.clear()
+            self._reply = FALLBACK_SAY if blank else say
+            self._unprompted = True
+            self._stage = Stage.REPLIED
+            self._last_error = "blank_say" if blank else None
+            return True
+
     def tick(self) -> None:
         """Drain completions and issue eligible work; never blocks on I/O."""
 
@@ -285,11 +350,16 @@ class ConversationCoordinator:
                 self._start_locked(
                     "brain", self._converse, self._transcript, tuple(self._recent)
                 )
-            elif self._stage is Stage.REPLIED and state is BehaviorState.SPEAKING:
+            elif self._stage is Stage.REPLIED and (
+                self._unprompted or state is BehaviorState.SPEAKING
+            ):
+                # An unprompted line dispatches in whatever state the character
+                # is in, because it never asked the FSM to enter SPEAKING. The
+                # inactive states already returned above.
                 self._stage = Stage.DELIVERING
                 try:
                     self._future = self._executor.submit(
-                        self._deliver, self._generation, self._reply
+                        self._deliver, self._generation, self._reply, self._unprompted
                     )
                 except Exception as error:
                     # A refused worker is an unstarted delivery, so it lands in
@@ -300,15 +370,21 @@ class ConversationCoordinator:
             self._mirror_plan_locked()
 
     def on_tts_done(self, t: float) -> bool:
-        """Accept the browser as the only authority for speech completion."""
+        """Accept the browser as the only authority for speech completion.
+
+        An unprompted line releases the same staging slot but posts no event:
+        the FSM was never moved into ``SPEAKING`` for it, so announcing that
+        speech finished would push a transition the character never made.
+        """
 
         instant = _time("t", t)
         with self._lock:
             started = self._speech_started_at
+            unprompted = self._unprompted
             if (
                 self._closed
                 or self._stage not in (Stage.AWAITING_DONE, Stage.STALLED)
-                or self._fsm.state is not BehaviorState.SPEAKING
+                or (not unprompted and self._fsm.state is not BehaviorState.SPEAKING)
                 or (started is not None and instant < started)
             ):
                 return False
@@ -316,8 +392,10 @@ class ConversationCoordinator:
             self._reply = None
             self._vad_start = None
             self._speech_attempts = 0
+            self._unprompted = False
             self._clear_speech_locked()
-            self._fsm.post_event(BehaviorEvent.SPEECH_DONE)
+            if not unprompted:
+                self._fsm.post_event(BehaviorEvent.SPEECH_DONE)
             return True
 
     def retry_speech(self) -> bool:
@@ -447,6 +525,7 @@ class ConversationCoordinator:
         self._recent.append(RecentExchange(self._transcript or "", say))
         self._transcript = None
         self._reply = say
+        self._unprompted = False
         self._stage = Stage.REPLIED
         self._emit(Milestone.RESPONSE, now)
 
@@ -478,12 +557,12 @@ class ConversationCoordinator:
             raise ValueError("compact memory must be a single line")
         return self._brain.converse(transcript, memory, recent[-MAX_RECENT:])
 
-    def _deliver(self, generation: int, text: str) -> None:
+    def _deliver(self, generation: int, text: str, unprompted: bool = False) -> None:
         """Synthesize and stream one utterance; this never runs on the tick."""
 
         for attempt in range(1, MAX_SPEECH_ATTEMPTS + 1):
             try:
-                self._attempt(generation, text)
+                self._attempt(generation, text, unprompted)
             except _Stale:
                 return
             except Exception as error:
@@ -503,7 +582,7 @@ class ConversationCoordinator:
                 self._settle(generation, Stage.AWAITING_DONE, None, attempt)
                 return
 
-    def _attempt(self, generation: int, text: str) -> None:
+    def _attempt(self, generation: int, text: str, unprompted: bool = False) -> None:
         """Run one complete delivery attempt, from synthesis to ``speak_end``."""
 
         speech = self._synthesize(text)
@@ -512,7 +591,9 @@ class ConversationCoordinator:
         )
         for index, chunk in enumerate(speech.chunks):
             self._send(generation, self._pcm_callback, chunk)
-            if index == 0:
+            if index == 0 and not unprompted:
+                # An unprompted line has no VAD start, so it belongs to no
+                # PRD 11.1 interaction row and must not mark one.
                 self._emit(Milestone.FIRST_AUDIO_CHUNK, self._now())
         self._send(generation, self._speak_callback, SpeakEndMessage())
 
@@ -608,6 +689,7 @@ class ConversationCoordinator:
         self._stage = Stage.IDLE
         self._transcript = None
         self._reply = None
+        self._unprompted = False
         self._vad_start = None
         self._speech_attempts = 0
         self._clear_speech_locked()
