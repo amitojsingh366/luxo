@@ -2,7 +2,7 @@
 
 ``core.main`` is deliberately thin. It resolves configuration and asset paths,
 constructs the real STT, TTS, and brain boundaries, hands them to
-:class:`core.runtime.app.LumenApp`, and then owns exactly two things the app
+:class:`core.runtime.app.LuxoApp`, and then owns exactly two things the app
 does not: the asyncio loop the WebSocket server runs on, and process exit.
 
 Secrets. ``OPENROUTER_API_KEY`` is read from the environment and nowhere else.
@@ -31,7 +31,7 @@ from .logging_setup import configure_logging
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_CACHE_DIR = Path.home() / ".cache" / "lumen"
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "luxo"
 DEFAULT_WHISPER_BINARY = DEFAULT_CACHE_DIR / "whisper.cpp" / "build" / "bin" / "whisper-cli"
 DEFAULT_WHISPER_MODEL = DEFAULT_CACHE_DIR / "ggml-base.en-q5_1.bin"
 DEFAULT_PIPER_MODEL = DEFAULT_CACHE_DIR / "en_US-lessac-medium.onnx"
@@ -58,7 +58,7 @@ class ServerFactory(Protocol):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="lumen-core")
+    parser = argparse.ArgumentParser(prog="luxo-core")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument(
@@ -123,18 +123,18 @@ def build_models(config: FrozenConfig, metrics_callback: object = None) -> dict[
     from .speech.stt import WhisperCppSpeechToText
     from .speech.tts import PiperTextToSpeech
 
-    piper_config = _env_path("LUMEN_PIPER_CONFIG", DEFAULT_PIPER_CONFIG)
+    piper_config = _env_path("LUXO_PIPER_CONFIG", DEFAULT_PIPER_CONFIG)
     profile = str(config.brain.profile)
     model = os.environ.get("OPENROUTER_MODEL") or (
         FREE_PROFILE_MODEL if profile == "free" else ""
     )
 
     stt = WhisperCppSpeechToText(
-        binary_path=_env_path("LUMEN_WHISPER_BIN", DEFAULT_WHISPER_BINARY),
-        model_path=_env_path("LUMEN_WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
+        binary_path=_env_path("LUXO_WHISPER_BIN", DEFAULT_WHISPER_BINARY),
+        model_path=_env_path("LUXO_WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
     )
     tts = PiperTextToSpeech(
-        _env_path("LUMEN_PIPER_MODEL", DEFAULT_PIPER_MODEL),
+        _env_path("LUXO_PIPER_MODEL", DEFAULT_PIPER_MODEL),
         piper_config,
         create_phoneme_encoder(piper_config),
         length_scale=float(config.speech.piper_length_scale),
@@ -148,7 +148,7 @@ def build_models(config: FrozenConfig, metrics_callback: object = None) -> dict[
 
 
 def build_app(config: FrozenConfig, server: object):
-    """Assemble one :class:`LumenApp` around an already-built server.
+    """Assemble one :class:`LuxoApp` around an already-built server.
 
     The latency recorder is built before the models so the brain can report
     its token counts into the same recorder the conversation milestones land
@@ -157,21 +157,21 @@ def build_app(config: FrozenConfig, server: object):
 
     from .brain.memory import SceneMemoryStore
     from .instrumentation import InteractionCSVLogger
-    from .runtime.app import LatencyRecorder, LumenApp
+    from .runtime.app import LatencyRecorder, LuxoApp
 
     profile = str(config.brain.profile)
     recorder = LatencyRecorder(
-        InteractionCSVLogger(_env_path("LUMEN_LATENCY_CSV", DEFAULT_LATENCY_CSV)),
+        InteractionCSVLogger(_env_path("LUXO_LATENCY_CSV", DEFAULT_LATENCY_CSV)),
         model=os.environ.get("OPENROUTER_MODEL") or FREE_PROFILE_MODEL,
         profile=profile,
     )
     models = build_models(config, recorder.on_call_metrics)
-    return LumenApp(
+    return LuxoApp(
         protocol=server,  # type: ignore[arg-type]
         stt=models["stt"],  # type: ignore[arg-type]
         tts=models["tts"],  # type: ignore[arg-type]
         brain=models["brain"],  # type: ignore[arg-type]
-        memory_store=SceneMemoryStore(_env_path("LUMEN_MEMORY_PATH", DEFAULT_MEMORY_PATH)),
+        memory_store=SceneMemoryStore(_env_path("LUXO_MEMORY_PATH", DEFAULT_MEMORY_PATH)),
         config=config,
         latency_recorder=recorder,
         brain_model=str(models["model"]),
