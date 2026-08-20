@@ -201,15 +201,22 @@ async def run_character(
     stopped = asyncio.Event()
     _install_signal_handlers(stopped)
     app.start()
+    serving = asyncio.ensure_future(server.serve_forever())
+    shutdown = asyncio.ensure_future(stopped.wait())
     try:
-        serving = asyncio.ensure_future(server.serve_forever())
-        await stopped.wait()
-        serving.cancel()
-        try:
-            await serving
-        except asyncio.CancelledError:
-            pass
+        done, _ = await asyncio.wait(
+            {serving, shutdown}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if serving in done:
+            # The transport ended by itself. Surface why, rather than leaving
+            # two tick threads running behind a socket that is already gone.
+            serving.result()
     finally:
+        for task in (serving, shutdown):
+            task.cancel()
+        # Retrieving both outcomes here is what turns a transport failure into
+        # a shutdown instead of an unretrieved-exception warning.
+        await asyncio.gather(serving, shutdown, return_exceptions=True)
         app.stop()
 
 
