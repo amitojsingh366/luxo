@@ -257,7 +257,7 @@ class ObservationResponse:
 
     visible: tuple[ObservedObject, ...]
     focus: int | None = None
-    present_prior_ids: tuple[str, ...] | None = None
+    present_prior_ids: tuple[str, ...] = ()
     raw_saturated: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -273,14 +273,13 @@ class ObservationResponse:
             or not 0 <= self.focus < len(self.visible)
         ):
             raise ValueError("focus must be null or an index into visible")
-        if self.present_prior_ids is not None:
-            if not isinstance(self.present_prior_ids, tuple) or any(
-                not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
-                for value in self.present_prior_ids
-            ):
-                raise TypeError("present_prior_ids must be null or a tuple of safe ids")
-            if len(self.present_prior_ids) != len(set(self.present_prior_ids)):
-                raise ValueError("present_prior_ids must not contain duplicates")
+        if not isinstance(self.present_prior_ids, tuple) or any(
+            not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
+            for value in self.present_prior_ids
+        ):
+            raise TypeError("present_prior_ids must be a tuple of safe ids")
+        if len(self.present_prior_ids) != len(set(self.present_prior_ids)):
+            raise ValueError("present_prior_ids must not contain duplicates")
         if type(self.raw_saturated) is not bool:
             raise TypeError("raw_saturated must be a boolean")
 
@@ -414,17 +413,17 @@ def parse_observation_response(payload: RawPayload) -> ObservationResponse:
                 "dropping observation focus %d because its object was not retained",
                 raw_focus,
             )
-    raw_presence = root.get("present_prior_ids")
-    if raw_presence is None:
-        presence = None
-    elif not isinstance(raw_presence, list) or any(
+    if "present_prior_ids" not in root:
+        raise ResponseSchemaError(
+            "observation response requires 'present_prior_ids' array"
+        )
+    raw_presence = root["present_prior_ids"]
+    if not isinstance(raw_presence, list) or any(
         not isinstance(value, str) or _SAFE_OBJECT_ID.fullmatch(value) is None
         for value in raw_presence
     ):
-        LOGGER.warning("dropping invalid present_prior_ids evidence")
-        presence = None
-    else:
-        presence = tuple(dict.fromkeys(raw_presence))
+        raise ResponseSchemaError("observation 'present_prior_ids' must be a safe id array")
+    presence = tuple(dict.fromkeys(raw_presence))
     return ObservationResponse(
         visible=visible,
         focus=focus,

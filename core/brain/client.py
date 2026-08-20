@@ -405,30 +405,50 @@ class OpenRouterBrainClient:
         ]
         def parse_observation(raw: str) -> ObservationResponse:
             response = parse_observation_response(raw)
-            prior_ids = {
-                value["id"]
+            prior_canonicals = {
+                value["id"]: value["canonical"]
                 for value in prior_objects
-                if isinstance(value, dict) and isinstance(value.get("id"), str)
+                if (
+                    isinstance(value, dict)
+                    and isinstance(value.get("id"), str)
+                    and isinstance(value.get("canonical"), str)
+                )
             }
+            prior_ids = set(prior_canonicals)
             claimed: set[str] = set()
             visible = []
             for item in response.visible:
                 match = item.match
+                if (
+                    match in prior_canonicals
+                    and prior_canonicals[match] != item.canonical
+                ):
+                    raise ResponseSchemaError(
+                        "visible match canonical disagrees with supplied prior"
+                    )
                 if match not in prior_ids or match in claimed:
                     match = None
                 else:
                     claimed.add(match)
                 visible.append(replace(item, match=match))
             presence = response.present_prior_ids
-            if presence is not None and any(value not in prior_ids for value in presence):
-                LOGGER.warning("dropping present_prior_ids with unknown prior ids")
-                presence = None
-            elif presence is not None and not response.raw_saturated:
-                # A list below the ten-object ceiling has room to report every
-                # meaningful visible prior. Treat unmatched presence claims as
-                # stale prompt-copying rather than letting them defeat the
-                # Python missing-object comparison.
-                presence = None
+            if any(value not in prior_ids for value in presence):
+                raise ResponseSchemaError(
+                    "present_prior_ids contains an id absent from the supplied prior"
+                )
+            matched_ids = {
+                item.match for item in visible if item.match is not None
+            }
+            presence_ids = set(presence)
+            consistent = (
+                matched_ids.issubset(presence_ids)
+                if response.raw_saturated
+                else matched_ids == presence_ids
+            )
+            if not consistent:
+                raise ResponseSchemaError(
+                    "visible matches and present_prior_ids disagree"
+                )
             return ObservationResponse(
                 tuple(visible),
                 response.focus,

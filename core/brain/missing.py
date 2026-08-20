@@ -89,17 +89,21 @@ def compute_observation_missing(
         raise TypeError("baseline must contain ObservationPrior values")
     baseline = tuple({item.id: item for item in priors}.values())
     baseline_ids = frozenset(item.id for item in baseline)
-    retained = [item.match for item in observation.visible if item.match is not None]
-    evidence = observation.present_prior_ids
-    evidence_valid = evidence is not None and all(
-        value in baseline_ids for value in evidence
+    evidence = tuple(
+        object_id
+        for object_id in observation.present_prior_ids
+        if object_id in baseline_ids
     )
-    if evidence_valid:
-        retained.extend(evidence or ())
-    elif observation.raw_saturated:
+    evidence_ids = frozenset(evidence)
+    retained = [
+        item.match
+        for item in observation.visible
+        if item.match is not None and item.match in evidence_ids
+    ]
+    if observation.raw_saturated:
         # A saturated detail list may omit lower-priority objects that remain
-        # visible. Without trustworthy presence evidence, silence is safer
-        # than claiming that every omitted prior disappeared.
+        # visible. Silence is safer than claiming that any omitted prior
+        # disappeared, even when the model supplied partial presence detail.
         retained.extend(item.id for item in baseline)
     return ObservationMissingComparison(baseline, tuple(dict.fromkeys(retained)))
 
