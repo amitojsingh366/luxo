@@ -30,7 +30,6 @@ BBOX_EDGE_TOLERANCE = 0.025
 _SAFE_OBJECT_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _CANONICAL_SEPARATOR = re.compile(r"[\s_-]+")
 _CANONICAL_LABEL = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)*\Z")
-_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
 
 
 class ResponseSchemaError(ValueError):
@@ -149,45 +148,6 @@ JsonObject: TypeAlias = Mapping[str, object]
 RawPayload: TypeAlias = JsonObject | str
 
 
-def extract_json_object(raw: str) -> dict[str, object]:
-    """Extract the first decodable JSON object from fences or model preamble.
-
-    This performs extraction only. Retry and repair policy belongs to the
-    network client so raw failures can be logged there.
-    """
-
-    if not isinstance(raw, str):
-        raise ResponseSchemaError("model response must be text")
-
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(raw):
-        if character != "{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(raw[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    raise ResponseSchemaError("model response contains no valid JSON object")
-
-
-def truncate_say(text: str) -> str:
-    """Trim dialogue to 120 characters, preferring the nearest full sentence."""
-
-    if not isinstance(text, str):
-        raise ResponseSchemaError("plan response 'say' must be a string")
-    text = text.strip()
-    if len(text) <= SAY_MAX_CHARACTERS:
-        return text
-
-    prefix = text[:SAY_MAX_CHARACTERS]
-    boundaries = tuple(_SENTENCE_END.finditer(prefix))
-    if boundaries:
-        return prefix[: boundaries[-1].end()].rstrip()
-    return prefix.rstrip()
-
-
 def normalize_canonical_label(value: object) -> str:
     """Return a stable lower-case, space-separated object label."""
 
@@ -200,7 +160,7 @@ def normalize_canonical_label(value: object) -> str:
 
 
 def parse_plan_response(payload: RawPayload) -> PlanResponse:
-    """Validate a ``converse`` or ``narrate`` response.
+    """Validate a ``converse`` or observation-resolution response.
 
     Unknown keys are ignored. Invalid actions are logged and dropped without
     invalidating other actions in the plan.
@@ -209,7 +169,7 @@ def parse_plan_response(payload: RawPayload) -> PlanResponse:
     root = _payload_object(payload, "plan")
     if "say" not in root or "plan" not in root:
         raise ResponseSchemaError("plan response requires 'say' and 'plan'")
-    say = truncate_say(root["say"])
+    say = _say(root["say"])
     raw_plan = root["plan"]
     if not isinstance(raw_plan, list):
         raise ResponseSchemaError("plan response 'plan' must be an array")
@@ -223,17 +183,12 @@ def parse_plan_response(payload: RawPayload) -> PlanResponse:
     return PlanResponse(say=say, plan=tuple(actions))
 
 
-def parse_observation_response(
-    payload: RawPayload,
-    *,
-    require_known: bool = False,
-) -> ObservationResponse:
+def parse_observation_response(payload: RawPayload) -> ObservationResponse:
     """Validate an ``observe`` response containing facts and no dialogue.
 
-    Unknown top-level and object keys are ignored, except dialogue keys: an
-    observation containing dialogue is invalid and must take the client's one
-    repair path. ``known`` is a backward-compatible extension carrying fresh
-    details for prior objects that remain visible.
+    Unknown top-level and object keys are ignored, except dialogue keys. Invalid
+    entries are logged and dropped; the three top-level fact arrays are always
+    required.
     """
 
     root = _payload_object(payload, "observation")
@@ -242,13 +197,11 @@ def parse_observation_response(
         raise ResponseSchemaError(
             f"observation response must not contain dialogue keys {sorted(forbidden)!r}"
         )
-    if "present" not in root or "new" not in root:
-        raise ResponseSchemaError("observation response requires 'present' and 'new'")
-    if require_known and "known" not in root:
-        raise ResponseSchemaError("observation response requires 'known'")
+    if not {"present", "known", "new"} <= root.keys():
+        raise ResponseSchemaError("observation response requires 'present', 'known', and 'new'")
     raw_present = root["present"]
     raw_new = root["new"]
-    raw_known = root.get("known", [])
+    raw_known = root["known"]
     if not all(isinstance(value, list) for value in (raw_present, raw_new, raw_known)):
         raise ResponseSchemaError("observation 'present', 'new', and 'known' must be arrays")
 
@@ -294,10 +247,32 @@ def _observed_objects(values: list[object], field: str) -> list[ObservedObject]:
 
 def _payload_object(payload: RawPayload, kind: str) -> JsonObject:
     if isinstance(payload, str):
-        return extract_json_object(payload)
+        try:
+            decoded = json.loads(payload, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError) as error:
+            raise ResponseSchemaError(
+                f"{kind} response must be one complete JSON object"
+            ) from error
+        if not isinstance(decoded, dict):
+            raise ResponseSchemaError(f"{kind} response must be a JSON object")
+        return decoded
     if not isinstance(payload, Mapping):
         raise ResponseSchemaError(f"{kind} response must be a JSON object")
     return payload
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"non-standard JSON constant {value!r}")
+
+
+def _say(value: object) -> str:
+    if not isinstance(value, str):
+        raise ResponseSchemaError("plan response 'say' must be a string")
+    if len(value) > SAY_MAX_CHARACTERS:
+        raise ResponseSchemaError(
+            f"plan response 'say' must be at most {SAY_MAX_CHARACTERS} characters"
+        )
+    return value
 
 
 def _parse_action(value: object) -> Action:
@@ -461,24 +436,8 @@ def _bbox(value: object) -> tuple[float, float, float, float]:
         raise ValueError("bbox_norm must contain x, y, width, and height")
     numbers = tuple(_required_finite_number(part, "bbox_norm") for part in value)
     x, y, width, height = numbers
-    if (
-        any(part > 1.0 for part in numbers)
-        and all(0.0 <= part <= 1000.0 for part in numbers)
-        and numbers[2] > numbers[0]
-        and numbers[3] > numbers[1]
-    ):
-        # Vision models commonly emit 0..1000 corner coordinates even when
-        # asked for normalized x/y/width/height. Convert that unambiguous form
-        # at the trust boundary instead of silently losing a correctly seen
-        # object (for example [596,668,705,738] for a held USB drive).
-        left, top, right, bottom = numbers
-        x = left / 1000.0
-        y = top / 1000.0
-        width = (right - left) / 1000.0
-        height = (bottom - top) / 1000.0
     if not all(0.0 <= part <= 1.0 for part in numbers):
-        if (x, y, width, height) == numbers:
-            raise ValueError("bbox_norm values must be between 0 and 1")
+        raise ValueError("bbox_norm values must be between 0 and 1")
     right = x + width
     bottom = y + height
     if width > 0 and height > 0 and x >= 0 and y >= 0 and right <= 1.0 and bottom <= 1.0:
@@ -486,22 +445,14 @@ def _bbox(value: object) -> tuple[float, float, float, float]:
     if (
         width > 0
         and height > 0
-        and -BBOX_EDGE_TOLERANCE <= x <= 1.0 + BBOX_EDGE_TOLERANCE
-        and -BBOX_EDGE_TOLERANCE <= y <= 1.0 + BBOX_EDGE_TOLERANCE
-        and -BBOX_EDGE_TOLERANCE <= right <= 1.0 + BBOX_EDGE_TOLERANCE
-        and -BBOX_EDGE_TOLERANCE <= bottom <= 1.0 + BBOX_EDGE_TOLERANCE
+        and right <= 1.0 + BBOX_EDGE_TOLERANCE
+        and bottom <= 1.0 + BBOX_EDGE_TOLERANCE
     ):
-        left = min(1.0, max(0.0, x))
-        top = min(1.0, max(0.0, y))
-        clipped_right = min(1.0, max(0.0, right))
-        clipped_bottom = min(1.0, max(0.0, bottom))
-        clipped_width = clipped_right - left
-        clipped_height = clipped_bottom - top
+        clipped_width = min(1.0, right) - x
+        clipped_height = min(1.0, bottom) - y
         if clipped_width > 0 and clipped_height > 0:
-            return left, top, clipped_width, clipped_height
-    if width <= 0 or height <= 0 or right > 1.0 or bottom > 1.0:
-        raise ValueError("bbox_norm must describe a positive box inside the frame")
-    return x, y, width, height
+            return x, y, clipped_width, clipped_height
+    raise ValueError("bbox_norm must describe a positive box inside the frame")
 
 
 def _required_finite_number(value: object, field: str) -> float:
@@ -526,9 +477,7 @@ __all__ = [
     "SAY_MAX_CHARACTERS",
     "SfxName",
     "WAIT_MAX_MS",
-    "extract_json_object",
     "normalize_canonical_label",
     "parse_observation_response",
     "parse_plan_response",
-    "truncate_say",
 ]
