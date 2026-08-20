@@ -124,6 +124,7 @@ class GestureName(str, Enum):
     RECOIL = "recoil"
     LEAN_IN = "lean_in"
     BOUNCE = "bounce"
+    DANCE = "dance"
     SHAKE_NO = "shake_no"
     SETTLE = "settle"
     DROOP = "droop"

@@ -22,6 +22,8 @@ TICK_HZ = 120
 FIXED_DT = 1.0 / TICK_HZ
 LOOK_TARGET_MAX_AGE_S = 1.0
 SPEECH_BOB_MAX_RAD = 0.025
+SPEECH_LIGHT_PULSE_GAIN = 0.18
+SPEECH_BLOOM_PULSE_GAIN = 0.10
 PUNCTUATION_BLINK_DURATION_S = 0.090
 PUNCTUATION_BLINK_HEAD_BOB_RAD = -0.020
 
@@ -128,6 +130,19 @@ class AnimationRuntime:
     @property
     def last_timestamp(self) -> float | None:
         return self._last_now
+
+    @property
+    def gesture_in_progress(self) -> bool:
+        """Whether a semantic gesture is queued or still animating.
+
+        Postures are intentionally excluded: they are held state, whereas a
+        gesture is a finite action whose authored release must finish before
+        the behavior plan can advance or announce itself drained.
+        """
+
+        return isinstance(self._pending_motion, GestureName) or isinstance(
+            self._gestures.active, GestureName
+        )
 
     def start_gesture(self, gesture: GestureName) -> None:
         """Queue a closed-vocabulary gesture for the next fixed tick."""
@@ -262,6 +277,12 @@ class AnimationRuntime:
             )
             gaze = LayerSample(joints=solution.offsets)
             requested_posture = solution.requested_posture
+            if self._inspection.active or self._searching.active:
+                # Inspection/search already own the whole-body silhouette.
+                # A simultaneous look-at crane or stoop would compound those
+                # offsets, overextend the reach, and could remain after the
+                # observation when a face target sits near a pitch limit.
+                requested_posture = None
             look_target = look_fact.target.target
         if requested_posture is None:
             self._release_look_posture(timestamp)
@@ -406,11 +427,12 @@ class AnimationRuntime:
 
     def _light_command(self) -> LightCommand:
         intensity, color_k = _LIGHT_PRESETS[self._light_preset]
+        speech_level = self._speech_amplitude if self._speaking else 0.0
         return LightCommand(
-            intensity=intensity,
+            intensity=intensity * (1.0 + speech_level * SPEECH_LIGHT_PULSE_GAIN),
             color_k=color_k,
             pattern=self._light_pattern.value,
-            bloom=0.60,
+            bloom=0.60 + speech_level * SPEECH_BLOOM_PULSE_GAIN,
         )
 
 
@@ -434,5 +456,7 @@ __all__ = [
     "PUNCTUATION_BLINK_DURATION_S",
     "PUNCTUATION_BLINK_HEAD_BOB_RAD",
     "SPEECH_BOB_MAX_RAD",
+    "SPEECH_BLOOM_PULSE_GAIN",
+    "SPEECH_LIGHT_PULSE_GAIN",
     "TICK_HZ",
 ]

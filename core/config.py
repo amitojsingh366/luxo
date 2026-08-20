@@ -104,7 +104,7 @@ _EXPECTED_ENUMS: dict[str, tuple[str, ...]] = {
     ),
     "gestures": (
         "perk_up", "nod", "double_take", "recoil", "lean_in", "bounce",
-        "shake_no", "settle", "droop", "regard",
+        "dance", "shake_no", "settle", "droop", "regard",
     ),
     "look_at_targets": ("person", "obj:<id>", "scene"),
     "light_presets": (

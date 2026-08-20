@@ -98,6 +98,11 @@ class ErrorMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class ClearMemoryMessage:
+    type: Literal["clear_memory"] = field(default="clear_memory", init=False)
+
+
+@dataclass(frozen=True, slots=True)
 class JointsState:
     base_yaw: float
     shoulder_pitch: float
@@ -204,7 +209,12 @@ class SpeakEndMessage:
 
 
 BrowserToCoreMessage: TypeAlias = (
-    HelloMessage | GazeMessage | VadMessage | TtsDoneMessage | ErrorMessage
+    HelloMessage
+    | GazeMessage
+    | VadMessage
+    | TtsDoneMessage
+    | ErrorMessage
+    | ClearMemoryMessage
 )
 CoreToBrowserMessage: TypeAlias = (
     BodyStateMessage
@@ -338,6 +348,8 @@ def _message_from_dict(data: dict[str, Any]) -> TextMessage:
         return TtsDoneMessage(**values)
     if kind == "error":
         return ErrorMessage(**values)
+    if kind == "clear_memory":
+        return ClearMemoryMessage()
     if kind == "body_state":
         telemetry = values["telemetry"]
         values["joints"] = JointsState(**values["joints"])
@@ -383,7 +395,15 @@ def _validate_text_direction(message: TextMessage, direction: Direction | None) 
     if direction is None:
         return
     browser_message = isinstance(
-        message, (HelloMessage, GazeMessage, VadMessage, TtsDoneMessage, ErrorMessage)
+        message,
+        (
+            HelloMessage,
+            GazeMessage,
+            VadMessage,
+            TtsDoneMessage,
+            ErrorMessage,
+            ClearMemoryMessage,
+        ),
     )
     actual = Direction.BROWSER_TO_CORE if browser_message else Direction.CORE_TO_BROWSER
     if actual is not direction:

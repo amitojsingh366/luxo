@@ -13,6 +13,9 @@ export const SFX_NAMES = Object.freeze([
 
 export type SfxName = (typeof SFX_NAMES)[number];
 
+export const SFX_OUTPUT_GAIN = 0.8;
+export const SFX_LIMIT_DB = -1;
+
 export const SFX_RECIPES = Object.freeze({
   chirp_up: Object.freeze({
     durationMs: 120,
@@ -131,17 +134,21 @@ function makeSineSynth(
 
 class SfxOutput {
   protected readonly master: Tone.Gain;
+  protected readonly limiter: Tone.Limiter;
 
   constructor(destination?: Tone.InputNode) {
-    this.master =
-      destination === undefined
-        ? new Tone.Gain(0.32).toDestination()
-        : new Tone.Gain(0.32).connect(destination);
+    this.limiter = new Tone.Limiter(SFX_LIMIT_DB);
+    if (destination === undefined) {
+      this.limiter.toDestination();
+    } else {
+      this.limiter.connect(destination);
+    }
+    this.master = new Tone.Gain(SFX_OUTPUT_GAIN).connect(this.limiter);
   }
 }
 
 class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
-  private readonly chirpUp = makeSineSynth(-10, {
+  private readonly chirpUp = makeSineSynth(-7, {
     attack: 0.003,
     decay: 0.116,
     sustain: 0,
@@ -153,14 +160,14 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
       dampening: 3_500,
       resonance: 0.76,
       release: 0.08,
-      volume: -13,
+      volume: -9,
     }).connect(this.master),
     new Tone.PluckSynth({
       attackNoise: 0.7,
       dampening: 3_500,
       resonance: 0.76,
       release: 0.08,
-      volume: -13,
+      volume: -9,
     }).connect(this.master),
   ] as const;
   private readonly boing = new Tone.MembraneSynth({
@@ -174,7 +181,7 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
       sustain: 0,
       release: 0.005,
     },
-    volume: -11,
+    volume: -7,
   }).connect(this.master);
   private readonly whirrFilter = new Tone.Filter({
     frequency: SFX_RECIPES.whirr_short.sources[0].filterHz,
@@ -185,9 +192,9 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
   private readonly whirrNoise = new Tone.NoiseSynth({
     noise: { type: "pink" },
     envelope: { attack: 0.025, decay: 0.14, sustain: 0.12, release: 0.035 },
-    volume: -22,
+    volume: -10,
   }).connect(this.whirrFilter);
-  private readonly whirrHum = makeSineSynth(-18, {
+  private readonly whirrHum = makeSineSynth(-8, {
     attack: 0.025,
     decay: 0.1,
     sustain: 0.12,
@@ -198,22 +205,22 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
     depth: SFX_RECIPES.hmm.vibrato.depth,
     wet: 1,
   }).connect(this.master);
-  private readonly hmm = makeSineSynth(-16).connect(this.hmmVibrato);
-  private readonly blipSad = makeSineSynth(-13, {
+  private readonly hmm = makeSineSynth(-9).connect(this.hmmVibrato);
+  private readonly blipSad = makeSineSynth(-9, {
     attack: 0.004,
     decay: 0.195,
     sustain: 0,
     release: 0.001,
   }).connect(this.master);
   private readonly fanfare = [
-    makeSineSynth(-15, { ...DEFAULT_ENVELOPE, release: 0.03 }).connect(this.master),
-    makeSineSynth(-15, { ...DEFAULT_ENVELOPE, release: 0.03 }).connect(this.master),
-    makeSineSynth(-15, { ...DEFAULT_ENVELOPE, release: 0.03 }).connect(this.master),
+    makeSineSynth(-10, { ...DEFAULT_ENVELOPE, release: 0.03 }).connect(this.master),
+    makeSineSynth(-10, { ...DEFAULT_ENVELOPE, release: 0.03 }).connect(this.master),
+    makeSineSynth(-10, { ...DEFAULT_ENVELOPE, release: 0.03 }).connect(this.master),
   ] as const;
   private readonly click = new Tone.NoiseSynth({
     noise: { type: "white" },
     envelope: { attack: 0.001, decay: 0.006, sustain: 0, release: 0.001 },
-    volume: -19,
+    volume: -7,
   }).connect(this.master);
   private readonly resources: readonly Disposable[];
   private disposed = false;
@@ -233,6 +240,7 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
       this.whirrFilter,
       this.hmmVibrato,
       this.master,
+      this.limiter,
     ];
   }
 
@@ -265,7 +273,7 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
           SFX_RECIPES.hmm.frequencyHz,
           seconds(SFX_RECIPES.hmm.durationMs - 40),
           at,
-          0.5,
+          0.7,
         );
         break;
       case "blip_sad":
@@ -278,7 +286,7 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
         this.click.triggerAttackRelease(
           seconds(SFX_RECIPES.click.durationMs - 1),
           at,
-          0.55,
+          0.85,
         );
         break;
     }
@@ -315,12 +323,12 @@ class LuxoSfxGraph extends SfxOutput implements RoutedSfxGraph {
 
   private playWhirr(at: number): void {
     const duration = seconds(SFX_RECIPES.whirr_short.durationMs);
-    this.whirrNoise.triggerAttackRelease(duration - 0.035, at, 0.48);
+    this.whirrNoise.triggerAttackRelease(duration - 0.035, at, 0.68);
     this.whirrHum.triggerAttackRelease(
       SFX_RECIPES.whirr_short.sources[1].frequencyHz,
       duration - 0.035,
       at,
-      0.38,
+      0.62,
     );
   }
 

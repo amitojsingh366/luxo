@@ -127,6 +127,12 @@ class AnimationDirector:
     def pending_effects(self) -> tuple[DirectorEffect, ...]:
         return tuple(self._effects)
 
+    @property
+    def gesture_in_progress(self) -> bool:
+        """Expose only the finite semantic-motion barrier to the plan router."""
+
+        return self._runtime.gesture_in_progress
+
     def apply_action(
         self,
         action: Action,
@@ -151,6 +157,10 @@ class AnimationDirector:
 
         if action.op is ActionOp.GESTURE:
             self._runtime.start_gesture(action.name)  # type: ignore[arg-type]
+            if action.name is GestureName.BOUNCE:
+                self._queue_sfx(SfxName.BOING)
+            elif action.name is GestureName.DANCE:
+                self._queue_sfx(SfxName.FANFARE_SMALL)
         elif action.op is ActionOp.POSTURE:
             self._runtime.start_posture(action.name)  # type: ignore[arg-type]
         elif action.op is ActionOp.LIGHT:
@@ -221,6 +231,11 @@ class AnimationDirector:
                 self._set_light(LightPreset.EXCITED_FLASH)
                 self._queue_sfx(SfxName.BOING)
             else:
+                # Canonical postures are intentionally held until replaced.
+                # A model plan may end on alert/stoop/crane without authoring
+                # an explicit rest action; returning to ENGAGED is the body-
+                # owned boundary that must release that pose.
+                self._runtime.start_posture(PostureName.REST)
                 self._set_light(LightPreset.WARM_BRIGHT)
         elif state is BehaviorState.LISTENING:
             self._desired_target = "person"
@@ -347,6 +362,10 @@ class AnimationDirector:
         if motion is InspectionMotion.REACH:
             self._queue_sfx(SfxName.WHIRR_SHORT)
         elif motion is InspectionMotion.SEARCHING:
+            # Search is the same curious motor family as close inspection,
+            # with a crisp accent so the wider scene sweep still reads as a
+            # distinct intent.
+            self._queue_sfx(SfxName.WHIRR_SHORT)
             self._queue_sfx(SfxName.CLICK)
 
     def _queue_sfx(self, name: SfxName) -> None:

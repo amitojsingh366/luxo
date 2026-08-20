@@ -44,6 +44,10 @@ export interface ErrorMessage {
   readonly detail: string;
 }
 
+export interface ClearMemoryMessage {
+  readonly type: "clear_memory";
+}
+
 export interface JointsState {
   readonly base_yaw: number;
   readonly shoulder_pitch: number;
@@ -113,9 +117,9 @@ export interface SpeakEndMessage {
   readonly type: "speak_end";
 }
 
-export type TextMessage = HelloMessage | GazeMessage | VadMessage | TtsDoneMessage | ErrorMessage | BodyStateMessage | CueMessage | CaptureFrameMessage | SpeakBeginMessage | SpeakEndMessage;
+export type TextMessage = HelloMessage | GazeMessage | VadMessage | TtsDoneMessage | ErrorMessage | ClearMemoryMessage | BodyStateMessage | CueMessage | CaptureFrameMessage | SpeakBeginMessage | SpeakEndMessage;
 
-export type BrowserToCoreMessage = HelloMessage | GazeMessage | VadMessage | TtsDoneMessage | ErrorMessage;
+export type BrowserToCoreMessage = HelloMessage | GazeMessage | VadMessage | TtsDoneMessage | ErrorMessage | ClearMemoryMessage;
 
 export type CoreToBrowserMessage = BodyStateMessage | CueMessage | CaptureFrameMessage | SpeakBeginMessage | SpeakEndMessage;
 

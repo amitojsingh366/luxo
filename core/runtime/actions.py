@@ -18,8 +18,11 @@ drives, so a cue raised by the animation loop is dispatched on the next 10 Hz
 router tick.
 
 Blockers stay exactly where the executor put them. ``wait`` holds for its
-duration and ``observe`` holds until a release, and because the router ticks
-the executor once and only once it can never drain past either.
+duration and ``observe`` holds until a release. Finite gestures are body-owned
+rather than executor-owned, so the router also withholds the next executor tick
+while the director reports that a gesture is queued or animating. This keeps
+multi-gesture plans sequential and prevents an empty queue from ending ACTING
+before the final authored release.
 
 The observation flow itself is not implemented here. ``capture_callback`` is
 the seam: the router hands out one :class:`CaptureFrameMessage` per accepted
@@ -149,6 +152,8 @@ class ActionRouter:
 
         with self._lock:
             try:
+                if self._director.gesture_in_progress:
+                    return None
                 action = self._plans.tick(snapshot, now)
                 return None if action is None else self._route_locked(action)
             finally:

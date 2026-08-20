@@ -3,6 +3,7 @@ import {
   type BodyStateMessage,
   type BrowserToCoreMessage,
   type CaptureFrameMessage,
+  type ClearMemoryMessage,
   type CoreToBrowserMessage,
   type CueMessage,
   type ErrorMessage,
@@ -332,6 +333,11 @@ export class ProtocolClient {
 
   sendError(where: string, detail: string): boolean {
     const message: ErrorMessage = { type: 'error', where, detail };
+    return this.sendJson(message);
+  }
+
+  sendClearMemory(): boolean {
+    const message: ClearMemoryMessage = { type: 'clear_memory' };
     return this.sendJson(message);
   }
 

@@ -261,6 +261,7 @@ from ..protocol.messages import (
     BodyStateMessage,
     BrowserToCoreMessage,
     CaptureFrameMessage,
+    ClearMemoryMessage,
     ClampCounts as WireClampCounts,
     CoreToBrowserMessage,
     CueMessage,
@@ -947,6 +948,12 @@ class LuxoApp:
                         self._observations.disengage()
                         with self._director_lock:
                             self._router.cancel("camera_error")
+            elif isinstance(message, ClearMemoryMessage):
+                # Use the existing serialized reset path: it invalidates any
+                # in-flight observation before clearing both the blackboard
+                # mirror and durable scene-memory file.
+                LOGGER.info("browser requested scene-memory clear")
+                self.request_reset("browser_clear_memory")
         except Exception:
             LOGGER.exception("handling %r failed", getattr(message, "type", message))
 
@@ -1339,12 +1346,15 @@ class LuxoApp:
         return False
 
     def _post_plan_drained(self) -> None:
-        """Announce a drained plan; the FSM alone decides what that means."""
+        """Announce a drained plan only after its finite body motion finishes."""
 
         if self._fsm.state is not BehaviorState.ACTING:
             return
         if self._plans.depth:
             return
+        with self._director_lock:
+            if self._director.gesture_in_progress:
+                return
         self._fsm.post_event(BehaviorEvent.PLAN_DRAINED)
 
     def _publish_telemetry(self, now: float) -> None:

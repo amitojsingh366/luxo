@@ -7,7 +7,11 @@ import { CameraSensor, type CameraSensorOptions } from "./sensors/camera";
 import { GazeSensor, type GazeSensorOptions } from "./sensors/gaze";
 import { MicrophoneCapture, type MicrophoneOptions, type VadAudioSink } from "./sensors/mic";
 import { SileroVadScorer, VadProcessor, type VadOptions, type VadScorer } from "./sensors/vad";
-import { mountTelemetryOverlay, type TelemetryOverlayHandle } from "./ui/overlay";
+import {
+  mountTelemetryOverlay,
+  type TelemetryOverlayHandle,
+  type TelemetryOverlayOptions,
+} from "./ui/overlay";
 
 type MaybePromise = void | Promise<void>;
 
@@ -38,6 +42,7 @@ interface RuntimeProtocol {
   sendVad(event: VadMessage["event"], t?: number): boolean;
   sendTtsDone(t?: number): boolean;
   sendError(where: string, detail: string): boolean;
+  sendClearMemory(): boolean;
   sendUtterancePcm(payload: Uint8Array): boolean;
   sendCapturedJpeg(payload: ArrayBuffer | Uint8Array): boolean;
 }
@@ -68,7 +73,7 @@ export interface LuxoRuntimeDependencies {
   createMicrophone(options: MicrophoneOptions): RuntimeMicrophone;
   createGaze(options: GazeSensorOptions): RuntimeGaze;
   createProtocol(options: ProtocolClientOptions): RuntimeProtocol;
-  createOverlay(root: HTMLElement): TelemetryOverlayHandle;
+  createOverlay(root: HTMLElement, options?: TelemetryOverlayOptions): TelemetryOverlayHandle;
   createFallback(): RuntimeFallback;
   nowSeconds(): number;
   requestFrame(callback: () => void): number;
@@ -137,7 +142,9 @@ export class LuxoBrowserRuntime {
       onTtsDone: () => this.completeTts(),
     });
     this.fallback = dependencies.createFallback();
-    this.overlay = dependencies.createOverlay(root);
+    this.overlay = dependencies.createOverlay(root, {
+      onClearMemory: () => this.protocol?.sendClearMemory() ?? false,
+    });
     sensorOverlay = this.overlay;
     this.overlay.setConnectionStatus("connecting");
     const documentRef = root.ownerDocument;

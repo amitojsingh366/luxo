@@ -188,6 +188,65 @@ canvas {
   text-align: center;
 }
 
+.luxo-telemetry[data-collapsed="true"] {
+  width: auto !important;
+  min-width: min(19rem, calc(100vw - 2rem));
+}
+
+.luxo-telemetry__heading {
+  display: grid;
+  gap: 0.12rem;
+  min-width: 0;
+}
+
+.luxo-telemetry__header-actions,
+.luxo-telemetry__memory-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.luxo-telemetry__button {
+  padding: 0.32rem 0.48rem;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 0.35rem;
+  color: rgb(244 239 231 / 82%);
+  background: rgb(255 255 255 / 6%);
+  font: inherit;
+  font-size: 0.52rem;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+}
+
+.luxo-telemetry__button:hover:not(:disabled) {
+  border-color: rgb(243 185 107 / 58%);
+  color: #fffaf2;
+  background: rgb(243 185 107 / 12%);
+}
+
+.luxo-telemetry__button:focus-visible {
+  outline: 2px solid #f3b96b;
+  outline-offset: 2px;
+}
+
+.luxo-telemetry__button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.luxo-telemetry__memory-actions {
+  justify-content: flex-end;
+  margin-top: 0.7rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid rgb(255 255 255 / 10%);
+}
+
+.luxo-telemetry__clear-memory {
+  color: #ffb2a9;
+  border-color: rgb(255 139 125 / 34%);
+}
+
 .luxo-sensor-view {
   display: grid;
   gap: 0.42rem;

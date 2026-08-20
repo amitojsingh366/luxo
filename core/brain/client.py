@@ -66,19 +66,28 @@ REPAIR_INSTRUCTIONS: Mapping[CallType, str] = {
         "Your conversation response was invalid. Return one bare JSON object with exactly "
         "the top-level keys say, visual_intent, memory_refs, and plan. visual_intent must be none, "
         "inspect, or search. Use none unless the current transcript needs a new camera "
-        "frame, inspect for a close/deictic subject, and search for a remembered object's "
-        "current location. memory_refs is an array of supplied obj_* ids discussed by the "
+        "frame, inspect for a close/deictic/presented subject, and search whenever the user "
+        "asks to find, locate, seek, look for, recover, or get the current location of a "
+        "remembered object. A request such as 'find it again' is search, not inspect. "
+        "For historical recall, say is the final answer: answer from supplied memory now or "
+        "say the requested fact was not remembered. Never answer only 'let me check my memory'. "
+        "memory_refs is an array of supplied obj_* ids discussed by the "
         "current transcript. Every plan item needs an op from gesture, "
         "look_at, light, sfx, scan, observe, posture, or wait. A gesture name such as "
-        "perk_up belongs in name with op set to gesture; it is never itself an op."
+        "perk_up belongs in name with op set to gesture; it is never itself an op. "
+        "A request to dance uses exactly one gesture action named dance; never speak "
+        "sound-effect names such as boing or whirr_short."
     ),
     "observe": (
         "Your observation response was invalid. Inspect the supplied image and return one "
         "bare JSON object with visible, focus, and present_prior_ids. visible must be "
         "an array of at most 10 objects ordered nearest-to-camera first. Each object needs "
         "match, label, canonical, attributes, and bbox_norm; match and bbox_norm may be null. "
-        "focus must be a visible array index or null. present_prior_ids lists every supplied "
-        "prior id still visible anywhere in the image. Do not return "
+        "For the focused object, include its dominant visible color in attributes whenever "
+        "the pixels support one; do not omit a clearly visible color and do not guess. "
+        "focus must be a visible array index or null. When a prior object is visible, use its "
+        "id in both that object's match and present_prior_ids. Do not put an id only in "
+        "present_prior_ids unless visible already contains 10 nearer objects. Do not return "
         "say, plan, dialogue, or prose."
     ),
     "resolve_observation": (
@@ -403,6 +412,7 @@ class OpenRouterBrainClient:
             {"type": "text", "text": _compact_json(labels)},
             {"type": "image_url", "image_url": {"url": payload["jpeg_data_url"]}},
         ]
+
         def parse_observation(raw: str) -> ObservationResponse:
             response = parse_observation_response(raw)
             prior_canonicals = {
@@ -414,47 +424,7 @@ class OpenRouterBrainClient:
                     and isinstance(value.get("canonical"), str)
                 )
             }
-            prior_ids = set(prior_canonicals)
-            claimed: set[str] = set()
-            visible = []
-            for item in response.visible:
-                match = item.match
-                if (
-                    match in prior_canonicals
-                    and prior_canonicals[match] != item.canonical
-                ):
-                    raise ResponseSchemaError(
-                        "visible match canonical disagrees with supplied prior"
-                    )
-                if match not in prior_ids or match in claimed:
-                    match = None
-                else:
-                    claimed.add(match)
-                visible.append(replace(item, match=match))
-            presence = response.present_prior_ids
-            if any(value not in prior_ids for value in presence):
-                raise ResponseSchemaError(
-                    "present_prior_ids contains an id absent from the supplied prior"
-                )
-            matched_ids = {
-                item.match for item in visible if item.match is not None
-            }
-            presence_ids = set(presence)
-            consistent = (
-                matched_ids.issubset(presence_ids)
-                if response.raw_saturated
-                else matched_ids == presence_ids
-            )
-            if not consistent:
-                raise ResponseSchemaError(
-                    "visible matches and present_prior_ids disagree"
-                )
-            return ObservationResponse(
-                tuple(visible),
-                response.focus,
-                presence,
-                raw_saturated=response.raw_saturated,
-            )
+            return _reconcile_observation_evidence(response, prior_canonicals)
 
         return self._run("observe", self._messages(content), parse_observation)
 
@@ -638,10 +608,75 @@ def _compact_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _reconcile_observation_evidence(
+    response: ObservationResponse,
+    prior_canonicals: Mapping[str, str],
+) -> ObservationResponse:
+    """Keep fresh visible facts while degrading inconsistent identity metadata.
+
+    ``focus`` and the visible list are direct evidence from the captured frame.
+    ``match`` and ``present_prior_ids`` are redundant stable-identity claims; a
+    small vision model occasionally gets one side right and the other wrong.
+    That disagreement must not discard a clearly focused new object. Only an
+    identity corroborated by both fields is retained. Presence-only evidence is
+    kept solely for a saturated ten-object list, where lower-priority priors may
+    legitimately be omitted from ``visible``.
+    """
+
+    if not isinstance(response, ObservationResponse):
+        raise TypeError("response must be an ObservationResponse")
+    if not isinstance(prior_canonicals, Mapping) or any(
+        not isinstance(object_id, str) or not isinstance(canonical, str)
+        for object_id, canonical in prior_canonicals.items()
+    ):
+        raise TypeError("prior_canonicals must map object ids to canonical labels")
+
+    prior_ids = frozenset(prior_canonicals)
+    valid_presence = tuple(
+        object_id
+        for object_id in response.present_prior_ids
+        if object_id in prior_ids
+    )
+    presence_ids = frozenset(valid_presence)
+    claimed: set[str] = set()
+    visible = []
+    for item in response.visible:
+        match = item.match
+        corroborated = (
+            match in presence_ids
+            and match not in claimed
+            and prior_canonicals.get(match) == item.canonical
+        )
+        if corroborated and match is not None:
+            claimed.add(match)
+        else:
+            match = None
+        visible.append(replace(item, match=match))
+
+    presence = (
+        valid_presence
+        if response.raw_saturated
+        else tuple(object_id for object_id in valid_presence if object_id in claimed)
+    )
+    return ObservationResponse(
+        visible=tuple(visible),
+        focus=response.focus,
+        present_prior_ids=presence,
+        raw_saturated=response.raw_saturated,
+    )
+
+
 def _parse_converse_response(raw: str) -> PlanResponse:
     """Keep wording while making the typed visual decision authoritative."""
 
     response = parse_conversation_response(raw)
+    if (
+        response.visual_intent is VisualIntent.NONE
+        and _is_deferred_memory_answer(response.say)
+    ):
+        raise ResponseSchemaError(
+            "historical recall must answer from memory now, not defer a memory check"
+        )
     scan = next(
         (action for action in response.plan if action.op is ActionOp.SCAN),
         Action(ActionOp.SCAN),
@@ -661,6 +696,24 @@ def _parse_converse_response(raw: str) -> PlanResponse:
         response.visual_intent,
         response.memory_refs,
     )
+
+
+def _is_deferred_memory_answer(value: str) -> bool:
+    """Recognize closed, non-answers that promise a nonexistent later turn."""
+
+    normalized = " ".join(value.casefold().replace("’", "'").split()).rstrip(
+        " !?.…"
+    )
+    return normalized in {
+        "let me check memory",
+        "let me check my memory",
+        "let me search memory",
+        "let me search my memory",
+        "i'll check memory",
+        "i'll check my memory",
+        "i will check memory",
+        "i will check my memory",
+    }
 
 
 def _parse_resolved_response(raw: str) -> PlanResponse:

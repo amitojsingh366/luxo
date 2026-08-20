@@ -41,6 +41,10 @@ export interface TelemetryOverlayHandle {
   dispose(): void;
 }
 
+export interface TelemetryOverlayOptions {
+  readonly onClearMemory?: () => boolean;
+}
+
 export const OBSERVATION_CAPTURE_STATUSES = Object.freeze([
   "waiting",
   "capturing",
@@ -73,7 +77,7 @@ const PANEL_STYLE = [
   "box-shadow:0 1rem 3rem rgba(0,0,0,0.32)",
   "font:600 0.68rem/1.35 ui-monospace,SFMono-Regular,Menlo,monospace",
   "letter-spacing:0.04em",
-  "pointer-events:none",
+  "pointer-events:auto",
   "backdrop-filter:blur(14px)",
 ].join(";");
 
@@ -269,6 +273,11 @@ function targetPoint(
 
 export class TelemetryOverlay implements TelemetryOverlayHandle {
   private readonly panel: HTMLElement;
+  private readonly body: HTMLElement;
+  private readonly header: HTMLElement;
+  private readonly toggleButton: HTMLButtonElement;
+  private readonly clearMemoryButton: HTMLButtonElement;
+  private readonly onClearMemory: (() => boolean) | undefined;
   private readonly connectionValue: HTMLElement;
   private readonly disconnectedBadge: HTMLElement;
   private readonly fields: Readonly<Record<string, FieldElements>>;
@@ -280,13 +289,28 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
   private previewVideo: HTMLVideoElement | null = null;
   private connection: OverlayConnectionStatus = "connecting";
   private facts: TelemetryState | null = null;
+  private collapsed = false;
+  private memoryClearPending = false;
   private disposed = false;
 
-  constructor(root: HTMLElement, documentRef: Document = root.ownerDocument) {
+  constructor(
+    root: HTMLElement,
+    options: TelemetryOverlayOptions = {},
+    documentRef: Document = root.ownerDocument,
+  ) {
     const panel = element(documentRef, "section", "luxo-telemetry");
     const header = element(documentRef, "header", "luxo-telemetry__header");
+    const heading = element(documentRef, "div", "luxo-telemetry__heading");
     const title = element(documentRef, "span", "luxo-telemetry__title", "LUXO TELEMETRY");
     const connectionValue = element(documentRef, "span", "luxo-telemetry__connection");
+    const headerActions = element(documentRef, "div", "luxo-telemetry__header-actions");
+    const toggleButton = element(
+      documentRef,
+      "button",
+      "luxo-telemetry__button luxo-telemetry__toggle",
+      "COLLAPSE",
+    ) as HTMLButtonElement;
+    const body = element(documentRef, "div", "luxo-telemetry__body");
     const disconnectedBadge = element(
       documentRef,
       "div",
@@ -307,6 +331,13 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
       "luxo-sensor-view__capture",
       CAPTURE_LABELS.waiting,
     );
+    const memoryActions = element(documentRef, "div", "luxo-telemetry__memory-actions");
+    const clearMemoryButton = element(
+      documentRef,
+      "button",
+      "luxo-telemetry__button luxo-telemetry__clear-memory",
+      "CLEAR MEMORY",
+    ) as HTMLButtonElement;
 
     panel.style.cssText = PANEL_STYLE;
     header.style.cssText = HEADER_STYLE;
@@ -315,6 +346,14 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
     panel.dataset.component = "luxo-telemetry";
     panel.setAttribute("aria-label", "Luxo live telemetry");
     panel.setAttribute("aria-live", "polite");
+    panel.dataset.collapsed = "false";
+    body.id = "luxo-telemetry-body";
+    toggleButton.type = "button";
+    toggleButton.setAttribute("aria-controls", body.id);
+    toggleButton.setAttribute("aria-expanded", "true");
+    toggleButton.setAttribute("aria-label", "Collapse telemetry");
+    clearMemoryButton.type = "button";
+    clearMemoryButton.setAttribute("aria-label", "Clear all Luxo scene memory");
     disconnectedBadge.setAttribute("role", "alert");
     disconnectedBadge.dataset.role = "disconnected-badge";
     sensorView.hidden = true;
@@ -325,14 +364,23 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
     sensorView.setAttribute("aria-live", "off");
     sensorViewport.setAttribute("aria-label", "Mirrored camera frame with local detections");
 
-    header.append(title, connectionValue);
+    heading.append(title, connectionValue);
+    headerActions.append(toggleButton);
+    header.append(heading, headerActions);
     sensorHeader.append(sensorTitle, sensorScope);
     sensorViewport.append(sensorAnnotations);
     sensorView.append(sensorHeader, sensorViewport, sensorFacts, observationStatus);
-    panel.append(header, disconnectedBadge, grid, sensorView);
+    memoryActions.append(clearMemoryButton);
+    body.append(disconnectedBadge, grid, memoryActions, sensorView);
+    panel.append(header, body);
     root.append(panel);
 
     this.panel = panel;
+    this.body = body;
+    this.header = header;
+    this.toggleButton = toggleButton;
+    this.clearMemoryButton = clearMemoryButton;
+    this.onClearMemory = options.onClearMemory;
     this.connectionValue = connectionValue;
     this.disconnectedBadge = disconnectedBadge;
     this.sensorView = sensorView;
@@ -351,8 +399,39 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
       velocityClamps: addField(documentRef, grid, "velocity-clamps", "VELOCITY CLAMPS"),
       limitClamps: addField(documentRef, grid, "limit-clamps", "LIMIT CLAMPS"),
     });
+    toggleButton.addEventListener("click", this.handleToggle);
+    clearMemoryButton.addEventListener("click", this.handleClearMemory);
     this.render();
   }
+
+  private readonly handleToggle = (): void => {
+    if (this.disposed) return;
+    this.collapsed = !this.collapsed;
+    this.body.hidden = this.collapsed;
+    this.panel.dataset.collapsed = String(this.collapsed);
+    this.toggleButton.textContent = this.collapsed ? "EXPAND" : "COLLAPSE";
+    this.toggleButton.setAttribute("aria-expanded", String(!this.collapsed));
+    this.toggleButton.setAttribute(
+      "aria-label",
+      this.collapsed ? "Expand telemetry" : "Collapse telemetry",
+    );
+    this.header.style.marginBottom = this.collapsed ? "0" : "0.65rem";
+  };
+
+  private readonly handleClearMemory = (): void => {
+    if (this.disposed || this.connection !== "connected" || this.memoryClearPending) return;
+    const confirmed = this.panel.ownerDocument.defaultView?.confirm(
+      "Clear everything Luxo remembers? This cannot be undone.",
+    ) ?? true;
+    if (!confirmed) return;
+    if (this.onClearMemory?.() !== true) {
+      this.clearMemoryButton.textContent = "CORE OFFLINE";
+      return;
+    }
+    this.memoryClearPending = true;
+    this.clearMemoryButton.textContent = "CLEARING…";
+    this.clearMemoryButton.disabled = true;
+  };
 
   setConnectionStatus(status: OverlayConnectionStatus): void {
     this.assertMounted();
@@ -370,6 +449,12 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
   updateFacts(facts: TelemetryState): void {
     this.assertMounted();
     this.facts = facts;
+    if (this.memoryClearPending && facts.memory_count === 0) {
+      this.memoryClearPending = false;
+      this.clearMemoryButton.textContent = "MEMORY CLEARED";
+    } else if (!this.memoryClearPending && facts.memory_count > 0) {
+      this.clearMemoryButton.textContent = "CLEAR MEMORY";
+    }
     this.render();
   }
 
@@ -463,6 +548,11 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
     this.connectionValue.textContent = view.connectionLabel;
     this.connectionValue.dataset.field = "connection";
     this.connectionValue.dataset.value = view.connection;
+    this.clearMemoryButton.disabled =
+      view.connection !== "connected" || this.memoryClearPending;
+    if (!this.memoryClearPending && this.clearMemoryButton.textContent !== "MEMORY CLEARED") {
+      this.clearMemoryButton.textContent = "CLEAR MEMORY";
+    }
     this.disconnectedBadge.hidden = !view.disconnected;
     this.disconnectedBadge.style.display = view.disconnected ? "block" : "none";
     this.setField("state", view.state);
@@ -488,6 +578,9 @@ export class TelemetryOverlay implements TelemetryOverlayHandle {
   }
 }
 
-export function mountTelemetryOverlay(root: HTMLElement): TelemetryOverlayHandle {
-  return new TelemetryOverlay(root);
+export function mountTelemetryOverlay(
+  root: HTMLElement,
+  options: TelemetryOverlayOptions = {},
+): TelemetryOverlayHandle {
+  return new TelemetryOverlay(root, options);
 }

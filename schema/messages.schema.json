@@ -9,6 +9,7 @@
     { "$ref": "#/$defs/VadMessage" },
     { "$ref": "#/$defs/TtsDoneMessage" },
     { "$ref": "#/$defs/ErrorMessage" },
+    { "$ref": "#/$defs/ClearMemoryMessage" },
     { "$ref": "#/$defs/BodyStateMessage" },
     { "$ref": "#/$defs/CueMessage" },
     { "$ref": "#/$defs/CaptureFrameMessage" },
@@ -21,7 +22,8 @@
       "GazeMessage",
       "VadMessage",
       "TtsDoneMessage",
-      "ErrorMessage"
+      "ErrorMessage",
+      "ClearMemoryMessage"
     ],
     "core-to-browser": [
       "BodyStateMessage",
@@ -127,6 +129,15 @@
         "type": { "const": "error" },
         "where": { "type": "string", "minLength": 1 },
         "detail": { "type": "string" }
+      }
+    },
+    "ClearMemoryMessage": {
+      "title": "ClearMemoryMessage",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": { "const": "clear_memory" }
       }
     },
     "JointsState": {

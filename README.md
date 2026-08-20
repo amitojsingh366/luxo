@@ -1,8 +1,8 @@
 # Luxo
 
-Luxo is an articulated five-degree-of-freedom desk lamp that behaves as one live
-character rather than a set of separate AI demos. It watches through the laptop
-camera, listens through the laptop microphone, and expresses itself through
+Luxo is an articulated five-degree-of-freedom desk lamp that behaves as a single,
+live character. It watches through the laptop camera, listens through the laptop
+microphone, and expresses itself through
 motion, light, voice, sound effects, and music. The personality is eager and
 puppyish: it perks up when someone looks at it, leans in to inspect things, and
 droops when attention moves elsewhere. The supplied URDF under `robot/` is the
@@ -14,16 +14,20 @@ The character is assembled as one application. `core/main.py` constructs the
 speech, OpenRouter, memory, behaviour, observation, animation, and protocol
 boundaries; `run.sh` starts that core together with the Vite renderer. Live use
 still depends on the locally staged model assets, browser camera and microphone
-permissions, and a working OpenRouter key and model.
+permissions, and a paid OpenRouter API key with a vision-capable model. The free
+models do not support the image input used by `observe`. Testing used
+`google/gemini-2.5-flash-lite:nitro`, which is the recommended model for running
+and testing Luxo.
 
-The Python and renderer suites run offline. Camera, microphone, browser GPU,
-voice quality, OpenRouter latency, and the clean Ubuntu installation remain
-environment-dependent checks; use `doctor.py` and `/selftest` before a take.
+Core preflight checks and the renderer typecheck and build run offline. Camera,
+microphone, browser GPU, voice quality, OpenRouter latency, and the clean Ubuntu
+installation remain environment-dependent checks; use `doctor.py` and
+`/selftest` before a take.
 
 ## Architecture in brief
 
-**The browser is the body. Python is the mind.** One WebSocket at
-`ws://127.0.0.1:8765` connects them, and nothing else crosses that line.
+The browser renderer and Python core communicate over a local WebSocket at
+`ws://127.0.0.1:8765`. All messages between the two use this connection.
 
 - The browser owns the camera, microphone, gaze landmarking, voice-activity
   detection, the three.js render of the URDF, the point light and bloom, and all
@@ -36,8 +40,7 @@ environment-dependent checks; use `doctor.py` and `/selftest` before a take.
   compact memory, and a filtered snapshot of what is currently visible.
 - A visual dialogue turn has exactly three successful cloud calls:
   `converse` selects one terminal `observe`, `observe` receives one JPEG, and
-  `resolve_observation` produces the grounded reply and plan. There is no
-  fourth semantic call.
+  `resolve_observation` produces the grounded reply and plan.
 - Vision returns at most 10 meaningful objects nearest-to-camera first, plus
   stable prior matches, a focused-object index, and presence evidence for
   lower-priority prior objects. Python keeps the current nearest objects first,
@@ -47,10 +50,9 @@ environment-dependent checks; use `doctor.py` and `/selftest` before a take.
   TypeScript types are generated from it, and a check fails if the checked-in
   file has drifted.
 
-The design argument — why the split falls there, what the model is and is not
-allowed to emit, how the missing-object comparison stays in Python, and the
-rejected alternatives — is in [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md). This
-README does not repeat it.
+[`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md) explains why the split falls there,
+what the model may emit, why Python handles the missing-object comparison, and
+which alternatives were rejected.
 
 ## Prerequisites
 
@@ -61,7 +63,10 @@ README does not repeat it.
 | Node.js `^20.19 \|\| >=22.12` | The `engines` requirement of the pinned Vite 8. |
 | Chromium or Firefox, recent | Needs WebGL2, `getUserMedia`, Web Audio, and WebAssembly. `localhost` is a secure context, so no TLS is involved. |
 | `espeak-ng` | A system package, not a Python one. `sudo apt-get install -y espeak-ng` on Ubuntu, `brew install espeak-ng` on macOS. It is Piper's phonemizer. |
-| OpenRouter configuration | Put `OPENROUTER_API_KEY` and, optionally, `OPENROUTER_MODEL` in the root `.env`. `run.sh` parses that file as data without executing or printing its contents. `doctor.py` probes only for key presence. |
+| OpenRouter configuration | Required. Put a paid API key in `OPENROUTER_API_KEY` and set `OPENROUTER_MODEL=google/gemini-2.5-flash-lite:nitro` in the root `.env`. This is the model used during development and is recommended for testing. The free models do not support image input. `run.sh` parses `.env` as data without executing or printing its contents. `doctor.py` probes only for key presence. |
+
+`OPENROUTER_API_KEY` is required. Without it, conversation, image observation,
+and model-directed behaviour do not work, so Luxo will not function as intended.
 
 whisper.cpp is built from source, CPU-only, and is not vendored here. Core-side
 model weights live outside the repository, in `~/.cache/luxo`. Browser-side
@@ -72,7 +77,7 @@ committed; the generated asset destinations are covered by `.gitignore`.
 
 ```sh
 ./setup.sh                      # venv, pip, npm ci, models, whisper.cpp, espeak-ng
-# In .env: OPENROUTER_API_KEY=... and OPENROUTER_MODEL=provider/model:free
+# In .env: OPENROUTER_API_KEY=... and OPENROUTER_MODEL=google/gemini-2.5-flash-lite:nitro
 python3 doctor.py               # core-side preflight; non-zero exit means stop
 ./run.sh                        # safely loads .env, then starts core and renderer
 ```
@@ -82,12 +87,11 @@ Then open two pages:
 - `http://127.0.0.1:5173` — the character.
 - `http://127.0.0.1:5173/selftest` — the browser half of preflight. It asks for
   camera and microphone permission and exercises the real sensor and audio path.
-  `doctor.py` deliberately does not duplicate these checks, because they cannot
-  be done outside a browser.
+  Those checks require a browser, so `doctor.py` covers the core preflight.
 
 `run.sh` runs `python -m core.main` and `npm run dev` together and shuts both
-down when either exits. The core binds loopback only, never `0.0.0.0`. The Vite
-dev server uses `strictPort`, so port 5173 must be free.
+down when either exits. The core binds to `127.0.0.1`. The Vite dev server uses
+`strictPort`, so port 5173 must be free.
 
 Two smaller commands are useful on their own:
 
@@ -170,7 +174,7 @@ manifest, available memory, port 8765, the presence of the API key, and
 │   ├── messages.schema.json     the single source of truth for the protocol
 │   ├── generate_types.py        emits renderer/src/protocol/types.ts
 │   └── check_generated.py       fails when the checked-in types have drifted
-├── robot/                       supplied and unmodified: URDF, mesh, reference image
+├── robot/                       supplied body assets and hand-authored animation JSON
 └── measurements/                ignored runtime CSV output, created as needed
 ```
 
@@ -202,12 +206,12 @@ python3 schema/check_generated.py
 
 ## Privacy
 
-This is an architectural property of the split, not a policy statement.
+The split enforces these privacy properties.
 
-- **Continuous gaze processing stays local.** Face and hand landmarking run in
+- Continuous gaze processing stays local. Face and hand landmarking run in
   the browser. Only derived measurements cross the local WebSocket; landmarks
   and the continuous camera stream do not.
-- **A camera frame leaves the machine only for an explicit `observe` action.**
+- A camera frame leaves the machine only for an explicit `observe` action.
   Dialogue observations are selected by the cloud plan; the bounded hand-dwell
   scene event can also issue one. The renderer captures one JPEG for the
   validated request and no other code path uploads frames. That scene JPEG may
@@ -219,28 +223,28 @@ This is an architectural property of the split, not a policy statement.
   missing objects as stable IDs with canonical names. Bounding boxes,
   timestamps, raw labels, gaze, telemetry, and joint state are excluded from
   text payloads.
-- **Only one utterance of audio is sent per turn.** The browser detects
+- Only one utterance of audio is sent per turn. The browser detects
   end-of-speech locally and sends that single utterance as PCM. There is no open
   microphone stream to the core, and OpenRouter receives the transcript rather
   than the audio.
 - The interaction CSV written by `core/instrumentation.py` records timestamps,
-  stage durations, model name, profile, and token counts. It cannot contain
+  stage durations, model name, profile, and token counts. Its schema excludes
   transcripts, prompts, model text, keys, audio, images, gaze, joint values, or
   FSM state.
 
 What does leave the machine, and the retention consequences of the shipped
 OpenRouter profile, are described in [`TECHNICAL_NOTE.md`](TECHNICAL_NOTE.md)
-§5 and §9. Read that before recording anything you care about.
+§5. Read that before recording anything you care about.
 
 ## Limitations
 
-- **The body has no roll degree of freedom**, so the classic sideways head-tilt
+- The body has no roll degree of freedom, so the classic sideways head-tilt
   is physically impossible. Curiosity is expressed as whole-body lean and crane
-  instead. This is a property of the supplied URDF, not a bug.
+  instead. The supplied URDF imposes this constraint.
 - No full inverse kinematics and no physics dynamics; motion is authored and
   spring-damped.
 - One subject at a time, no wake word (gaze is the signal), no barge-in, and no
-  cross-frame tracking — `observe` is discrete.
+  cross-frame tracking. `observe` is discrete.
 - Localhost only. There is no LAN bind and no TLS path.
 - `run.sh` safely loads the root `.env` as data. A non-empty value already
   exported in the parent shell takes precedence over the value in `.env`.

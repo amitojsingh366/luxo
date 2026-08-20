@@ -1,3 +1,5 @@
+import { SFX_NAMES, SFX_RECIPES, sfx } from './audio/sfx';
+
 export const CHECK_DEFINITIONS = Object.freeze([
   { id: 'secure', title: 'Secure localhost', detail: 'Requires a loopback secure context.' },
   { id: 'camera', title: 'Camera + frame', detail: 'Requests camera access and captures one local JPEG.' },
@@ -5,7 +7,7 @@ export const CHECK_DEFINITIONS = Object.freeze([
   { id: 'webgl', title: 'WebGL', detail: 'Creates and releases a browser graphics context.' },
   { id: 'mediapipe', title: 'Face Landmarker', detail: 'Loads the local MediaPipe WASM and model assets.' },
   { id: 'silero', title: 'Silero VAD', detail: 'Loads local ONNX/WASM and runs one silent frame.' },
-  { id: 'audio', title: 'Audio output', detail: 'Use Play tone for a user-gesture-gated local sample.', gesture: true },
+  { id: 'audio', title: 'Luxo sound effects', detail: 'Use Play SFX to audition the real user-gesture-gated effect graph.', gesture: true },
   { id: 'websocket', title: 'Core socket', detail: 'Opens and closes ws://127.0.0.1:8765 without sending anything.' },
 ] as const);
 
@@ -279,26 +281,20 @@ async function sileroCheck({ signal }: CheckContext): Promise<string> {
 }
 
 async function audioCheck({ signal }: CheckContext): Promise<string> {
-  const context = new AudioContext();
   try {
-    await context.resume();
-    if (signal.aborted) throw stoppedError();
-    const oscillator = context.createOscillator();
-    const gain = context.createGain();
-    oscillator.frequency.value = 440;
-    gain.gain.setValueAtTime(0.0001, context.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.12, context.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.22);
-    oscillator.connect(gain).connect(context.destination);
-    const ended = new Promise<void>((resolve) => { oscillator.onended = () => resolve(); });
-    oscillator.start();
-    oscillator.stop(context.currentTime + 0.23);
-    await withDeadline(ended, 1_000, signal);
-    oscillator.disconnect();
-    gain.disconnect();
-    return 'Local 440 Hz sample tone played through the browser output.';
+    for (const name of SFX_NAMES) {
+      if (signal.aborted) throw stoppedError();
+      await sfx.play(name);
+      const durationMs = SFX_RECIPES[name].durationMs + 120;
+      await withDeadline(
+        new Promise<void>((resolve) => globalThis.setTimeout(resolve, durationMs)),
+        durationMs + 500,
+        signal,
+      );
+    }
+    return `Played the real Luxo SFX graph: ${SFX_NAMES.join(', ')}.`;
   } finally {
-    await context.close().catch(() => undefined);
+    sfx.dispose();
   }
 }
 
@@ -362,7 +358,7 @@ export function mountSelfTest(root: HTMLElement): SelfTestController {
       const button = document.createElement('button');
       button.className = 'card-action';
       button.type = 'button';
-      button.textContent = 'Play tone';
+      button.textContent = 'Play SFX';
       button.addEventListener('click', () => { void controller.run('audio'); });
       card.append(button);
     }

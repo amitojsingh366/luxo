@@ -27,6 +27,7 @@ from .poses import SOFT_LIMITS
 
 NECK_LEAD_LIMIT_RAD: Final = 0.5
 NECK_RECENTER_TIME_CONSTANT_S: Final = 0.9
+LOOK_POSTURE_REQUEST_MARGIN_RAD: Final = 0.08
 _FULL_TURN: Final = 2.0 * pi
 _HEAD_PITCH_MIN, _HEAD_PITCH_MAX = SOFT_LIMITS["head_pitch"]
 
@@ -220,11 +221,11 @@ def _elevation_solution(
     # Therefore the emitter's positive-down elevation is head - shoulder -
     # elbow, and the absolute head target must carry the upstream arm pitch.
     required_head_pitch = elevation + arm_pitch
-    if required_head_pitch > _HEAD_PITCH_MAX:
+    if required_head_pitch > _HEAD_PITCH_MAX + LOOK_POSTURE_REQUEST_MARGIN_RAD:
         return _HEAD_PITCH_MAX, PostureName.STOOP
-    if required_head_pitch < _HEAD_PITCH_MIN:
+    if required_head_pitch < _HEAD_PITCH_MIN - LOOK_POSTURE_REQUEST_MARGIN_RAD:
         return _HEAD_PITCH_MIN, PostureName.CRANE
-    return required_head_pitch, None
+    return _clamp(required_head_pitch, _HEAD_PITCH_MIN, _HEAD_PITCH_MAX), None
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:
@@ -235,6 +236,7 @@ __all__ = [
     "LookAtSolution",
     "LookAtSolver",
     "LookAtTarget",
+    "LOOK_POSTURE_REQUEST_MARGIN_RAD",
     "NECK_LEAD_LIMIT_RAD",
     "NECK_RECENTER_TIME_CONSTANT_S",
 ]

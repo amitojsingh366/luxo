@@ -28,26 +28,28 @@ MASS_ORDER: Final = JOINT_NAMES
 
 # Owner-authored URDF-editor anchors, adapted into a gaze-relative inspection
 # layer. The editor's base endpoint was the hard limit (+2.6 rad), so live
-# animation preserves its engaged-to-inspecting ratio against the soft-safe
-# engaged anchor. Shoulder and elbow define the silhouette exactly. Neck and
-# head counter the body offsets so the live solver continues to own the real
-# emitter axis. After the pi flip, emitter elevation is head minus shoulder and
-# elbow, so the head follows the arm-pitch delta with the same sign.
+# animation starts from its engaged-to-inspecting ratio against the soft-safe
+# engaged anchor, then applies a small owner-directed restraint so the reach
+# does not overextend. Neck and head counter the scaled body offsets so the live
+# solver continues to own the real emitter axis. After the pi flip, emitter
+# elevation is head minus shoulder and elbow, so the head follows the arm-pitch
+# delta with the same sign.
 _REFERENCE_ENGAGED_SHOULDER: Final = 0.654
 _REFERENCE_ENGAGED_ELBOW: Final = -1.265
 _REFERENCE_ENGAGED_BASE: Final = 2.600
 _REFERENCE_INSPECTING_BASE: Final = 1.7836
 _REFERENCE_INSPECTING_SHOULDER: Final = -0.1686
 _REFERENCE_INSPECTING_ELBOW: Final = -0.57425
+INSPECTION_REACH_SCALE: Final = 0.92
 _INSPECTION_BASE_OFFSET: Final = ENGAGED_BASE_YAW_RAD * (
     _REFERENCE_INSPECTING_BASE / _REFERENCE_ENGAGED_BASE - 1.0
-)
+) * INSPECTION_REACH_SCALE
 _INSPECTION_SHOULDER_OFFSET: Final = (
     _REFERENCE_INSPECTING_SHOULDER - _REFERENCE_ENGAGED_SHOULDER
-)
+) * INSPECTION_REACH_SCALE
 _INSPECTION_ELBOW_OFFSET: Final = (
     _REFERENCE_INSPECTING_ELBOW - _REFERENCE_ENGAGED_ELBOW
-)
+) * INSPECTION_REACH_SCALE
 _INSPECTION_NECK_OFFSET: Final = -_INSPECTION_BASE_OFFSET
 _INSPECTION_HEAD_OFFSET: Final = (
     _INSPECTION_SHOULDER_OFFSET + _INSPECTION_ELBOW_OFFSET
@@ -135,6 +137,19 @@ GESTURE_DEFINITIONS: Final[Mapping[GestureName, GestureDefinition]] = (
                 (
                     _frame(-0.010, 0.085, -0.11, 0.015, 0.055, 0.070),
                     _frame(0.012, -0.14, 0.12, -0.018, -0.13, STRONG_HOLD_SECONDS),
+                )
+            ),
+            # A complete, unmistakable dance phrase rather than a model-built
+            # stack of tiny generic gestures. The base leads each side step,
+            # the arm compresses and springs, and the shade answers in the
+            # opposite direction before a final celebratory lift.
+            GestureName.DANCE: GestureDefinition(
+                (
+                    _frame(0.24, -0.12, 0.16, -0.22, -0.10, 0.080),
+                    _frame(-0.24, 0.04, -0.04, 0.28, 0.16, 0.080),
+                    _frame(0.22, -0.08, 0.12, -0.25, -0.12, 0.080),
+                    _frame(-0.18, 0.03, -0.02, 0.22, 0.12, 0.080),
+                    _frame(0.00, -0.16, 0.18, 0.00, -0.18, 0.180),
                 )
             ),
             GestureName.SHAKE_NO: GestureDefinition(
