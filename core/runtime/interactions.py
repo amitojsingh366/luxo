@@ -306,12 +306,12 @@ class ConversationCoordinator:
             self._emit(Milestone.PCM_RECEIVED, self._now())
             return self._start_locked("stt", self._stt.transcribe, pcm, STT_SAMPLE_HZ)
 
-    def speak(self, text: str) -> bool:
+    def speak(self, text: str, *, dispatch: bool = False) -> bool:
         """Stage one line the brain never produced; returns whether it staged.
 
         This is the public entry point for narration and any other unprompted
         speech. It stages ``text`` into the very slot a brain reply occupies,
-        so the next tick dispatches it through the same worker, the same
+        so it can dispatch through the same worker, the same
         synthesis and wire validation, the same raw prefix-free PCM delivery,
         the same ``speak_begin``/``speak_end`` pair, and the same bounded
         retry. There is no second speaker and no second owner of ``speaking``,
@@ -319,6 +319,13 @@ class ConversationCoordinator:
 
         A blank or whitespace-only line takes the in-character fallback rather
         than reaching Piper, which rejects empty text.
+
+        ``dispatch=True`` submits the existing delivery worker before returning.
+        Observation callbacks use that form because they run after this
+        coordinator's once-per-beat tick; without it, a fresh visual line can
+        sit staged until the next behaviour beat and be cleared by an intervening
+        disengagement. Submission is still nonblocking and synthesis remains on
+        the worker.
 
         **A line already in flight is refused, not queued and not superseded.**
         The browser has one audio graph, so speech is a serial resource: the
@@ -355,6 +362,8 @@ class ConversationCoordinator:
             self._stage = Stage.REPLIED
             self._last_error = "blank_say" if blank else None
             LOGGER.info("CHAT Luxo (scene): %s", _log_text(self._reply))
+            if dispatch:
+                self._dispatch_speech_locked()
             return True
 
     def tick(self) -> None:
@@ -382,18 +391,23 @@ class ConversationCoordinator:
                 # An unprompted line dispatches in whatever state the character
                 # is in, because it never asked the FSM to enter SPEAKING. The
                 # inactive states already returned above.
-                self._stage = Stage.DELIVERING
-                try:
-                    self._future = self._executor.submit(
-                        self._deliver, self._generation, self._reply, self._unprompted
-                    )
-                except Exception as error:
-                    # A refused worker is an unstarted delivery, so it lands in
-                    # the same explicit recovery path as an exhausted retry.
-                    self._stage = Stage.FAILED
-                    self._speech_attempts = MAX_SPEECH_ATTEMPTS
-                    self._last_error = type(error).__name__
+                self._dispatch_speech_locked()
             self._mirror_plan_locked()
+
+    def _dispatch_speech_locked(self) -> None:
+        """Submit the one staged line without running synthesis on the caller."""
+
+        self._stage = Stage.DELIVERING
+        try:
+            self._future = self._executor.submit(
+                self._deliver, self._generation, self._reply, self._unprompted
+            )
+        except Exception as error:
+            # A refused worker is an unstarted delivery, so it lands in the
+            # same explicit recovery path as an exhausted retry.
+            self._stage = Stage.FAILED
+            self._speech_attempts = MAX_SPEECH_ATTEMPTS
+            self._last_error = type(error).__name__
 
     def on_tts_done(self, t: float) -> bool:
         """Accept the browser as the only authority for speech completion.

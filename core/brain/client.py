@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from .prompts import FixedPromptBuilder, PromptBuilder
 from .schema import (
+    ActionOp,
     ObservationResponse,
     PlanResponse,
     ResponseSchemaError,
@@ -357,9 +358,9 @@ class OpenRouterBrainClient:
                 raise ResponseSchemaError(
                     "observation known contains an object outside prior_canonical"
                 )
-            if {item.canonical for item in response.known} != set(response.present):
+            if not {item.canonical for item in response.known} <= set(response.present):
                 raise ResponseSchemaError(
-                    "observation known must describe exactly the present objects"
+                    "observation known must describe only present objects"
                 )
             if any(item.canonical in prior_set for item in response.new):
                 raise ResponseSchemaError(
@@ -425,9 +426,17 @@ class OpenRouterBrainClient:
                 raise ResponseSchemaError("scene comment is not grounded in a fresh object")
             if len(response.plan) > 3:
                 raise ResponseSchemaError("scene comment plan must stay small")
-            if any(action.op.value == "observe" for action in response.plan):
-                raise ResponseSchemaError("scene comment must not request another observation")
-            return response
+            # The line is already grounded in the fresh, committed frame. A
+            # lightweight model often appends another scan/observe out of habit;
+            # those actions are redundant here and would create a visual loop.
+            # Keep the useful line and locally remove only those forbidden ops
+            # instead of paying a repair call that may rewrite it.
+            safe_plan = tuple(
+                action
+                for action in response.plan
+                if action.op not in (ActionOp.SCAN, ActionOp.OBSERVE)
+            )
+            return PlanResponse(response.say, safe_plan)
 
         return self._run("scene_comment", self._text_messages(payload), parse_comment)
 
@@ -584,6 +593,9 @@ def _requires_fresh_visual(transcript: str) -> bool:
     if any(phrase in normalized for phrase in historical):
         return False
     current_scene = (
+        "look at this",
+        "look at that",
+        "take a look",
         "what do you see",
         "what can you see",
         "what is in my hand",
